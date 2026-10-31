@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Written by `cargo run --release -- --smoke-test`
+/smoke-result.txt
+
+# Tester builds go to GitHub Releases, not the repo; the readme that ships with them stays
+/dist/*
+!/dist/README-TESTER.txt
+
+# Local agent tooling (third-party design skills), not part of the app
+/.agents/
+
+# Remotion project that renders assets/previews/*.gif; kept locally, not published
+/demo-video/
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
