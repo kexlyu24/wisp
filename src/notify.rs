@@ -9,11 +9,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::SIZE;
-use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
-    FOLDERID_AppsFolder, IShellItem, IShellItemImageFactory, SHCreateItemInKnownFolder, KF_FLAG_DEFAULT, SIGDN_NORMALDISPLAY,
-    SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    FOLDERID_AppsFolder, IShellItem, IShellItemImageFactory, SHCreateItemInKnownFolder,
+    KF_FLAG_DEFAULT, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 type Handle = *mut c_void;
 
@@ -66,7 +69,8 @@ const ROW: i32 = 100;
 struct Db(Handle);
 impl Db {
     unsafe fn open() -> Option<Self> {
-        let path = std::env::var("LOCALAPPDATA").ok()? + "\\Microsoft\\Windows\\Notifications\\wpndatabase.db";
+        let path = std::env::var("LOCALAPPDATA").ok()?
+            + "\\Microsoft\\Windows\\Notifications\\wpndatabase.db";
         if !std::path::Path::new(&path).exists() {
             return None;
         }
@@ -83,7 +87,9 @@ impl Db {
     unsafe fn query(&self, sql: &str, arg: i64, mut row: impl FnMut(Handle)) -> bool {
         let sql = format!("{sql}\0");
         let mut stmt = null_mut();
-        if sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &mut stmt, null_mut()) != Some(0) || stmt.is_null() {
+        if sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &mut stmt, null_mut()) != Some(0)
+            || stmt.is_null()
+        {
             return false;
         }
         sqlite3_bind_int64(stmt, 1, arg);
@@ -96,7 +102,12 @@ impl Db {
 }
 
 unsafe fn column_bytes(stmt: Handle, column: i32, blob: bool) -> Vec<u8> {
-    let ptr = if blob { sqlite3_column_blob(stmt, column) } else { sqlite3_column_text(stmt, column) }.unwrap_or(std::ptr::null());
+    let ptr = if blob {
+        sqlite3_column_blob(stmt, column)
+    } else {
+        sqlite3_column_text(stmt, column)
+    }
+    .unwrap_or(std::ptr::null());
     let len = sqlite3_column_bytes(stmt, column).unwrap_or(0);
     if ptr.is_null() || len <= 0 {
         return Vec::new();
@@ -112,14 +123,71 @@ pub fn start() -> Receiver<Notice> {
     rx
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn FindFirstChangeNotificationW(
+        path: *const u16,
+        watch_subtree: i32,
+        filter: u32,
+    ) -> *mut std::ffi::c_void;
+    fn FindNextChangeNotification(handle: *mut std::ffi::c_void) -> i32;
+    fn FindCloseChangeNotification(handle: *mut std::ffi::c_void) -> i32;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, ms: u32) -> u32;
+}
+
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+const WAIT_OBJECT_0: u32 = 0;
+
 unsafe fn run(tx: Sender<Notice>) {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     let Some(db) = Db::open() else { return };
     let mut last = 0i64;
-    db.query("select max([Order]) from Notification where ?1=?1", 0, |stmt| last = sqlite3_column_int64(stmt, 0).unwrap_or(0));
+    db.query(
+        "select max([Order]) from Notification where ?1=?1",
+        0,
+        |stmt| last = sqlite3_column_int64(stmt, 0).unwrap_or(0),
+    );
     let mut apps: HashMap<String, (String, Option<Vec<u32>>)> = HashMap::new();
+
+    let notif_dir = std::env::var("LOCALAPPDATA").ok().map(|d| {
+        let p = d + r"\Microsoft\Windows\Notifications";
+        p.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    });
+    let change_handle = notif_dir
+        .as_ref()
+        .map(|p| {
+            FindFirstChangeNotificationW(
+                p.as_ptr(),
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE
+                    | FILE_NOTIFY_CHANGE_SIZE,
+            )
+        })
+        .unwrap_or(std::ptr::null_mut());
+    let valid_handle = !change_handle.is_null() && change_handle as isize != -1;
+
     loop {
-        std::thread::sleep(Duration::from_millis(700));
+        let mut woke_by_change = false;
+        if valid_handle {
+            let res = WaitForSingleObject(change_handle, 2000);
+            if res == WAIT_OBJECT_0 {
+                FindNextChangeNotification(change_handle);
+                woke_by_change = true;
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(1500));
+            woke_by_change = true;
+        }
+
+        if !woke_by_change {
+            continue;
+        }
+
         let mut rows = Vec::new();
         let ok = db.query(
             "select n.[Order], h.PrimaryId, n.Payload, n.ArrivalTime from Notification n \
@@ -143,8 +211,13 @@ unsafe fn run(tx: Sender<Notice>) {
             if filetime_now() - arrival > 30 * 10_000_000 {
                 continue;
             }
-            let Some(toast) = parse_toast(&payload) else { continue };
-            let (app, app_icon) = apps.entry(aumid.clone()).or_insert_with(|| app_info(&aumid)).clone();
+            let Some(toast) = parse_toast(&payload) else {
+                continue;
+            };
+            let (app, app_icon) = apps
+                .entry(aumid.clone())
+                .or_insert_with(|| app_info(&aumid))
+                .clone();
             let picture = toast.image.as_deref().and_then(load_picture);
             let notice = Notice {
                 app,
@@ -156,6 +229,9 @@ unsafe fn run(tx: Sender<Notice>) {
                 aumid,
             };
             if tx.send(notice).is_err() {
+                if valid_handle {
+                    FindCloseChangeNotification(change_handle);
+                }
                 return;
             }
         }
@@ -163,7 +239,9 @@ unsafe fn run(tx: Sender<Notice>) {
 }
 
 fn filetime_now() -> i64 {
-    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     (unix.as_nanos() / 100) as i64 + 116_444_736_000_000_000
 }
 
@@ -183,14 +261,18 @@ pub fn parse_toast(xml: &str) -> Option<Toast> {
     let mut rest = binding;
     while let Some(start) = rest.find("<text") {
         let after = &rest[start + 5..];
-        let Some(open_end) = after.find('>') else { break };
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
         let attrs = &after[..open_end];
         if attrs.ends_with('/') {
             rest = &after[open_end + 1..];
             continue;
         }
         let content = &after[open_end + 1..];
-        let Some(close) = content.find("</text>") else { break };
+        let Some(close) = content.find("</text>") else {
+            break;
+        };
         let text = unescape_xml(&content[..close]);
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if !text.is_empty() && !attrs.contains("placement=\"attribution\"") {
@@ -206,7 +288,10 @@ pub fn parse_toast(xml: &str) -> Option<Toast> {
     let mut from = 0;
     while let Some(i) = xml[from..].find("<image") {
         let tag_start = from + i;
-        let tag = &xml[tag_start..xml[tag_start..].find('>').map_or(xml.len(), |e| tag_start + e)];
+        let tag = &xml[tag_start
+            ..xml[tag_start..]
+                .find('>')
+                .map_or(xml.len(), |e| tag_start + e)];
         from = tag_start + 6;
         if !tag.contains("placement=\"appLogoOverride\"") {
             continue;
@@ -215,7 +300,12 @@ pub fn parse_toast(xml: &str) -> Option<Toast> {
         image = attribute(tag, "src").and_then(|src| local_path(&unescape_xml(src)));
         break;
     }
-    Some(Toast { title, body, image, circle })
+    Some(Toast {
+        title,
+        body,
+        image,
+        circle,
+    })
 }
 
 fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -274,7 +364,9 @@ fn unescape_xml(s: &str) -> String {
             "gt" => Some('>'),
             "quot" => Some('"'),
             "apos" => Some('\''),
-            e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32),
+            e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
             e if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
             _ => None,
         };
@@ -300,7 +392,13 @@ fn load_picture(path: &str) -> Option<Vec<u32>> {
         return None;
     }
     let img = image::open(path).ok()?;
-    let img = img.resize_to_fill(ICON_PX as u32, ICON_PX as u32, image::imageops::FilterType::Triangle).to_rgba8();
+    let img = img
+        .resize_to_fill(
+            ICON_PX as u32,
+            ICON_PX as u32,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgba8();
     Some(
         img.pixels()
             .map(|p| {
@@ -315,23 +413,42 @@ fn load_picture(path: &str) -> Option<Vec<u32>> {
 /// The app's display name and icon from the shell's Apps folder (what Start shows).
 unsafe fn app_info(aumid: &str) -> (String, Option<Vec<u32>>) {
     let fallback = aumid.rsplit(['!', '.']).next().unwrap_or(aumid).to_string();
-    let Ok(item) = SHCreateItemInKnownFolder::<_, IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, &HSTRING::from(aumid)) else {
+    let Ok(item) = SHCreateItemInKnownFolder::<_, IShellItem>(
+        &FOLDERID_AppsFolder,
+        KF_FLAG_DEFAULT,
+        &HSTRING::from(aumid),
+    ) else {
         return (fallback, None);
     };
     let name = match item.GetDisplayName(SIGDN_NORMALDISPLAY) {
         Ok(p) => {
             let s = p.to_string().unwrap_or_default();
             CoTaskMemFree(Some(p.0 as *const c_void));
-            if s.is_empty() { fallback } else { s }
+            if s.is_empty() {
+                fallback
+            } else {
+                s
+            }
         }
         Err(_) => fallback,
     };
-    let icon = item.cast::<IShellItemImageFactory>().ok().and_then(|factory| {
-        let bitmap = factory.GetImage(SIZE { cx: ICON_PX as i32, cy: ICON_PX as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
-        let pixels = bitmap_pixels(bitmap);
-        let _ = DeleteObject(bitmap);
-        pixels
-    });
+    let icon = item
+        .cast::<IShellItemImageFactory>()
+        .ok()
+        .and_then(|factory| {
+            let bitmap = factory
+                .GetImage(
+                    SIZE {
+                        cx: ICON_PX as i32,
+                        cy: ICON_PX as i32,
+                    },
+                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+                )
+                .ok()?;
+            let pixels = bitmap_pixels(bitmap);
+            let _ = DeleteObject(bitmap);
+            pixels
+        });
     (name, icon)
 }
 
@@ -353,7 +470,15 @@ unsafe fn bitmap_pixels(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Optio
     info.bmiHeader.biCompression = 0;
     info.bmiHeader.biHeight = -h;
     let mut raw = vec![0u32; (w * h) as usize];
-    let lines = GetDIBits(dc, bitmap, 0, h as u32, Some(raw.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+    let lines = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        h as u32,
+        Some(raw.as_mut_ptr().cast()),
+        &mut info,
+        DIB_RGB_COLORS,
+    );
     let _ = DeleteDC(dc);
     if lines == 0 {
         return None;
@@ -367,10 +492,21 @@ unsafe fn bitmap_pixels(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Optio
     let rgba = image::RgbaImage::from_fn(w as u32, h as u32, |x, y| {
         let p = raw[(y * w as u32 + x) as usize];
         let a = if all_clear { 255 } else { (p >> 24) as u8 };
-        let un = |c: u32| if straight || a == 0 || all_clear { c as u8 } else { (c * 255 / a as u32).min(255) as u8 };
+        let un = |c: u32| {
+            if straight || a == 0 || all_clear {
+                c as u8
+            } else {
+                (c * 255 / a as u32).min(255) as u8
+            }
+        };
         image::Rgba([un(p >> 16 & 255), un(p >> 8 & 255), un(p & 255), a])
     });
-    let img = image::imageops::resize(&rgba, ICON_PX as u32, ICON_PX as u32, image::imageops::FilterType::Triangle);
+    let img = image::imageops::resize(
+        &rgba,
+        ICON_PX as u32,
+        ICON_PX as u32,
+        image::imageops::FilterType::Triangle,
+    );
     Some(
         img.pixels()
             .map(|p| {
@@ -393,18 +529,30 @@ mod tests {
         let toast = parse_toast(xml).unwrap();
         assert_eq!(toast.title, "Mira & Co");
         assert_eq!(toast.body, "Hey, are you coming?");
-        assert_eq!(toast.image.as_deref(), Some("C:\\Users\\Me\\avatar one.png"));
+        assert_eq!(
+            toast.image.as_deref(),
+            Some("C:\\Users\\Me\\avatar one.png")
+        );
         assert!(toast.circle);
     }
 
     #[test]
     fn handles_title_only_and_empty_toasts() {
         let toast = parse_toast(r#"<toast><visual><binding template="ToastGeneric"><text>Done</text><text/></binding></visual></toast>"#).unwrap();
-        assert_eq!((toast.title.as_str(), toast.body.as_str(), toast.image), ("Done", "", None));
-        assert!(parse_toast("<toast><visual><binding template=\"ToastGeneric\"></binding></visual></toast>").is_none());
+        assert_eq!(
+            (toast.title.as_str(), toast.body.as_str(), toast.image),
+            ("Done", "", None)
+        );
+        assert!(parse_toast(
+            "<toast><visual><binding template=\"ToastGeneric\"></binding></visual></toast>"
+        )
+        .is_none());
         let web = parse_toast(r#"<toast><visual><binding><text>A</text><image placement="appLogoOverride" src="https://x/y.png"/></binding></visual></toast>"#).unwrap();
         assert_eq!(web.image, None);
-        assert_eq!(unescape_xml("&#x1F44B; &#65; &bogus; &"), "\u{1F44B} A &bogus; &");
+        assert_eq!(
+            unescape_xml("&#x1F44B; &#65; &bogus; &"),
+            "\u{1F44B} A &bogus; &"
+        );
     }
 }
 
@@ -435,7 +583,11 @@ mod live {
                     toast.is_some(),
                     toast.as_ref().map_or(0, |t| t.title.chars().count()),
                     toast.as_ref().map_or(0, |t| t.body.chars().count()),
-                    toast.as_ref().and_then(|t| t.image.as_deref()).and_then(load_picture).is_some(),
+                    toast
+                        .as_ref()
+                        .and_then(|t| t.image.as_deref())
+                        .and_then(load_picture)
+                        .is_some(),
                 );
             }
         }
@@ -447,14 +599,29 @@ mod leak {
     use super::*;
     #[repr(C)]
     #[derive(Default)]
-    struct Counters { cb: u32, faults: u32, peak_ws: usize, ws: usize, qpp: usize, qp: usize, qnpp: usize, qnp: usize, pagefile: usize, peak_pagefile: usize, private: usize }
+    struct Counters {
+        cb: u32,
+        faults: u32,
+        peak_ws: usize,
+        ws: usize,
+        qpp: usize,
+        qp: usize,
+        qnpp: usize,
+        qnp: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+        private: usize,
+    }
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentProcess() -> *mut std::ffi::c_void;
         fn K32GetProcessMemoryInfo(p: *mut std::ffi::c_void, c: *mut Counters, cb: u32) -> i32;
     }
     fn private_mb() -> f64 {
-        let mut c = Counters { cb: size_of::<Counters>() as u32, ..Default::default() };
+        let mut c = Counters {
+            cb: size_of::<Counters>() as u32,
+            ..Default::default()
+        };
         unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
         c.private as f64 / 1048576.
     }
@@ -474,11 +641,19 @@ mod leak {
                     |_| n += 1,
                 );
             };
-            for _ in 0..50 { poll(&db); }
+            for _ in 0..50 {
+                poll(&db);
+            }
             let before = private_mb();
             let start = std::time::Instant::now();
-            for _ in 0..3000 { poll(&db); }
-            println!("3000 polls: {:+.1} MB, {:.2} ms per poll", private_mb() - before, start.elapsed().as_secs_f64() * 1000. / 3000.);
+            for _ in 0..3000 {
+                poll(&db);
+            }
+            println!(
+                "3000 polls: {:+.1} MB, {:.2} ms per poll",
+                private_mb() - before,
+                start.elapsed().as_secs_f64() * 1000. / 3000.
+            );
         }
     }
 }

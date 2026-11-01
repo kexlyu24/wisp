@@ -1,5 +1,8 @@
 //! Notification-area (tray) icon. Its menu (right-click, or left-click) opens the Settings page or quits.
-use crate::{AppendMenuW, BitmapInfo, CreateDIBSection, CreatePopupMenu, DeleteObject, DestroyMenu, GetCursorPos, GetSystemMetrics, Point, SetForegroundWindow, TrackPopupMenu, wide};
+use crate::{
+    wide, AppendMenuW, BitmapInfo, CreateDIBSection, CreatePopupMenu, DeleteObject, DestroyMenu,
+    GetCursorPos, GetSystemMetrics, Point, SetForegroundWindow, TrackPopupMenu,
+};
 use std::ffi::c_void;
 use std::ptr::null_mut;
 type Handle = *mut c_void;
@@ -18,8 +21,6 @@ pub mod item {
     pub const AUTOSTART: usize = 14;
     pub const FOLLOW_ANIMATIONS: usize = 15;
     pub const MINIMAL: usize = 16;
-    /// `PLAYER + i` picks `Player::ALL[i]`.
-    pub const PLAYER: usize = 20;
 }
 
 #[repr(C)]
@@ -66,7 +67,15 @@ extern "system" {
 }
 #[link(name = "advapi32")]
 extern "system" {
-    fn RegGetValueW(key: Handle, subkey: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
+    fn RegGetValueW(
+        key: Handle,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
 }
 
 pub struct Tray {
@@ -77,7 +86,11 @@ pub struct Tray {
 
 impl Tray {
     pub unsafe fn new(hwnd: Handle) -> Self {
-        let tray = Self { hwnd, icon: make_icon(), taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
+        let tray = Self {
+            hwnd,
+            icon: make_icon(),
+            taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+        };
         tray.add();
         tray
     }
@@ -123,7 +136,15 @@ impl Tray {
         GetCursorPos(&mut cursor);
         // The menu only dismisses on outside clicks if our window is foreground (documented quirk).
         SetForegroundWindow(self.hwnd);
-        let chosen = TrackPopupMenu(menu, 0x100 | 0x20 | 2, cursor.x, cursor.y, 0, self.hwnd, std::ptr::null());
+        let chosen = TrackPopupMenu(
+            menu,
+            0x100 | 0x20 | 2,
+            cursor.x,
+            cursor.y,
+            0,
+            self.hwnd,
+            std::ptr::null(),
+        );
         DestroyMenu(menu);
         PostMessageW(self.hwnd, 0, 0, 0);
         chosen.max(0) as usize
@@ -160,7 +181,19 @@ fn light_taskbar() -> bool {
 /// 4×4 supersampling, white on a dark taskbar and black on a light one.
 unsafe fn make_icon() -> Handle {
     let size = GetSystemMetrics(49).max(16);
-    let info = BitmapInfo { size: 40, width: size, height: -size, planes: 1, bits: 32, compression: 0, bytes: 0, x: 0, y: 0, used: 0, important: 0 };
+    let info = BitmapInfo {
+        size: 40,
+        width: size,
+        height: -size,
+        planes: 1,
+        bits: 32,
+        compression: 0,
+        bytes: 0,
+        x: 0,
+        y: 0,
+        used: 0,
+        important: 0,
+    };
     let mut bits = null_mut();
     let color = CreateDIBSection(null_mut(), &info, 0, &mut bits, null_mut(), 0);
     if color.is_null() {
@@ -184,7 +217,10 @@ unsafe fn make_icon() -> Handle {
             let mut hits = 0;
             for sy in 0..4 {
                 for sx in 0..4 {
-                    if inside(px as f64 + (sx as f64 + 0.5) / 4., py as f64 + (sy as f64 + 0.5) / 4.) {
+                    if inside(
+                        px as f64 + (sx as f64 + 0.5) / 4.,
+                        py as f64 + (sy as f64 + 0.5) / 4.,
+                    ) {
                         hits += 1;
                     }
                 }
@@ -194,7 +230,13 @@ unsafe fn make_icon() -> Handle {
         }
     }
     let mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
-    let icon = CreateIconIndirect(&IconInfo { icon: 1, x: 0, y: 0, mask, color });
+    let icon = CreateIconIndirect(&IconInfo {
+        icon: 1,
+        x: 0,
+        y: 0,
+        mask,
+        color,
+    });
     DeleteObject(mask);
     DeleteObject(color);
     icon

@@ -6,36 +6,6 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 type Handle = *mut c_void;
 
-/// Which music app Now Playing follows.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Player {
-    Auto,
-    Spotify,
-    Spotifast,
-    AppleMusic,
-}
-
-impl Player {
-    pub const ALL: [Player; 4] = [Player::Auto, Player::Spotify, Player::Spotifast, Player::AppleMusic];
-    /// The `media::app_key` it limits sessions to ("" for any).
-    pub fn key(self) -> &'static str {
-        match self {
-            Player::Auto => "",
-            Player::Spotify => "spotify",
-            Player::Spotifast => "spotifast",
-            Player::AppleMusic => "applemusic",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Player::Auto => "Automatic",
-            Player::Spotify => "Spotify",
-            Player::Spotifast => "Spotifast",
-            Player::AppleMusic => "Apple Music",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     /// Show Windows notifications in the notch.
@@ -51,18 +21,32 @@ pub struct Settings {
     pub follow_windows_animations: bool,
     /// Shrink the closed notch to a sliver while it would cover another window's content.
     pub minimal_when_covering: bool,
-    pub player: Player,
     /// Pomodoro lengths in minutes: focus, short break, long break.
     pub pomo_minutes: [u32; 3],
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notifications: true, open_on_hover: true, collapsed_lyrics: true, clock_24h: true, follow_windows_animations: false, minimal_when_covering: true, player: Player::Auto, pomo_minutes: [25, 5, 15] }
+        Self {
+            notifications: true,
+            open_on_hover: true,
+            collapsed_lyrics: true,
+            clock_24h: true,
+            follow_windows_animations: false,
+            minimal_when_covering: true,
+            pomo_minutes: [25, 5, 15],
+        }
     }
 }
 
-const KEYS: [&str; 6] = ["notifications", "open_on_hover", "collapsed_lyrics", "clock_24h", "follow_windows_animations", "minimal_when_covering"];
+const KEYS: [&str; 6] = [
+    "notifications",
+    "open_on_hover",
+    "collapsed_lyrics",
+    "clock_24h",
+    "follow_windows_animations",
+    "minimal_when_covering",
+];
 
 impl Settings {
     fn fields(&mut self) -> [&mut bool; 6] {
@@ -79,17 +63,20 @@ impl Settings {
     pub fn parse(src: &str) -> Self {
         let mut settings = Self::default();
         for line in src.lines() {
-            let Some((key, value)) = line.split_once('=') else { continue };
-            if let Some(i) = ["focus_minutes", "short_minutes", "long_minutes"].iter().position(|k| *k == key.trim()) {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if let Some(i) = ["focus_minutes", "short_minutes", "long_minutes"]
+                .iter()
+                .position(|k| *k == key.trim())
+            {
                 if let Ok(m) = value.trim().parse::<u32>() {
                     settings.pomo_minutes[i] = m;
                 }
                 continue;
             }
             if key.trim() == "player" {
-                if let Some(player) = Player::ALL.iter().find(|p| p.key() == value.trim() || (value.trim() == "auto" && **p == Player::Auto)) {
-                    settings.player = *player;
-                }
+                // Obsolete manual player setting ignored safely on migration
                 continue;
             }
             if let Some(i) = KEYS.iter().position(|k| *k == key.trim()) {
@@ -104,9 +91,14 @@ impl Settings {
     }
     pub fn format(mut self) -> String {
         let values: Vec<bool> = self.fields().iter().map(|v| **v).collect();
-        let player = if self.player == Player::Auto { "auto" } else { self.player.key() };
-        KEYS.iter().zip(values).map(|(k, v)| format!("{k}={}\n", v as u8)).collect::<String>() + &format!("player={player}\n")
-            + &format!("focus_minutes={}\nshort_minutes={}\nlong_minutes={}\n", self.pomo_minutes[0], self.pomo_minutes[1], self.pomo_minutes[2])
+        KEYS.iter()
+            .zip(values)
+            .map(|(k, v)| format!("{k}={}\n", v as u8))
+            .collect::<String>()
+            + &format!(
+                "focus_minutes={}\nshort_minutes={}\nlong_minutes={}\n",
+                self.pomo_minutes[0], self.pomo_minutes[1], self.pomo_minutes[2]
+            )
     }
     pub fn load() -> Self {
         crate::tasks::data_path("settings.txt")
@@ -121,8 +113,23 @@ impl Settings {
 
 #[link(name = "advapi32")]
 extern "system" {
-    fn RegGetValueW(key: Handle, subkey: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
-    fn RegSetKeyValueW(key: Handle, subkey: *const u16, value: *const u16, kind: u32, data: *const c_void, size: u32) -> i32;
+    fn RegGetValueW(
+        key: Handle,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+    fn RegSetKeyValueW(
+        key: Handle,
+        subkey: *const u16,
+        value: *const u16,
+        kind: u32,
+        data: *const c_void,
+        size: u32,
+    ) -> i32;
     fn RegDeleteKeyValueW(key: Handle, subkey: *const u16, value: *const u16) -> i32;
 }
 const RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -140,7 +147,15 @@ pub fn starts_with_windows() -> bool {
     let mut buffer = [0u16; 1024];
     let mut size = (buffer.len() * 2) as u32;
     let found = unsafe {
-        RegGetValueW(current_user(), wide(RUN).as_ptr(), wide("Wisp").as_ptr(), 0x2, null_mut(), buffer.as_mut_ptr().cast(), &mut size) == 0
+        RegGetValueW(
+            current_user(),
+            wide(RUN).as_ptr(),
+            wide("Wisp").as_ptr(),
+            0x2,
+            null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        ) == 0
     };
     if !found {
         return false;
@@ -155,7 +170,14 @@ pub fn set_start_with_windows(on: bool) {
         if on {
             let Some(cmd) = launch_command() else { return };
             let data = wide(&cmd);
-            RegSetKeyValueW(current_user(), wide(RUN).as_ptr(), wide("Wisp").as_ptr(), 1, data.as_ptr().cast(), (data.len() * 2) as u32);
+            RegSetKeyValueW(
+                current_user(),
+                wide(RUN).as_ptr(),
+                wide("Wisp").as_ptr(),
+                1,
+                data.as_ptr().cast(),
+                (data.len() * 2) as u32,
+            );
         } else {
             RegDeleteKeyValueW(current_user(), wide(RUN).as_ptr(), wide("Wisp").as_ptr());
         }
@@ -175,14 +197,47 @@ mod tests {
             clock_24h: false,
             follow_windows_animations: true,
             minimal_when_covering: false,
-            player: Player::Spotifast,
             pomo_minutes: [50, 10, 20],
         };
         assert_eq!(Settings::parse(&custom.format()), custom);
         assert_eq!(Settings::parse(""), Settings::default());
         let partial = Settings::parse("open_on_hover=0\nbogus=1\nclock_24h=maybe\n");
         assert!(!partial.open_on_hover && partial.notifications && partial.clock_24h);
-        assert!(!partial.follow_windows_animations && partial.player == Player::Auto);
-        assert_eq!(Settings::parse("player=applemusic\nplayer=bogus\n").player, Player::AppleMusic);
+        assert!(!partial.follow_windows_animations);
+        // Verify obsolete player setting from earlier versions is ignored safely
+        let migrated = Settings::parse("player=spotifast\nnotifications=0\n");
+        assert!(!migrated.notifications);
+        assert!(!custom.format().contains("player="));
+    }
+
+    #[test]
+    fn settings_all_seven_toggle_defaults_and_parse_isolation() {
+        let def = Settings::default();
+        assert!(def.notifications);
+        assert!(def.open_on_hover);
+        assert!(def.collapsed_lyrics);
+        assert!(def.clock_24h);
+        assert!(!def.follow_windows_animations);
+        assert!(def.minimal_when_covering);
+
+        for (key, inverted_line) in [
+            ("notifications", "notifications=0\n"),
+            ("open_on_hover", "open_on_hover=0\n"),
+            ("collapsed_lyrics", "collapsed_lyrics=0\n"),
+            ("clock_24h", "clock_24h=0\n"),
+            ("follow_windows_animations", "follow_windows_animations=1\n"),
+            ("minimal_when_covering", "minimal_when_covering=0\n"),
+        ] {
+            let s = Settings::parse(inverted_line);
+            match key {
+                "notifications" => assert!(!s.notifications),
+                "open_on_hover" => assert!(!s.open_on_hover),
+                "collapsed_lyrics" => assert!(!s.collapsed_lyrics),
+                "clock_24h" => assert!(!s.clock_24h),
+                "follow_windows_animations" => assert!(s.follow_windows_animations),
+                "minimal_when_covering" => assert!(!s.minimal_when_covering),
+                _ => unreachable!(),
+            }
+        }
     }
 }
