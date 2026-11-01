@@ -21,6 +21,13 @@ The smoke test drives the real window: expand/collapse geometry (Now Playing `NP
 
 Release build: `dist/Wisp-<version>-windows-x64.zip` (current: 0.1.7, tagged `v0.1.7`) holds `wisp.exe` (self-contained; it imports only Windows system DLLs, and Inter is embedded), `dist/README-TESTER.txt` and `assets/fonts/Inter-LICENSE.txt` (font install steps, SmartScreen, where data lives). Rebuild it by copying a fresh `target/release/wisp.exe`, the readme, `LICENSE` and `Inter-LICENSE.txt` into `dist/Wisp-<version>-windows-x64/` and zipping that folder; it is uploaded to a GitHub Release, never committed.
 
+Branches (several developers):
+- `main` only ever holds released versions. It is protected and needs a PR with one approval.
+- `dev` is the default branch, where unreleased features are integrated. It is protected and needs a PR, but no approval.
+- Each feature or fix gets its own branch off `dev` (`feat/…`, `fix/…`) and a PR into `dev`.
+- To release, open a PR from `dev` into `main`, then bump the version, tag `v0.1.x` on `main` and create the GitHub Release.
+- Never push straight to `main` or `dev`, even though the owner's admin rights would allow it.
+
 `UNRELEASED.md` (git-ignored, written in Indonesian for the owner) lists every change since the last release, with its test status and whether it is committed. Add each new change there as you make it. At release time, build the release notes from it, then reset it.
 
 
