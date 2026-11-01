@@ -68,13 +68,11 @@ pub fn map_from_spotify_range(v: f64) -> f32 {
 }
 
 /// Maps Wisp volume [0.0, 1.0] to Spotifast native slider value [0.0, 100.0].
-#[allow(dead_code)]
 pub fn map_to_spotifast_range(v: f32) -> f64 {
     (normalize_volume(v) as f64) * 100.0
 }
 
 /// Maps Spotifast native slider value [0.0, 100.0] to Wisp volume [0.0, 1.0].
-#[allow(dead_code)]
 pub fn map_from_spotifast_range(v: f64) -> f32 {
     if v.is_nan() {
         0.
@@ -148,26 +146,6 @@ pub fn find_spotify_window() -> Option<HWND> {
     }
 }
 
-/// Locates any window or background process of Spotifast.
-pub fn find_spotifast_window() -> Option<HWND> {
-    unsafe {
-        let mut curr =
-            FindWindowExW(HWND::default(), HWND::default(), None, None).unwrap_or_default();
-        while !curr.is_invalid() {
-            let mut pid = 0;
-            let _ = GetWindowThreadProcessId(curr, Some(&mut pid));
-            if pid != 0 {
-                let pname = process_name(pid);
-                if pname.eq_ignore_ascii_case("spotifast.exe") {
-                    return Some(curr);
-                }
-            }
-            curr = FindWindowExW(HWND::default(), curr, None, None).unwrap_or_default();
-        }
-        None
-    }
-}
-
 pub fn spotifast_exe_path() -> std::path::PathBuf {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let p = std::path::PathBuf::from(local_app_data).join(r"Programs\Spotifast\spotifast.exe");
@@ -178,67 +156,39 @@ pub fn spotifast_exe_path() -> std::path::PathBuf {
     std::path::PathBuf::from("spotifast.exe")
 }
 
-pub fn spotifast_volume_file_path() -> Option<std::path::PathBuf> {
-    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    let p = std::path::PathBuf::from(local_app_data).join(r"paolino\spotifast\data\volume\volume");
-    Some(p)
-}
-
-pub fn read_spotifast_volume() -> Option<(f32, bool)> {
-    let p = spotifast_volume_file_path()?;
-    let text = std::fs::read_to_string(p).ok()?;
-    let trimmed = text.trim();
-    let raw: u32 = trimmed.parse().ok()?;
-    let normalized = (raw as f32) / 65535.0;
-    let muted = raw == 0;
-    Some((normalized.clamp(0.0, 1.0), muted))
-}
-
-pub fn write_spotifast_volume(level: f32) -> bool {
-    let percent = (level * 100.0).round() as u32;
-    let raw = (level * 65535.0).round() as u32;
-    if let Some(path) = spotifast_volume_file_path() {
-        let _ = std::fs::write(path, raw.to_string());
-    }
-    let exe = spotifast_exe_path();
+/// Runs one `spotifast` verb and waits for it to finish, so successive commands reach
+/// Spotifast in order (fire-and-forget processes could overtake each other during a drag).
+fn run_spotifast(args: &[&str]) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    std::process::Command::new(exe)
-        .arg("volume")
-        .arg(percent.to_string())
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(spotifast_exe_path())
+        .args(args)
         .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .is_ok()
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn set_spotifast_mute(muted: bool) -> bool {
-    let (_, current_muted) = read_spotifast_volume().unwrap_or((0.2, false));
-    if current_muted != muted {
-        if let Some(path) = spotifast_volume_file_path() {
-            if muted {
-                let _ = std::fs::write(path, "0");
-            } else {
-                let _ = std::fs::write(path, "26214"); // 40% restore
-            }
-        }
-        let exe = spotifast_exe_path();
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = std::process::Command::new(exe)
-            .arg("mute")
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    true
+/// Spotifast's volume from `spotifast now-playing --raw`: tab-separated state, title, artist,
+/// album, position ms, duration ms, then the volume in percent (0 while muted).
+pub fn parse_spotifast_volume(raw: &str) -> Option<f32> {
+    let percent: f64 = raw.lines().next()?.split('\t').nth(6)?.trim().parse().ok()?;
+    Some(map_from_spotifast_range(percent))
 }
 
-#[allow(dead_code)]
-pub fn toggle_spotifast_mute() -> bool {
-    let (_, current_muted) = read_spotifast_volume().unwrap_or((0.2, false));
-    set_spotifast_mute(!current_muted)
+/// The running Spotifast's volume; None when it is not running.
+pub fn read_spotifast_volume() -> Option<f32> {
+    parse_spotifast_volume(&run_spotifast(&["now-playing", "--raw"])?)
 }
 
-/// Locates the top-level window of Apple Music for Windows.
+/// Sets Spotifast's volume (this also unmutes it).
+pub fn write_spotifast_volume(level: f32) -> bool {
+    let percent = map_to_spotifast_range(level).round() as u32;
+    run_spotifast(&["volume", &percent.to_string()]).is_some()
+}
+
 pub fn find_applemusic_window() -> Option<HWND> {
     unsafe {
         let mut curr =
@@ -393,11 +343,9 @@ impl VolumeAdapter for SpotifyVolumeAdapter {
         let _ = tx.send(DesktopCommand::Reconnect);
     }
 
+    /// Stops the worker but keeps the last known level, so reopening the panel shows the
+    /// slider at once while the worker reconnects (it hides it if Spotify is gone).
     fn disconnect(&mut self) {
-        self.cached_level
-            .store(f32::to_bits(-1.), Ordering::Relaxed);
-        self.cached_muted.store(false, Ordering::Relaxed);
-        self.is_connected.store(false, Ordering::Relaxed);
         self.update_status
             .store(VolumeUpdateStatus::Idle as u8, Ordering::Relaxed);
         self.tx = None;
@@ -720,20 +668,38 @@ fn spotify_worker_loop(
         let cond_unmute_btn = automation
             .CreateAndCondition(&cond_btn_type, &cond_unmute_name)
             .ok();
+        // The mute button is one element whose name flips between "Mute" and "Unmute". It is
+        // found once per connection: searching Spotify's whole tree costs ~80 ms per lookup.
+        let cond_mute_toggle = match (&cond_mute_btn, &cond_unmute_btn) {
+            (Some(m), Some(u)) => automation.CreateOrCondition(m, u).ok(),
+            _ => None,
+        };
 
         let mut current_hwnd = HWND::default();
         let mut focus_guard = SpotifyFocusGuard::new(HWND::default());
         let mut slider_pattern: Option<IUIAutomationRangeValuePattern> = None;
-        let mut root_elem: Option<IUIAutomationElement> = None;
+        let mut mute_elem: Option<IUIAutomationElement> = None;
+        // Spotify's accessibility value lags a change by about 2 s, and a SetValue while it is
+        // minimized blocks for about as long, so a change is held this long before readbacks win.
+        const SETTLE: Duration = Duration::from_millis(4000);
+        const POLL: Duration = Duration::from_millis(500);
+        let is_muted_now = |mute_elem: &Option<IUIAutomationElement>| -> Option<bool> {
+            let name = mute_elem.as_ref()?.CurrentName().ok()?.to_string();
+            Some(name.eq_ignore_ascii_case("Unmute"))
+        };
         let mut last_poll = Instant::now() - Duration::from_secs(1);
         let mut last_reconnect = Instant::now() - Duration::from_secs(10);
         let mut pending: Option<PendingVerification> = None;
+        // Set by our own changes; see the minimized case in the poll below.
+        let mut own_change = false;
+        let mut hidden_since_change = false;
+        let mut shown_at: Option<Instant> = None;
 
         loop {
             let wait_dur = if pending.is_some() {
                 Duration::from_millis(50)
             } else if slider_pattern.is_some() {
-                Duration::from_millis(250).saturating_sub(last_poll.elapsed())
+                POLL.saturating_sub(last_poll.elapsed())
             } else {
                 Duration::from_millis(1000).saturating_sub(last_poll.elapsed())
             };
@@ -765,7 +731,9 @@ fn spotify_worker_loop(
                             {
                                 if let Ok(pat) = unk.cast::<IUIAutomationRangeValuePattern>() {
                                     slider_pattern = Some(pat);
-                                    root_elem = Some(elem);
+                                    mute_elem = cond_mute_toggle
+                                        .as_ref()
+                                        .and_then(|c| elem.FindFirst(TreeScope_Descendants, c).ok());
                                     is_connected.store(true, Ordering::Relaxed);
                                 }
                             }
@@ -774,7 +742,7 @@ fn spotify_worker_loop(
                 }
                 if slider_pattern.is_none() {
                     current_hwnd = HWND::default();
-                    root_elem = None;
+                    mute_elem = None;
                     is_connected.store(false, Ordering::Relaxed);
                 }
             }
@@ -786,6 +754,7 @@ fn spotify_worker_loop(
                             let target = map_to_spotify_range(lvl);
                             let res = focus_guard.execute(|| pat.SetValue(target));
                             if res.is_ok() {
+                                own_change = true;
                                 cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
                                 if lvl > 0. {
                                     cached_muted.store(false, Ordering::Relaxed);
@@ -793,7 +762,7 @@ fn spotify_worker_loop(
                                 pending = Some(PendingVerification {
                                     target_level: Some(lvl),
                                     target_muted: if lvl > 0. { Some(false) } else { None },
-                                    deadline: Instant::now() + Duration::from_millis(1500),
+                                    deadline: Instant::now() + SETTLE,
                                     last_read: Instant::now(),
                                 });
                                 update_status
@@ -808,40 +777,12 @@ fn spotify_worker_loop(
                         }
                         DesktopCommand::SetMuted(muted) => {
                             let mut handled = false;
-                            if let Some(ref root) = root_elem {
-                                let mut btn_opt = None;
-                                if muted {
-                                    if let Some(ref cond) = cond_mute_btn {
-                                        if let Ok(btn) = root.FindFirst(TreeScope_Descendants, cond)
-                                        {
-                                            if btn.CurrentName().is_ok() {
-                                                btn_opt = Some(btn);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    if let Some(ref cond) = cond_unmute_btn {
-                                        if let Ok(btn) = root.FindFirst(TreeScope_Descendants, cond)
-                                        {
-                                            if btn.CurrentName().is_ok() {
-                                                btn_opt = Some(btn);
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(btn) = btn_opt {
-                                    if let Ok(unk) = btn.GetCurrentPattern(UIA_InvokePatternId) {
-                                        if let Ok(inv) = unk.cast::<IUIAutomationInvokePattern>() {
-                                            let _ = focus_guard.execute(|| inv.Invoke());
-                                            handled = true;
-                                        }
-                                    }
-                                } else {
-                                    let is_already_muted = cond_unmute_btn
-                                        .as_ref()
-                                        .and_then(|c| root.FindFirst(TreeScope_Descendants, c).ok())
-                                        .is_some_and(|b| b.CurrentName().is_ok());
-                                    if is_already_muted == muted {
+                            if let (Some(btn), Some(now_muted)) = (&mute_elem, is_muted_now(&mute_elem)) {
+                                if now_muted == muted {
+                                    handled = true;
+                                } else if let Ok(unk) = btn.GetCurrentPattern(UIA_InvokePatternId) {
+                                    if let Ok(inv) = unk.cast::<IUIAutomationInvokePattern>() {
+                                        let _ = focus_guard.execute(|| inv.Invoke());
                                         handled = true;
                                     }
                                 }
@@ -862,10 +803,11 @@ fn spotify_worker_loop(
                                 }
                             }
                             cached_muted.store(muted, Ordering::Relaxed);
+                            own_change = true;
                             pending = Some(PendingVerification {
                                 target_level: None,
                                 target_muted: Some(muted),
-                                deadline: Instant::now() + Duration::from_millis(1500),
+                                deadline: Instant::now() + SETTLE,
                                 last_read: Instant::now(),
                             });
                             update_status
@@ -875,66 +817,55 @@ fn spotify_worker_loop(
                     }
                 }
             } else if let Some(ref mut p) = pending {
-                // Asynchronous bounded verification (up to 1500 ms)
-                if p.last_read.elapsed() >= Duration::from_millis(50) {
+                // A change is confirmed once Spotify reads back the target. Its readback can lag
+                // well behind, so after SETTLE the change is simply kept, never the stale reading.
+                if p.last_read.elapsed() >= Duration::from_millis(100) {
                     p.last_read = Instant::now();
-                    let current_val = slider_pattern
-                        .as_ref()
-                        .and_then(|pat| pat.CurrentValue().ok());
-                    let current_lvl = current_val.map(map_from_spotify_range);
-
-                    let mut confirmed = false;
-
-                    if let (Some(target_lvl), Some(read_lvl)) = (p.target_level, current_lvl) {
-                        if (read_lvl - target_lvl).abs() <= 0.02 {
-                            confirmed = true;
-                            cached_level.store(f32::to_bits(read_lvl), Ordering::Relaxed);
-                        }
-                    }
-
-                    if let Some(target_muted) = p.target_muted {
-                        let is_muted = if let Some(ref root) = root_elem {
-                            cond_unmute_btn
-                                .as_ref()
-                                .and_then(|c| root.FindFirst(TreeScope_Descendants, c).ok())
-                                .is_some_and(|b| b.CurrentName().is_ok())
+                    let confirmed = match p.target_level {
+                        Some(target) => slider_pattern
+                            .as_ref()
+                            .and_then(|pat| pat.CurrentValue().ok())
+                            .is_some_and(|v| (map_from_spotify_range(v) - target).abs() <= 0.02),
+                        None => p
+                            .target_muted
+                            .is_some_and(|m| is_muted_now(&mute_elem) == Some(m)),
+                    };
+                    let timed_out = Instant::now() >= p.deadline;
+                    if confirmed || timed_out {
+                        let status = if confirmed {
+                            VolumeUpdateStatus::Confirmed
                         } else {
-                            current_lvl.map_or(false, |l| l <= 0.005)
+                            VolumeUpdateStatus::Failed
                         };
-                        if is_muted == target_muted {
-                            confirmed = true;
-                            cached_muted.store(is_muted, Ordering::Relaxed);
-                        }
-                    }
-
-                    if confirmed {
-                        update_status.store(VolumeUpdateStatus::Confirmed as u8, Ordering::Relaxed);
-                        pending = None;
-                        last_poll = Instant::now();
-                    } else if Instant::now() >= p.deadline {
-                        update_status.store(VolumeUpdateStatus::Failed as u8, Ordering::Relaxed);
-                        if let Some(read_lvl) = current_lvl {
-                            cached_level.store(f32::to_bits(read_lvl), Ordering::Relaxed);
-                        }
+                        update_status.store(status as u8, Ordering::Relaxed);
                         pending = None;
                         last_poll = Instant::now();
                     }
-                    // While pending, do NOT overwrite cached_level with stale readback!
                 }
-            } else if last_poll.elapsed() >= Duration::from_millis(250) {
+            } else if last_poll.elapsed() >= POLL {
                 last_poll = Instant::now();
+                // While Spotify is minimized its accessibility tree stops updating, so after a
+                // change of ours a readback would be stale; trust our value until it is shown
+                // again and has had SETTLE to catch up.
+                let iconic = !current_hwnd.is_invalid() && IsIconic(current_hwnd).as_bool();
+                if iconic && own_change {
+                    hidden_since_change = true;
+                    continue;
+                }
+                if hidden_since_change {
+                    hidden_since_change = false;
+                    shown_at = Some(Instant::now());
+                }
+                if shown_at.is_some_and(|t| t.elapsed() < SETTLE) {
+                    continue;
+                }
+                shown_at = None;
+                own_change = false;
                 if let Some(ref pat) = slider_pattern {
                     if let Ok(val) = pat.CurrentValue() {
                         let lvl = map_from_spotify_range(val);
                         cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
-                        let is_muted = if let Some(ref root) = root_elem {
-                            cond_unmute_btn
-                                .as_ref()
-                                .and_then(|c| root.FindFirst(TreeScope_Descendants, c).ok())
-                                .is_some_and(|b| b.CurrentName().is_ok())
-                        } else {
-                            lvl <= 0.005
-                        };
+                        let is_muted = is_muted_now(&mute_elem).unwrap_or(lvl <= 0.005);
                         cached_muted.store(is_muted, Ordering::Relaxed);
                         if lvl > 0.005 && !is_muted {
                             if let Ok(mut u) = last_unmuted.lock() {
@@ -945,6 +876,7 @@ fn spotify_worker_loop(
                         update_status.store(VolumeUpdateStatus::Idle as u8, Ordering::Relaxed);
                     } else {
                         slider_pattern = None;
+                        mute_elem = None;
                         is_connected.store(false, Ordering::Relaxed);
                     }
                 }
@@ -1007,18 +939,8 @@ impl VolumeAdapter for SpotifastVolumeAdapter {
         if !self.is_available() {
             return None;
         }
-        let bits = self.cached_level.load(Ordering::Relaxed);
-        let val = f32::from_bits(bits);
-        if val >= 0. {
-            return Some(val);
-        }
-        if let Some((vol, muted)) = read_spotifast_volume() {
-            self.cached_level
-                .store(f32::to_bits(vol), Ordering::Relaxed);
-            self.cached_muted.store(muted, Ordering::Relaxed);
-            return Some(vol);
-        }
-        None
+        let val = f32::from_bits(self.cached_level.load(Ordering::Relaxed));
+        (val >= 0.).then_some(val)
     }
 
     fn set_volume(&mut self, value: f32) -> bool {
@@ -1051,23 +973,13 @@ impl VolumeAdapter for SpotifastVolumeAdapter {
     }
 
     fn reconnect(&mut self) {
-        if find_spotifast_window().is_some() {
-            self.is_connected.store(true, Ordering::Relaxed);
-            if let Some((vol, muted)) = read_spotifast_volume() {
-                self.cached_level
-                    .store(f32::to_bits(vol), Ordering::Relaxed);
-                self.cached_muted.store(muted, Ordering::Relaxed);
-            }
-        }
         let tx = self.ensure_worker();
         let _ = tx.send(DesktopCommand::Reconnect);
     }
 
+    /// Stops the worker but keeps the last known level, so reopening the panel shows the
+    /// slider at once; the worker's first reading corrects it or hides it.
     fn disconnect(&mut self) {
-        self.cached_level
-            .store(f32::to_bits(-1.), Ordering::Relaxed);
-        self.cached_muted.store(false, Ordering::Relaxed);
-        self.is_connected.store(false, Ordering::Relaxed);
         self.tx = None;
     }
 }
@@ -1079,89 +991,93 @@ fn spotifast_worker_loop(
     is_connected: Arc<AtomicBool>,
     last_unmuted: Arc<Mutex<f32>>,
 ) {
-    let mut last_poll = Instant::now() - Duration::from_secs(1);
-    let mut last_reconnect = Instant::now() - Duration::from_secs(10);
-    let mut running = false;
+    // Each reading starts a `spotifast` process (~0.2 s), so poll about once a second, and
+    // never shortly after a change: a reading taken before it landed would move the slider back.
+    const POLL: Duration = Duration::from_millis(1000);
+    const SETTLE: Duration = Duration::from_millis(1500);
+    let mut last_poll: Option<Instant> = None;
+    let mut changed: Option<Instant> = None;
+    // Spotifast's own mute state as last read or set here. `cached_muted` can't serve: the
+    // adapter stores the requested state there before the command reaches this worker.
+    let mut player_muted = false;
 
     loop {
-        let poll_interval = if running {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_millis(1500)
-        };
-        let wait_dur = poll_interval.saturating_sub(last_poll.elapsed());
-
-        let mut cmd = match rx.recv_timeout(wait_dur) {
-            Ok(c) => Some(c),
-            Err(RecvTimeoutError::Timeout) => None,
+        let wait = last_poll.map_or(Duration::ZERO, |t| POLL.saturating_sub(t.elapsed()));
+        let mut cmds = Vec::new();
+        match rx.recv_timeout(wait) {
+            Ok(c) => cmds.push(c),
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
-        };
-        // Coalesce rapid volume drag commands
-        while let Ok(next) = rx.try_recv() {
-            cmd = Some(next);
         }
+        cmds.extend(rx.try_iter());
+        // A drag queues many levels; only the newest one is sent.
+        let newest_level = cmds
+            .iter()
+            .rposition(|c| matches!(c, DesktopCommand::SetLevel(_)));
 
-        let is_explicit_reconnect = matches!(cmd, Some(DesktopCommand::Reconnect));
-        if !running
-            || is_explicit_reconnect
-            || last_reconnect.elapsed() >= Duration::from_millis(1500)
-        {
-            last_reconnect = Instant::now();
-            running = find_spotifast_window().is_some();
-            is_connected.store(running, Ordering::Relaxed);
-            if running
-                && (is_explicit_reconnect
-                    || cached_level.load(Ordering::Relaxed) == f32::to_bits(-1.))
-            {
-                if let Some((vol, muted)) = read_spotifast_volume() {
-                    cached_level.store(f32::to_bits(vol), Ordering::Relaxed);
-                    cached_muted.store(muted, Ordering::Relaxed);
-                    if vol > 0.005 {
-                        if let Ok(mut u) = last_unmuted.lock() {
-                            *u = vol;
+        for (i, cmd) in cmds.into_iter().enumerate() {
+            match cmd {
+                DesktopCommand::SetLevel(_) if Some(i) != newest_level => {}
+                DesktopCommand::SetLevel(lvl) => {
+                    if write_spotifast_volume(lvl) {
+                        player_muted = lvl <= 0.005;
+                        cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
+                        cached_muted.store(player_muted, Ordering::Relaxed);
+                        if lvl > 0.005 {
+                            if let Ok(mut u) = last_unmuted.lock() {
+                                *u = lvl;
+                            }
                         }
+                        changed = Some(Instant::now());
+                    }
+                }
+                DesktopCommand::SetMuted(muted) => {
+                    if muted && !player_muted {
+                        // `mute` toggles; Spotifast's own unmute then restores its level.
+                        if run_spotifast(&["mute"]).is_some() {
+                            player_muted = true;
+                        }
+                    } else if !muted && player_muted {
+                        // Setting a volume unmutes, and works even if it was dragged to zero.
+                        let restore = last_unmuted.lock().map(|u| *u).unwrap_or(0.5).max(0.05);
+                        if write_spotifast_volume(restore) {
+                            player_muted = false;
+                            cached_level.store(f32::to_bits(restore), Ordering::Relaxed);
+                        }
+                    }
+                    cached_muted.store(player_muted, Ordering::Relaxed);
+                    changed = Some(Instant::now());
+                }
+                DesktopCommand::Reconnect => {
+                    if !is_connected.load(Ordering::Relaxed) {
+                        last_poll = None;
                     }
                 }
             }
         }
 
-        if running {
-            if let Some(cmd) = cmd {
-                match cmd {
-                    DesktopCommand::SetLevel(lvl) => {
-                        let _ = write_spotifast_volume(lvl);
-                        cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
-                        if lvl > 0.005 {
-                            cached_muted.store(false, Ordering::Relaxed);
-                            if let Ok(mut u) = last_unmuted.lock() {
-                                *u = lvl;
-                            }
-                        }
-                        last_poll = Instant::now() + Duration::from_millis(300);
-                    }
-                    DesktopCommand::SetMuted(muted) => {
-                        let _ = set_spotifast_mute(muted);
-                        cached_muted.store(muted, Ordering::Relaxed);
-                        last_poll = Instant::now() + Duration::from_millis(500);
-                    }
-                    DesktopCommand::Reconnect => {
-                        if let Some((vol, muted)) = read_spotifast_volume() {
-                            cached_level.store(f32::to_bits(vol), Ordering::Relaxed);
-                            cached_muted.store(muted, Ordering::Relaxed);
-                        }
-                    }
-                }
-            } else if last_poll.elapsed() >= Duration::from_millis(250) {
-                last_poll = Instant::now();
-                if let Some((vol, muted)) = read_spotifast_volume() {
-                    cached_level.store(f32::to_bits(vol), Ordering::Relaxed);
+        let settled = changed.map_or(true, |t| t.elapsed() >= SETTLE);
+        let due = last_poll.map_or(true, |t| t.elapsed() >= POLL);
+        if settled && due {
+            last_poll = Some(Instant::now());
+            match read_spotifast_volume() {
+                Some(vol) => {
+                    let muted = vol <= 0.005;
+                    player_muted = muted;
                     cached_muted.store(muted, Ordering::Relaxed);
-                    if vol > 0.005 {
+                    if muted {
+                        // Spotifast reports 0 while muted; keep showing the level it returns to.
+                        let back = last_unmuted.lock().map(|u| *u).unwrap_or(0.);
+                        cached_level.store(f32::to_bits(back), Ordering::Relaxed);
+                    } else {
+                        cached_level.store(f32::to_bits(vol), Ordering::Relaxed);
                         if let Ok(mut u) = last_unmuted.lock() {
                             *u = vol;
                         }
                     }
+                    is_connected.store(true, Ordering::Relaxed);
                 }
+                None => is_connected.store(false, Ordering::Relaxed),
             }
         }
     }
@@ -1824,9 +1740,45 @@ mod tests {
         assert_eq!(adapter.get_volume(), Some(0.65));
         assert_eq!(adapter.get_muted(), Some(false));
 
+        // Closing the panel stops the worker but keeps the last level for an instant reopen.
         adapter.disconnect();
-        assert!(!adapter.is_available());
-        assert_eq!(adapter.get_volume(), None);
+        assert!(adapter.is_available());
+        assert_eq!(adapter.get_volume(), Some(0.65));
+    }
+
+    /// Mutes and unmutes the running Spotifast through the adapter:
+    /// `cargo test live_spotifast_mute -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_spotifast_mute() {
+        let before = read_spotifast_volume().expect("Spotifast must be running and playing");
+        assert!(before > 0.005, "unmute Spotifast first");
+        let mut adapter = SpotifastVolumeAdapter::new();
+        adapter.reconnect();
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(adapter.get_muted(), Some(false));
+
+        adapter.set_muted(true);
+        thread::sleep(Duration::from_millis(1500));
+        let muted = read_spotifast_volume();
+        println!("before {before:.2}, muted {muted:?}");
+        assert_eq!(muted, Some(0.));
+
+        adapter.set_muted(false);
+        thread::sleep(Duration::from_millis(1500));
+        let after = read_spotifast_volume();
+        println!("unmuted {after:?}");
+        assert!(after.is_some_and(|v| (v - before).abs() < 0.015));
+    }
+
+    #[test]
+    fn test_parse_spotifast_now_playing_volume() {
+        let raw = "playing\tSweet Fantasy\tMagnolia Celebration\tFantasia\t93208\t396000\t73\toff\toff\thttps://x\tno\tSpotifast\n";
+        assert_eq!(parse_spotifast_volume(raw), Some(0.73));
+        let muted = "paused\ta\tb\tc\t0\t0\t0\toff\toff\t\tno\tSpotifast";
+        assert_eq!(parse_spotifast_volume(muted), Some(0.0));
+        assert_eq!(parse_spotifast_volume("stopped"), None);
+        assert_eq!(parse_spotifast_volume(""), None);
     }
 
     #[test]
