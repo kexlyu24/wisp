@@ -1,11 +1,13 @@
 //! Time-synced lyrics from LRCLIB (https://lrclib.net), falling back to NetEase Cloud Music's
 //! public web API when LRCLIB has none, fetched on a worker thread.
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 use windows::core::HSTRING;
 use windows::Foundation::Uri;
-use windows::Web::Http::Filters::{HttpBaseProtocolFilter, HttpCacheReadBehavior, HttpCacheWriteBehavior, HttpCookieUsageBehavior};
+use windows::Web::Http::Filters::{
+    HttpBaseProtocolFilter, HttpCacheReadBehavior, HttpCacheWriteBehavior, HttpCookieUsageBehavior,
+};
 use windows::Web::Http::HttpClient;
 
 pub struct Line {
@@ -45,7 +47,7 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
     let (req_tx, req_rx) = mpsc::channel::<Request>();
     let (reply_tx, reply_rx) = mpsc::channel();
     thread::spawn(move || {
-        let client = http_client();
+        let mut client: Option<HttpClient> = None;
         let mut pending = req_rx.recv().ok();
         while let Some(mut req) = pending.take() {
             while let Ok(newer) = req_rx.try_recv() {
@@ -53,18 +55,37 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
             }
             if !req.fresh {
                 if let Some(status) = read_cache(&req) {
-                    if reply_tx.send(Reply { key: req.key, status }).is_err() {
+                    if reply_tx
+                        .send(Reply {
+                            key: req.key,
+                            status,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                     pending = req_rx.recv().ok();
                     continue;
                 }
             }
+            if client.is_none() {
+                client = http_client();
+            }
             // LRCLIB answers 503 when it is overloaded, sometimes for minutes: retry with growing
             // gaps for about ten minutes, and drop the work as soon as a newer track is requested.
             let mut status = Status::Failed;
-            for (attempt, delay) in [0u64, 2, 5, 12, 25, 45, 60, 60, 60, 60, 60, 60, 60, 60, 60].into_iter().enumerate() {
-                if attempt == 1 && reply_tx.send(Reply { key: req.key.clone(), status: Status::Busy }).is_err() {
+            for (attempt, delay) in [0u64, 2, 5, 12, 25, 45, 60, 60, 60, 60, 60, 60, 60, 60, 60]
+                .into_iter()
+                .enumerate()
+            {
+                if attempt == 1
+                    && reply_tx
+                        .send(Reply {
+                            key: req.key.clone(),
+                            status: Status::Busy,
+                        })
+                        .is_err()
+                {
                     return;
                 }
                 if delay > 0 {
@@ -89,7 +110,13 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
                 continue;
             }
             write_cache(&req, &status);
-            if reply_tx.send(Reply { key: req.key, status }).is_err() {
+            if reply_tx
+                .send(Reply {
+                    key: req.key,
+                    status,
+                })
+                .is_err()
+            {
                 break;
             }
             pending = req_rx.recv().ok();
@@ -126,13 +153,24 @@ fn lrclib(client: &HttpClient, req: &Request) -> Status {
     let (title, artist) = (clean_title(&req.title), primary_artist(&req.artist));
     let mut urls = vec![
         get,
-        format!("https://lrclib.net/api/search?track_name={}&artist_name={}", encode(&req.title), encode(&req.artist)),
+        format!(
+            "https://lrclib.net/api/search?track_name={}&artist_name={}",
+            encode(&req.title),
+            encode(&req.artist)
+        ),
     ];
     // Titles like "Song (feat. X) - Remastered 2011" or "A, B & C" artists rarely match exactly.
     if title != req.title || artist != req.artist {
-        urls.push(format!("https://lrclib.net/api/search?track_name={}&artist_name={}", encode(&title), encode(&artist)));
+        urls.push(format!(
+            "https://lrclib.net/api/search?track_name={}&artist_name={}",
+            encode(&title),
+            encode(&artist)
+        ));
     }
-    urls.push(format!("https://lrclib.net/api/search?q={}", encode(&format!("{} {}", artist, title))));
+    urls.push(format!(
+        "https://lrclib.net/api/search?q={}",
+        encode(&format!("{} {}", artist, title))
+    ));
 
     let (mut plain, mut unreachable) = (false, 0);
     for url in urls {
@@ -157,11 +195,32 @@ fn lrclib(client: &HttpClient, req: &Request) -> Status {
 /// Searches NetEase for the track and reads its LRC; `None` when nothing matches closely or the
 /// API does not answer.
 fn netease(client: &HttpClient, req: &Request) -> Option<Status> {
-    let query = format!("{} {}", primary_artist(&req.artist), clean_title(&req.title));
-    let (code, body) = http_get(client, &format!("https://music.163.com/api/search/get?s={}&type=1&limit=10", encode(&query)))?;
-    let id = if code == 200 { pick_song(&body, req)? } else { return None };
-    let (code, body) = http_get(client, &format!("https://music.163.com/api/song/lyric?id={}&lv=1&tv=-1", id))?;
-    if code == 200 { netease_lyrics(&body) } else { None }
+    let query = format!(
+        "{} {}",
+        primary_artist(&req.artist),
+        clean_title(&req.title)
+    );
+    let (code, body) = http_get(
+        client,
+        &format!(
+            "https://music.163.com/api/search/get?s={}&type=1&limit=10",
+            encode(&query)
+        ),
+    )?;
+    let id = if code == 200 {
+        pick_song(&body, req)?
+    } else {
+        return None;
+    };
+    let (code, body) = http_get(
+        client,
+        &format!("https://music.163.com/api/song/lyric?id={}&lv=1&tv=-1", id),
+    )?;
+    if code == 200 {
+        netease_lyrics(&body)
+    } else {
+        None
+    }
 }
 
 /// The id of the first search result whose title, artist and length all match the request.
@@ -189,31 +248,62 @@ fn pick_song(json: &str, req: &Request) -> Option<u64> {
             })
         });
         let ms = song["duration"].as_i64().unwrap_or(0);
-        let timed = req.duration <= 0 || ms <= 0 || (ms as f64 / 1000. - req.duration as f64).abs() <= 3.;
+        let timed =
+            req.duration <= 0 || ms <= 0 || (ms as f64 / 1000. - req.duration as f64).abs() <= 3.;
         named && by && timed
     };
-    songs.iter().find(|s| matches(s, true)).or_else(|| songs.iter().find(|s| matches(s, false)))?["id"].as_u64()
+    songs
+        .iter()
+        .find(|s| matches(s, true))
+        .or_else(|| songs.iter().find(|s| matches(s, false)))?["id"]
+        .as_u64()
 }
 
 fn normalize(s: &str) -> String {
-    s.to_lowercase().replace('\u{2019}', "'").split_whitespace().collect::<Vec<_>>().join(" ")
+    s.to_lowercase()
+        .replace('\u{2019}', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Reads a NetEase `/song/lyric` reply, dropping the credit lines it puts at the top.
 fn netease_lyrics(json: &str) -> Option<Status> {
     let doc: serde_json::Value = serde_json::from_str(json).ok()?;
     let text = doc["lrc"]["lyric"].as_str().unwrap_or("");
-    if doc["pureMusic"].as_bool() == Some(true) || doc["nolyric"].as_bool() == Some(true) || text.contains("纯音乐") {
+    if doc["pureMusic"].as_bool() == Some(true)
+        || doc["nolyric"].as_bool() == Some(true)
+        || text.contains("纯音乐")
+    {
         return Some(Status::Instrumental);
     }
-    let lines: Vec<Line> = parse_lrc(text).into_iter().filter(|l| !is_credit(&l.text)).collect();
-    lines.iter().any(|l| !l.text.trim().is_empty()).then_some(Status::Synced(lines))
+    let lines: Vec<Line> = parse_lrc(text)
+        .into_iter()
+        .filter(|l| !is_credit(&l.text))
+        .collect();
+    lines
+        .iter()
+        .any(|l| !l.text.trim().is_empty())
+        .then_some(Status::Synced(lines))
 }
 
 /// "作词 : Someone", "Composer: Someone" and the like.
 fn is_credit(text: &str) -> bool {
-    let Some((head, _)) = text.split_once(':').or_else(|| text.split_once('：')) else { return false };
-    let roles = ["作词", "作曲", "编曲", "制作人", "混音", "母带", "lyricist", "composer", "arranger", "producer"];
+    let Some((head, _)) = text.split_once(':').or_else(|| text.split_once('：')) else {
+        return false;
+    };
+    let roles = [
+        "作词",
+        "作曲",
+        "编曲",
+        "制作人",
+        "混音",
+        "母带",
+        "lyricist",
+        "composer",
+        "arranger",
+        "producer",
+    ];
     roles.contains(&head.trim().to_lowercase().as_str())
 }
 
@@ -229,7 +319,9 @@ fn classify(response: Option<(i32, String)>) -> Option<Status> {
 /// Drops featured artists and edition suffixes: "Song (feat. X) - Remastered 2011" -> "Song".
 pub fn clean_title(title: &str) -> String {
     let mut s = title.to_string();
-    let noise = ["remaster", "live", "edit", "version", "mono", "stereo", "mix", "bonus", "deluxe"];
+    let noise = [
+        "remaster", "live", "edit", "version", "mono", "stereo", "mix", "bonus", "deluxe",
+    ];
     if let Some(i) = s.find(" - ") {
         let tail = s[i + 3..].to_ascii_lowercase();
         if noise.iter().any(|k| tail.contains(k)) {
@@ -239,9 +331,13 @@ pub fn clean_title(title: &str) -> String {
     for (open, close) in [('(', ')'), ('[', ']')] {
         let mut from = 0;
         while let Some(start) = s[from..].find(open).map(|i| i + from) {
-            let Some(end) = s[start..].find(close).map(|i| i + start) else { break };
+            let Some(end) = s[start..].find(close).map(|i| i + start) else {
+                break;
+            };
             let inner = s[start + 1..end].trim().to_ascii_lowercase();
-            let featured = ["feat", "ft.", "with "].iter().any(|k| inner.starts_with(k));
+            let featured = ["feat", "ft.", "with "]
+                .iter()
+                .any(|k| inner.starts_with(k));
             if featured || noise.iter().any(|k| inner.contains(k)) {
                 s.replace_range(start..=end, "");
             } else {
@@ -250,28 +346,47 @@ pub fn clean_title(title: &str) -> String {
         }
     }
     let cleaned = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.is_empty() { title.to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        title.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// The first of several credited artists: "A, B & C feat. D" -> "A".
 pub fn primary_artist(artist: &str) -> String {
     let lower = artist.to_ascii_lowercase();
-    let cut = [", ", " & ", " feat", " ft.", " x ", "; ", " and "].iter().filter_map(|sep| lower.find(sep)).min();
+    let cut = [", ", " & ", " feat", " ft.", " x ", "; ", " and "]
+        .iter()
+        .filter_map(|sep| lower.find(sep))
+        .min();
     let first = cut.map_or(artist, |i| &artist[..i]).trim();
-    if first.is_empty() { artist.trim().to_string() } else { first.to_string() }
+    if first.is_empty() {
+        artist.trim().to_string()
+    } else {
+        first.to_string()
+    }
 }
 
 /// `%APPDATA%\Wisp\lyrics\<hash>.lrc`, keyed by title and artist.
 fn cache_path(req: &Request) -> Option<std::path::PathBuf> {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in format!("{}\0{}", req.title.to_lowercase(), req.artist.to_lowercase()).bytes() {
+    for b in format!(
+        "{}\0{}",
+        req.title.to_lowercase(),
+        req.artist.to_lowercase()
+    )
+    .bytes()
+    {
         hash = (hash ^ b as u64).wrapping_mul(0x100000001b3);
     }
     crate::tasks::data_path("lyrics").map(|dir| dir.join(format!("{:016x}.lrc", hash)))
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// "Not found" is kept for a day so new LRCLIB uploads show up; failures are never cached.
@@ -297,7 +412,8 @@ fn encode_cache(status: &Status, now: u64) -> Option<String> {
 fn decode_cache(src: &str, now: u64) -> Option<Status> {
     let (head, body) = src.split_once('\n').unwrap_or((src, ""));
     match head.trim() {
-        "#synced" => Some(Status::Synced(parse_lrc(body))).filter(|s| matches!(s, Status::Synced(l) if !l.is_empty())),
+        "#synced" => Some(Status::Synced(parse_lrc(body)))
+            .filter(|s| matches!(s, Status::Synced(l) if !l.is_empty())),
         "#plain" => Some(Status::Plain),
         "#instrumental" => Some(Status::Instrumental),
         h => {
@@ -312,7 +428,9 @@ fn read_cache(req: &Request) -> Option<Status> {
 }
 
 fn write_cache(req: &Request, status: &Status) {
-    let (Some(path), Some(text)) = (cache_path(req), encode_cache(status, now_secs())) else { return };
+    let (Some(path), Some(text)) = (cache_path(req), encode_cache(status, now_secs())) else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -330,7 +448,11 @@ fn http_client() -> Option<HttpClient> {
     }
     let client = HttpClient::Create(&filter).ok()?;
     if let Ok(agent) = client.DefaultRequestHeaders().and_then(|h| h.UserAgent()) {
-        let _ = agent.TryParseAdd(&HSTRING::from(concat!("Wisp/", env!("CARGO_PKG_VERSION"), " (Windows notch)")));
+        let _ = agent.TryParseAdd(&HSTRING::from(concat!(
+            "Wisp/",
+            env!("CARGO_PKG_VERSION"),
+            " (Windows notch)"
+        )));
     }
     Some(client)
 }
@@ -339,13 +461,23 @@ fn http_get(client: &HttpClient, url: &str) -> Option<(i32, String)> {
     let uri = Uri::CreateUri(&HSTRING::from(url)).ok()?;
     let response = client.GetAsync(&uri).ok()?.get().ok()?;
     let code = response.StatusCode().ok()?.0;
-    let body = response.Content().ok()?.ReadAsStringAsync().ok()?.get().ok()?.to_string();
+    let body = response
+        .Content()
+        .ok()?
+        .ReadAsStringAsync()
+        .ok()?
+        .get()
+        .ok()?
+        .to_string();
     Some((code, body))
 }
 
 /// Interprets a `/get` object or a `/search` array: synced lyrics win, then instrumental, then plain.
 pub fn parse_record(json: &str) -> Status {
-    if let Some(text) = json_strings(json, "syncedLyrics").into_iter().find(|t| !t.trim().is_empty()) {
+    if let Some(text) = json_strings(json, "syncedLyrics")
+        .into_iter()
+        .find(|t| !t.trim().is_empty())
+    {
         let lines = parse_lrc(&text);
         if !lines.is_empty() {
             return Status::Synced(lines);
@@ -354,7 +486,10 @@ pub fn parse_record(json: &str) -> Status {
     if json.contains("\"instrumental\":true") {
         return Status::Instrumental;
     }
-    if json_strings(json, "plainLyrics").iter().any(|t| !t.trim().is_empty()) {
+    if json_strings(json, "plainLyrics")
+        .iter()
+        .any(|t| !t.trim().is_empty())
+    {
         return Status::Plain;
     }
     Status::NotFound
@@ -375,7 +510,10 @@ pub fn parse_lrc(src: &str) -> Vec<Line> {
         }
         let text = rest.trim().to_string();
         for time in times {
-            lines.push(Line { time, text: text.clone() });
+            lines.push(Line {
+                time,
+                text: text.clone(),
+            });
         }
     }
     lines.sort_by(|a, b| a.time.total_cmp(&b.time));
@@ -446,7 +584,9 @@ fn unescape(body: &str) -> Option<String> {
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{:02X}", b),
         })
         .collect()
@@ -458,9 +598,13 @@ mod tests {
 
     #[test]
     fn parses_lrc_with_multiple_stamps_and_metadata() {
-        let lines = parse_lrc("[ar:Someone]\n[00:12.50]Hello\n[01:02.00][00:05.00]Again\n[00:20.00]\n");
+        let lines =
+            parse_lrc("[ar:Someone]\n[00:12.50]Hello\n[01:02.00][00:05.00]Again\n[00:20.00]\n");
         let got: Vec<(f64, &str)> = lines.iter().map(|l| (l.time, l.text.as_str())).collect();
-        assert_eq!(got, [(5., "Again"), (12.5, "Hello"), (20., ""), (62., "Again")]);
+        assert_eq!(
+            got,
+            [(5., "Again"), (12.5, "Hello"), (20., ""), (62., "Again")]
+        );
     }
 
     #[test]
@@ -477,10 +621,17 @@ mod tests {
 
     #[test]
     fn search_skips_entries_without_synced_lyrics() {
-        let json = r#"[{"syncedLyrics":null,"plainLyrics":"x"},{"syncedLyrics":"[00:03.00]Found"}]"#;
+        let json =
+            r#"[{"syncedLyrics":null,"plainLyrics":"x"},{"syncedLyrics":"[00:03.00]Found"}]"#;
         assert!(matches!(parse_record(json), Status::Synced(ref l) if l[0].text == "Found"));
-        assert!(matches!(parse_record(r#"{"instrumental":true,"syncedLyrics":null}"#), Status::Instrumental));
-        assert!(matches!(parse_record(r#"{"plainLyrics":"words","syncedLyrics":null}"#), Status::Plain));
+        assert!(matches!(
+            parse_record(r#"{"instrumental":true,"syncedLyrics":null}"#),
+            Status::Instrumental
+        ));
+        assert!(matches!(
+            parse_record(r#"{"plainLyrics":"words","syncedLyrics":null}"#),
+            Status::Plain
+        ));
         assert!(matches!(parse_record("[]"), Status::NotFound));
     }
 
@@ -489,14 +640,23 @@ mod tests {
         let busy = r#"{"message":"The server is busy","name":"ServerOverloaded","statusCode":503}"#;
         assert!(classify(Some((503, busy.into()))).is_none());
         assert!(classify(None).is_none());
-        assert!(matches!(classify(Some((404, String::new()))), Some(Status::NotFound)));
-        assert!(matches!(classify(Some((200, "[]".into()))), Some(Status::NotFound)));
+        assert!(matches!(
+            classify(Some((404, String::new()))),
+            Some(Status::NotFound)
+        ));
+        assert!(matches!(
+            classify(Some((200, "[]".into()))),
+            Some(Status::NotFound)
+        ));
     }
 
     #[test]
     fn loosens_titles_and_artists() {
         assert_eq!(clean_title("Blah Blah"), "Blah Blah");
-        assert_eq!(clean_title("Song (feat. Someone) - Remastered 2011"), "Song");
+        assert_eq!(
+            clean_title("Song (feat. Someone) - Remastered 2011"),
+            "Song"
+        );
         assert_eq!(clean_title("Track [Live at Wembley]"), "Track");
         assert_eq!(clean_title("Love (Is Strange)"), "Love (Is Strange)");
         assert_eq!(clean_title("Hey - Jude"), "Hey - Jude");
@@ -519,7 +679,10 @@ mod tests {
             _ => panic!("expected synced lyrics"),
         }
         let missing = encode_cache(&Status::NotFound, 1000).unwrap();
-        assert!(matches!(decode_cache(&missing, 1000 + 60), Some(Status::NotFound)));
+        assert!(matches!(
+            decode_cache(&missing, 1000 + 60),
+            Some(Status::NotFound)
+        ));
         assert!(decode_cache(&missing, 1000 + NOT_FOUND_TTL).is_none());
         assert!(encode_cache(&Status::Failed, 0).is_none());
         assert!(decode_cache("garbage", 0).is_none());
@@ -530,14 +693,34 @@ mod tests {
     #[ignore]
     fn live_lrclib() {
         let client = http_client().unwrap();
-        let req = Request { key: String::new(), title: "Blah Blah".into(), artist: "Joji".into(), album: String::new(), duration: 162, fresh: true };
+        let req = Request {
+            key: String::new(),
+            title: "Blah Blah".into(),
+            artist: "Joji".into(),
+            album: String::new(),
+            duration: 162,
+            fresh: true,
+        };
         let status = fetch(&client, &req);
-        assert!(matches!(status, Status::Synced(_) | Status::Failed), "a busy server must not read as not found");
-        assert!(matches!(status, Status::Synced(_)), "LRCLIB was unreachable on every attempt");
+        assert!(
+            matches!(status, Status::Synced(_) | Status::Failed),
+            "a busy server must not read as not found"
+        );
+        assert!(
+            matches!(status, Status::Synced(_)),
+            "LRCLIB was unreachable on every attempt"
+        );
     }
 
     fn request(title: &str, artist: &str, duration: i64) -> Request {
-        Request { key: String::new(), title: title.into(), artist: artist.into(), album: String::new(), duration, fresh: true }
+        Request {
+            key: String::new(),
+            title: title.into(),
+            artist: artist.into(),
+            album: String::new(),
+            duration,
+            fresh: true,
+        }
     }
 
     #[test]
@@ -547,12 +730,27 @@ mod tests {
             {"id":2,"name":"Yellow","duration":266773,"artists":[{"name":"Someone Else"}]},
             {"id":3,"name":"Yellow (Live)","duration":266773,"artists":[{"name":"Coldplay"}]},
             {"id":4,"name":"Yellow","duration":266773,"artists":[{"name":"Coldplay"}]}]}}"#;
-        assert_eq!(pick_song(json, &request("Yellow", "Coldplay", 267)), Some(4));
-        assert_eq!(pick_song(json, &request("Yellow [Live]", "Coldplay", 267)), Some(3));
-        assert_eq!(pick_song(json, &request("Yellow - Remastered 2011", "Coldplay feat. X", 0)), Some(1));
+        assert_eq!(
+            pick_song(json, &request("Yellow", "Coldplay", 267)),
+            Some(4)
+        );
+        assert_eq!(
+            pick_song(json, &request("Yellow [Live]", "Coldplay", 267)),
+            Some(3)
+        );
+        assert_eq!(
+            pick_song(
+                json,
+                &request("Yellow - Remastered 2011", "Coldplay feat. X", 0)
+            ),
+            Some(1)
+        );
         assert_eq!(pick_song(json, &request("Yellow", "Coldplay", 280)), None);
         assert_eq!(pick_song(json, &request("Fix You", "Coldplay", 0)), None);
-        assert_eq!(pick_song("not json", &request("Yellow", "Coldplay", 0)), None);
+        assert_eq!(
+            pick_song("not json", &request("Yellow", "Coldplay", 0)),
+            None
+        );
     }
 
     #[test]
@@ -565,8 +763,14 @@ mod tests {
             }
             _ => panic!("expected synced lyrics"),
         }
-        assert!(matches!(netease_lyrics(r#"{"pureMusic":true,"lrc":{"lyric":""}}"#), Some(Status::Instrumental)));
-        assert!(matches!(netease_lyrics(r#"{"lrc":{"lyric":"[00:00.00] 纯音乐，请欣赏"}}"#), Some(Status::Instrumental)));
+        assert!(matches!(
+            netease_lyrics(r#"{"pureMusic":true,"lrc":{"lyric":""}}"#),
+            Some(Status::Instrumental)
+        ));
+        assert!(matches!(
+            netease_lyrics(r#"{"lrc":{"lyric":"[00:00.00] 纯音乐，请欣赏"}}"#),
+            Some(Status::Instrumental)
+        ));
         assert!(netease_lyrics(r#"{"uncollected":true,"lrc":{"lyric":""}}"#).is_none());
     }
 
@@ -576,7 +780,9 @@ mod tests {
     fn live_netease() {
         let client = http_client().unwrap();
         let status = netease(&client, &request("Yellow", "Coldplay", 267));
-        assert!(matches!(status, Some(Status::Synced(ref l)) if l.iter().any(|l| l.text.contains("stars"))));
+        assert!(
+            matches!(status, Some(Status::Synced(ref l)) if l.iter().any(|l| l.text.contains("stars")))
+        );
     }
 
     #[test]
