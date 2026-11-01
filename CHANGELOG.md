@@ -2,7 +2,7 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
-## [Unreleased] - 2026-11-01
+## [0.1.8] - 2026-11-02
 
 ### Added
 - **Spotify Desktop Native Volume Adapter (`SpotifyVolumeAdapter`)**: Direct player volume and mute/unmute control via Windows UI Automation (`IUIAutomationRangeValuePattern`, `IUIAutomationInvokePattern`) targeting Spotify's internal volume slider.
@@ -11,7 +11,7 @@ All notable changes to Wisp in this development checkpoint are documented in thi
 - **Spotifast CLI IPC Volume Adapter (`SpotifastVolumeAdapter`)**: Native CLI volume control [0.0, 100.0] and mute toggling without touching Windows master volume.
 - **Apple Music for Windows UIA Volume Adapter (`AppleMusicVolumeAdapter`)**: Windows UI Automation RangeValue adapter structure for Apple Music Desktop.
 - **Browser Per-Application Audio Session Adapters**: Dedicated per-process Core Audio session volume control for Google Chrome (`ChromeYouTubeVolumeAdapter`) and Microsoft Edge (`EdgeYouTubeVolumeAdapter`) using Windows `ISimpleAudioVolume`.
-- **Interactive Calendar & Event Scheduling**: Month-view calendar with weekday headers, date selection, month/year boundary navigation, leap year handling, and local JSON persistence (`%APPDATA%\Wisp\calendar.json`) with schedule creation, editing, deletion, and date indicators.
+- **Interactive Calendar & Event Scheduling**: Month-view calendar with weekday headers, date selection, month/year boundary navigation, leap year handling, and local persistence (`%APPDATA%\Wisp\calendar.txt`) with schedule creation, editing, deletion, and date indicators.
 - **Standardized Volume Readback & Focus Race Test Suites**: Unit and integration test suites covering player volume normalization, range mapping, concurrent player switching, UIA live verification, and mock audio session isolation.
 - **Formal PRD Documentation**: Complete Product Requirements Documents in `docs/WISP-PRD.md` and `Wisp-Product-PRD-EN.md` with verified SHA-256 byte parity.
 
