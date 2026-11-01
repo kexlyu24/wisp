@@ -4,6 +4,8 @@
 
 **A Dynamic Island–style notch for Windows, inspired by Apple's design.**
 
+🙏 **Thanks for contributing, [@overhaulpxl](https://github.com/overhaulpxl)!** Per-app volume, the calendar schedule and a lighter idle footprint are their work.
+
 It sits at the top of your screen, shows what's playing and your notifications, and opens into a small panel with lyrics, a calendar, a to-do list, a Pomodoro timer and a file shelf. When it would hide something, it steps aside.
 
 ![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)
@@ -205,7 +207,8 @@ The smoke test drives the real window: it checks the expand/collapse sizes, plac
 
 ## Credits
 
-- Lyrics from [LRCLIB](https://lrclib.net), a free, open lyrics database. Please be kind to their servers.
+- Contributors: [@overhaulpxl](https://github.com/overhaulpxl) (per-app volume, calendar schedule, idle performance).
+- Lyrics from [LRCLIB](https://lrclib.net), a free, open lyrics database (please be kind to their servers), with NetEase Cloud Music as a fallback.
 - [Inter](https://rsms.me/inter/) font by The Inter Project Authors, bundled under the SIL Open Font License 1.1 (`assets/fonts/Inter-LICENSE.txt`).
 - Design inspired by Apple's Dynamic Island and the macOS notch. This is an independent project, not affiliated with Apple, and contains no Apple code or assets.
 
