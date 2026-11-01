@@ -93,6 +93,7 @@ pub fn is_valid_date(s: &str) -> bool {
 }
 
 /// Helper to validate HH:MM format
+#[allow(dead_code)]
 pub fn is_valid_time(s: &str) -> bool {
     if s.is_empty() {
         return true;
@@ -108,6 +109,37 @@ pub fn is_valid_time(s: &str) -> bool {
         return false;
     };
     h < 24 && m < 60
+}
+
+/// Minutes after midnight for a typed time: `9:30`, `09:30`, `9.30`, `21:05`.
+pub fn parse_time(token: &str) -> Option<u32> {
+    let (h, m) = token.trim().split_once(|c| c == ':' || c == '.')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// `HH:MM` for minutes after midnight.
+pub fn format_time(minutes: u32) -> String {
+    let minutes = minutes % (24 * 60);
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// Splits an optional leading time off an event title, so typing `9:30 Standup` or
+/// `9:30-10:00 Standup` still works next to the time picker: (start, end, title).
+pub fn split_leading_time(text: &str) -> (Option<u32>, Option<u32>, String) {
+    let text = text.trim();
+    let (first, rest) = text.split_once(' ').unwrap_or((text, ""));
+    let (start, end) = match first.split_once(|c| c == '-' || c == '\u{2013}') {
+        Some((a, b)) => (parse_time(a), parse_time(b)),
+        None => (parse_time(first), None),
+    };
+    match start {
+        Some(start) if !rest.trim().is_empty() => (Some(start), end, rest.trim().to_string()),
+        _ => (None, None, text.to_string()),
+    }
 }
 
 pub fn parse_schedules(src: &str) -> Vec<Schedule> {
@@ -193,6 +225,14 @@ pub fn days_in_month(year: i32, month: u32) -> u32 {
         }
         _ => 30,
     }
+}
+
+/// Day of the week, 0 = Sunday (Sakamoto's method).
+pub fn weekday_of(year: i32, month: u32, day: u32) -> u32 {
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    ((y + y / 4 - y / 100 + y / 400 + t[(month.clamp(1, 12) - 1) as usize] + day as i32) % 7)
+        as u32
 }
 
 pub fn first_weekday_of_month(year: i32, month: u32) -> u32 {
@@ -287,11 +327,8 @@ impl CalendarState {
         }
         let date = self.selected_date_str();
         let next_id = self.schedules.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-        let st = if start_time.trim().is_empty() {
-            "09:00".to_string()
-        } else {
-            start_time.trim().to_string()
-        };
+        // An empty start time is an all-day event.
+        let st = start_time.trim().to_string();
         let et = end_time.trim().to_string();
         self.schedules.push(Schedule {
             id: next_id,
@@ -324,12 +361,7 @@ impl CalendarState {
             return false;
         }
         if let Some(pos) = self.schedules.iter().position(|s| s.id == id) {
-            let st = if start_time.trim().is_empty() {
-                "09:00".to_string()
-            } else {
-                start_time.trim().to_string()
-            };
-            self.schedules[pos].start_time = st;
+            self.schedules[pos].start_time = start_time.trim().to_string();
             self.schedules[pos].end_time = end_time.trim().to_string();
             self.schedules[pos].title = title.to_string();
             self.schedules[pos].description = description.trim().to_string();
@@ -796,6 +828,21 @@ mod tests {
         assert!(!is_valid_date("2026-13-01"));
 
         assert!(is_valid_time("09:00"));
+        assert_eq!(weekday_of(2026, 11, 2), 1); // Monday
+        assert_eq!(weekday_of(2024, 2, 29), 4); // Thursday
+        assert_eq!(parse_time("9:30"), Some(570));
+        assert_eq!(parse_time("09.05"), Some(545));
+        assert_eq!(parse_time("24:00"), None);
+        assert_eq!(parse_time("930"), None);
+        assert_eq!(parse_time("Lunch"), None);
+        assert_eq!(format_time(570), "09:30");
+        assert_eq!(split_leading_time("9:30 Standup"), (Some(570), None, "Standup".into()));
+        assert_eq!(
+            split_leading_time("9:30-10:15 Design review"),
+            (Some(570), Some(615), "Design review".into())
+        );
+        assert_eq!(split_leading_time("Lunch with the team"), (None, None, "Lunch with the team".into()));
+        assert_eq!(split_leading_time("12:00"), (None, None, "12:00".into()));
         assert!(is_valid_time("23:59"));
         assert!(is_valid_time("")); // optional
         assert!(!is_valid_time("25:00"));
