@@ -22,7 +22,7 @@ It sits at the top of your screen, shows what's playing and your notifications, 
 - Detects **Spotify**, **Apple Music** and **Spotifast** through Windows media sessions. Browsers and other apps are ignored.
 - Shows the album artwork, title, artist and a scrubber you can click to seek, plus previous / play-pause / next controls.
 - An activity waveform takes its color from the artwork.
-- A **volume slider for the player only**. Your system volume and other apps stay as they are.
+- A **volume slider linked to the player's own slider**: moving one moves the other, even while Spotifast is minimized. Your system volume, the Volume Mixer and other apps stay as they are.
 
 ### 🎤 Synced lyrics
 - Real-time lyrics in the style of Apple Music, from [LRCLIB](https://lrclib.net), with NetEase Cloud Music as a fallback for songs LRCLIB lacks. The current line is highlighted and the column glides to the next one on a spring.
@@ -163,7 +163,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 
 - **Rendering**: a layered window drawn with GDI+ (antialiased shapes and SF Symbols-style icons) and GDI text, presented with `UpdateLayeredWindow`.
 - **Animation**: spring physics, so changing direction mid-motion keeps the current speed. While the notch itself moves, frames are locked to the display (`DwmFlush`); while only small things move, a timer at the display rate runs them; at rest Wisp ticks about 10 times a second. Text, icons and artwork are cached, so a frame takes well under a millisecond.
-- **Media**: Windows `GlobalSystemMediaTransportControlsSessionManager` for track info and playback control. Core Audio per-app sessions control the player's volume.
+- **Media**: Windows `GlobalSystemMediaTransportControlsSessionManager` for track info and playback control. The volume follows the player's own slider: Spotifast's `spotifast volume`/`mute` commands, and UI Automation for Spotify and Apple Music.
 - **Lyrics**: a background worker using WinRT `HttpClient` that talks to LRCLIB (falling back to NetEase), with an on-disk cache.
 - **Notifications**: read-only from the Action Center's database through the system's `winsqlite3.dll`.
 - **Minimal mode**: walks the window z-order and checks the screen pixels beside the notch for content.
@@ -175,7 +175,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 | `src/render.rs` | Thin GDI+ wrapper |
 | `src/media.rs` | Media session polling and control |
 | `src/lyrics.rs` | LRCLIB and NetEase clients, LRC parsing, cache |
-| `src/volume.rs` | Per-app volume |
+| `src/volume.rs` | The player's own volume (Spotifast commands, UI Automation) |
 | `src/tasks.rs` | To-do and Pomodoro logic |
 | `src/tray.rs` | Tray icon and its menu |
 | `src/settings.rs` | Settings file and Start with Windows |

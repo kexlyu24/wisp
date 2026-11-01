@@ -317,7 +317,7 @@ impl State {
         let mut now=Time::default();GetLocalTime(&mut now);
         let initial_media_playing=false;
         let (lyrics_tx,lyrics_rx)=if smoke {(None,None)} else {let (tx,rx)=lyrics::start();(Some(tx),Some(rx))};
-        let volume=volume::Volume::none();
+        let volume=if smoke {volume::Volume::none()} else {volume::Volume::start()};
         let shelf_items=if smoke {Vec::new()} else {load_shelf()};
         let shelf_saved=serialize_shelf(&shelf_items);
         let (vol_level,vol_muted)=volume.get().unwrap_or((-1.,false));
@@ -2036,8 +2036,8 @@ unsafe extern "system" fn procedure(hwnd:Hwnd,msg:u32,w:usize,l:isize)->isize {
                     }
                 }
                 if !s.smoke && s.expanded && s.active_tab==TAB_MUSIC && !s.vol_drag && s.ticks%20==0 {
-                    // The player's audio session appears once it starts playing, so look again every ~2 s.
-                    if s.ticks%120==0 || s.volume.app()!=s.media.app {let app=s.media.app.clone();s.volume.refresh(&app);}
+                    // Asks the volume worker for a fresh reading of the player's own slider; it throttles itself.
+                    let app=s.media.app.clone();s.volume.refresh(&app);
                     let (level,muted)=s.volume.get().unwrap_or((-1.,false));
                     if level!=s.vol_level || muted!=s.vol_muted {s.vol_level=level;s.vol_muted=muted;InvalidateRect(hwnd,std::ptr::null(),0);}
                 }
