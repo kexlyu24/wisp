@@ -1,4 +1,4 @@
-WISP 0.1.6 FOR WINDOWS
+WISP 0.1.7 FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
@@ -57,7 +57,9 @@ Want the exact original look? SF Pro is a free download from Apple:
   - Your to-dos, shelf, settings and cached lyrics are stored in
     %APPDATA%\Wisp. Delete that folder to reset everything.
   - The only internet access is looking up lyrics on lrclib.net
-    (it sends the song title, artist, album and length).
+    (it sends the song title, artist, album and length). If LRCLIB
+    has no synced lyrics, it asks music.163.com (NetEase) with the
+    title and artist.
   - Notifications are only read on your PC, never stored or sent.
   - To remove Wisp: quit it from the tray, delete wisp.exe and the
     %APPDATA%\Wisp folder. If you turned on "Start with Windows", turn it
