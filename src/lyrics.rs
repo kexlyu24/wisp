@@ -1,9 +1,11 @@
-//! Time-synced lyrics from LRCLIB (https://lrclib.net), fetched on a worker thread.
+//! Time-synced lyrics from LRCLIB (https://lrclib.net), falling back to NetEase Cloud Music's
+//! public web API when LRCLIB has none, fetched on a worker thread.
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 use std::thread;
 use windows::core::HSTRING;
 use windows::Foundation::Uri;
+use windows::Web::Http::Filters::{HttpBaseProtocolFilter, HttpCacheReadBehavior, HttpCacheWriteBehavior, HttpCookieUsageBehavior};
 use windows::Web::Http::HttpClient;
 
 pub struct Line {
@@ -43,14 +45,7 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
     let (req_tx, req_rx) = mpsc::channel::<Request>();
     let (reply_tx, reply_rx) = mpsc::channel();
     thread::spawn(move || {
-        let client = HttpClient::new().ok();
-        if let Some(client) = &client {
-            if let Ok(headers) = client.DefaultRequestHeaders() {
-                if let Ok(agent) = headers.UserAgent() {
-                    let _ = agent.TryParseAdd(&HSTRING::from(concat!("Wisp/", env!("CARGO_PKG_VERSION"), " (Windows notch)")));
-                }
-            }
-        }
+        let client = http_client();
         let mut pending = req_rx.recv().ok();
         while let Some(mut req) = pending.take() {
             while let Ok(newer) = req_rx.try_recv() {
@@ -103,10 +98,20 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
     (req_tx, reply_rx)
 }
 
+/// LRCLIB first; NetEase only when LRCLIB has no synced lyrics or is unreachable. NetEase is an
+/// unofficial API, so its errors and misses just keep LRCLIB's answer (and its retries).
+fn fetch(client: &HttpClient, req: &Request) -> Status {
+    let status = lrclib(client, req);
+    match status {
+        Status::NotFound | Status::Plain | Status::Failed => netease(client, req).unwrap_or(status),
+        _ => status,
+    }
+}
+
 /// Tries an exact `/get`, then progressively looser searches, stopping at the first synced (or
 /// instrumental) answer. An overloaded server is only reported as `Failed`, never as "not found",
 /// so the worker keeps retrying.
-fn fetch(client: &HttpClient, req: &Request) -> Status {
+fn lrclib(client: &HttpClient, req: &Request) -> Status {
     let mut get = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}",
         encode(&req.artist),
@@ -147,6 +152,69 @@ fn fetch(client: &HttpClient, req: &Request) -> Status {
     } else {
         Status::NotFound
     }
+}
+
+/// Searches NetEase for the track and reads its LRC; `None` when nothing matches closely or the
+/// API does not answer.
+fn netease(client: &HttpClient, req: &Request) -> Option<Status> {
+    let query = format!("{} {}", primary_artist(&req.artist), clean_title(&req.title));
+    let (code, body) = http_get(client, &format!("https://music.163.com/api/search/get?s={}&type=1&limit=10", encode(&query)))?;
+    let id = if code == 200 { pick_song(&body, req)? } else { return None };
+    let (code, body) = http_get(client, &format!("https://music.163.com/api/song/lyric?id={}&lv=1&tv=-1", id))?;
+    if code == 200 { netease_lyrics(&body) } else { None }
+}
+
+/// The id of the first search result whose title, artist and length all match the request.
+/// Loose matches are rejected: wrong lyrics are worse than none.
+fn pick_song(json: &str, req: &Request) -> Option<u64> {
+    let doc: serde_json::Value = serde_json::from_str(json).ok()?;
+    let titles = [normalize(&req.title), normalize(&clean_title(&req.title))];
+    let artist = normalize(&primary_artist(&req.artist));
+    if artist.is_empty() {
+        return None;
+    }
+    let songs = doc["result"]["songs"].as_array()?;
+    // An exact title beats one that only matches without its "(Live)"/"- Remastered" suffix.
+    let matches = |song: &serde_json::Value, exact: bool| {
+        let name = song["name"].as_str().unwrap_or("");
+        let named = if exact {
+            normalize(name) == titles[0]
+        } else {
+            titles.contains(&normalize(name)) || titles.contains(&normalize(&clean_title(name)))
+        };
+        let by = song["artists"].as_array().is_some_and(|artists| {
+            artists.iter().any(|a| {
+                let a = normalize(a["name"].as_str().unwrap_or(""));
+                !a.is_empty() && (a.contains(&artist) || artist.contains(&a))
+            })
+        });
+        let ms = song["duration"].as_i64().unwrap_or(0);
+        let timed = req.duration <= 0 || ms <= 0 || (ms as f64 / 1000. - req.duration as f64).abs() <= 3.;
+        named && by && timed
+    };
+    songs.iter().find(|s| matches(s, true)).or_else(|| songs.iter().find(|s| matches(s, false)))?["id"].as_u64()
+}
+
+fn normalize(s: &str) -> String {
+    s.to_lowercase().replace('\u{2019}', "'").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Reads a NetEase `/song/lyric` reply, dropping the credit lines it puts at the top.
+fn netease_lyrics(json: &str) -> Option<Status> {
+    let doc: serde_json::Value = serde_json::from_str(json).ok()?;
+    let text = doc["lrc"]["lyric"].as_str().unwrap_or("");
+    if doc["pureMusic"].as_bool() == Some(true) || doc["nolyric"].as_bool() == Some(true) || text.contains("纯音乐") {
+        return Some(Status::Instrumental);
+    }
+    let lines: Vec<Line> = parse_lrc(text).into_iter().filter(|l| !is_credit(&l.text)).collect();
+    lines.iter().any(|l| !l.text.trim().is_empty()).then_some(Status::Synced(lines))
+}
+
+/// "作词 : Someone", "Composer: Someone" and the like.
+fn is_credit(text: &str) -> bool {
+    let Some((head, _)) = text.split_once(':').or_else(|| text.split_once('：')) else { return false };
+    let roles = ["作词", "作曲", "编曲", "制作人", "混音", "母带", "lyricist", "composer", "arranger", "producer"];
+    roles.contains(&head.trim().to_lowercase().as_str())
 }
 
 /// 200 is an answer, 404 is "no match"; anything else (503 overload, 429, no connection) is `None`.
@@ -249,6 +317,22 @@ fn write_cache(req: &Request, status: &Status) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, text);
+}
+
+/// Without cookies or the shared WinINet cache: once NetEase's `NMTID` cookie is sent back, its
+/// search ignores the query and returns unrelated songs. We keep our own disk cache anyway.
+fn http_client() -> Option<HttpClient> {
+    let filter = HttpBaseProtocolFilter::new().ok()?;
+    let _ = filter.SetCookieUsageBehavior(HttpCookieUsageBehavior::NoCookies);
+    if let Ok(cache) = filter.CacheControl() {
+        let _ = cache.SetReadBehavior(HttpCacheReadBehavior::NoCache);
+        let _ = cache.SetWriteBehavior(HttpCacheWriteBehavior::NoCache);
+    }
+    let client = HttpClient::Create(&filter).ok()?;
+    if let Ok(agent) = client.DefaultRequestHeaders().and_then(|h| h.UserAgent()) {
+        let _ = agent.TryParseAdd(&HSTRING::from(concat!("Wisp/", env!("CARGO_PKG_VERSION"), " (Windows notch)")));
+    }
+    Some(client)
 }
 
 fn http_get(client: &HttpClient, url: &str) -> Option<(i32, String)> {
@@ -445,11 +529,54 @@ mod tests {
     #[test]
     #[ignore]
     fn live_lrclib() {
-        let client = HttpClient::new().unwrap();
+        let client = http_client().unwrap();
         let req = Request { key: String::new(), title: "Blah Blah".into(), artist: "Joji".into(), album: String::new(), duration: 162, fresh: true };
         let status = fetch(&client, &req);
         assert!(matches!(status, Status::Synced(_) | Status::Failed), "a busy server must not read as not found");
         assert!(matches!(status, Status::Synced(_)), "LRCLIB was unreachable on every attempt");
+    }
+
+    fn request(title: &str, artist: &str, duration: i64) -> Request {
+        Request { key: String::new(), title: title.into(), artist: artist.into(), album: String::new(), duration, fresh: true }
+    }
+
+    #[test]
+    fn picks_only_a_close_netease_match() {
+        let json = r#"{"result":{"songs":[
+            {"id":1,"name":"Yellow","duration":200000,"artists":[{"name":"Coldplay"}]},
+            {"id":2,"name":"Yellow","duration":266773,"artists":[{"name":"Someone Else"}]},
+            {"id":3,"name":"Yellow (Live)","duration":266773,"artists":[{"name":"Coldplay"}]},
+            {"id":4,"name":"Yellow","duration":266773,"artists":[{"name":"Coldplay"}]}]}}"#;
+        assert_eq!(pick_song(json, &request("Yellow", "Coldplay", 267)), Some(4));
+        assert_eq!(pick_song(json, &request("Yellow [Live]", "Coldplay", 267)), Some(3));
+        assert_eq!(pick_song(json, &request("Yellow - Remastered 2011", "Coldplay feat. X", 0)), Some(1));
+        assert_eq!(pick_song(json, &request("Yellow", "Coldplay", 280)), None);
+        assert_eq!(pick_song(json, &request("Fix You", "Coldplay", 0)), None);
+        assert_eq!(pick_song("not json", &request("Yellow", "Coldplay", 0)), None);
+    }
+
+    #[test]
+    fn reads_netease_lyrics_without_credits() {
+        let json = r#"{"lrc":{"lyric":"[00:00.000] 作词 : A/B\n[00:01.000] 作曲 : A\n[00:33.790]Look at the stars\n[00:36.780]Look how they shine"},"code":200}"#;
+        match netease_lyrics(json) {
+            Some(Status::Synced(lines)) => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].text, "Look at the stars");
+            }
+            _ => panic!("expected synced lyrics"),
+        }
+        assert!(matches!(netease_lyrics(r#"{"pureMusic":true,"lrc":{"lyric":""}}"#), Some(Status::Instrumental)));
+        assert!(matches!(netease_lyrics(r#"{"lrc":{"lyric":"[00:00.00] 纯音乐，请欣赏"}}"#), Some(Status::Instrumental)));
+        assert!(netease_lyrics(r#"{"uncollected":true,"lrc":{"lyric":""}}"#).is_none());
+    }
+
+    /// Hits the real NetEase API: `cargo test live_netease -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_netease() {
+        let client = http_client().unwrap();
+        let status = netease(&client, &request("Yellow", "Coldplay", 267));
+        assert!(matches!(status, Some(Status::Synced(ref l)) if l.iter().any(|l| l.text.contains("stars"))));
     }
 
     #[test]

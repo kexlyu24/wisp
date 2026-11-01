@@ -25,7 +25,7 @@ It sits at the top of your screen, shows what's playing and your notifications, 
 - A **volume slider for the player only**. Your system volume and other apps stay as they are.
 
 ### 🎤 Synced lyrics
-- Real-time lyrics in the style of Apple Music, from [LRCLIB](https://lrclib.net). The current line is highlighted and the column glides to the next one on a spring.
+- Real-time lyrics in the style of Apple Music, from [LRCLIB](https://lrclib.net), with NetEase Cloud Music as a fallback for songs LRCLIB lacks. The current line is highlighted and the column glides to the next one on a spring.
 - Click any line to jump to that point in the song.
 - **Lyrics in the collapsed notch** as well: the current line sits in the closed bar, which widens smoothly to fit long lines.
 - Lyrics are saved on your PC after the first load, so songs you've played before show them instantly, even offline. While LRCLIB is overloaded the notch says so and keeps retrying.
@@ -153,7 +153,7 @@ Everything stays on your PC, in `%APPDATA%\Wisp\`:
 | `shelf.txt` | The file paths on your shelf (the files themselves aren't copied) |
 | `lyrics\` | Cached lyrics |
 
-The only network request is the lyrics lookup. It sends the current track's title, artist, album and duration to LRCLIB.
+The only network request is the lyrics lookup. It sends the current track's title, artist, album and duration to LRCLIB, and only when LRCLIB has no synced lyrics, the title and artist to NetEase Cloud Music (music.163.com), without cookies.
 
 Notifications are read locally and read-only from Windows' own notification database. Wisp never stores, logs or sends them anywhere.
 
@@ -164,7 +164,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 - **Rendering**: a layered window drawn with GDI+ (antialiased shapes and SF Symbols-style icons) and GDI text, presented with `UpdateLayeredWindow`.
 - **Animation**: spring physics, so changing direction mid-motion keeps the current speed. While the notch itself moves, frames are locked to the display (`DwmFlush`); while only small things move, a timer at the display rate runs them; at rest Wisp ticks about 10 times a second. Text, icons and artwork are cached, so a frame takes well under a millisecond.
 - **Media**: Windows `GlobalSystemMediaTransportControlsSessionManager` for track info and playback control. Core Audio per-app sessions control the player's volume.
-- **Lyrics**: a background worker using WinRT `HttpClient` that talks to LRCLIB, with an on-disk cache.
+- **Lyrics**: a background worker using WinRT `HttpClient` that talks to LRCLIB (falling back to NetEase), with an on-disk cache.
 - **Notifications**: read-only from the Action Center's database through the system's `winsqlite3.dll`.
 - **Minimal mode**: walks the window z-order and checks the screen pixels beside the notch for content.
 - **Files**: OLE drag-and-drop in both directions.
@@ -174,7 +174,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 | `src/main.rs` | Window, state, drawing and input |
 | `src/render.rs` | Thin GDI+ wrapper |
 | `src/media.rs` | Media session polling and control |
-| `src/lyrics.rs` | LRCLIB client, LRC parsing, cache |
+| `src/lyrics.rs` | LRCLIB and NetEase clients, LRC parsing, cache |
 | `src/volume.rs` | Per-app volume |
 | `src/tasks.rs` | To-do and Pomodoro logic |
 | `src/tray.rs` | Tray icon and its menu |
@@ -197,7 +197,7 @@ The smoke test drives the real window: it checks the expand/collapse sizes, plac
 
 ## Limitations
 
-- Lyrics depend on LRCLIB, a free community service. Some songs are missing, and it is sometimes overloaded.
+- Lyrics depend on LRCLIB, a free community service, and NetEase's unofficial web API as a fallback. Some songs are still missing, LRCLIB is sometimes overloaded, and NetEase may change its API without notice.
 - The notch appears on the primary display only.
 - Notifications come from Windows' notification database, which isn't an official API. A future Windows update could change it; if that happens, the notch simply stops showing notifications.
 
