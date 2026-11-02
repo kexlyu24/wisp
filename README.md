@@ -4,8 +4,6 @@
 
 **A Dynamic Island–style notch for Windows, inspired by Apple's design.**
 
-🙏 **Thanks for contributing, [@overhaulpxl](https://github.com/overhaulpxl)!** Per-app volume, the calendar schedule and a lighter idle footprint are their work.
-
 It sits at the top of your screen, shows what's playing and your notifications, and opens into a small panel with lyrics, a calendar, a to-do list, a Pomodoro timer and a file shelf. When it would hide something, it steps aside.
 
 ![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)
@@ -205,9 +203,27 @@ The smoke test drives the real window: it checks the expand/collapse sizes, plac
 - The notch appears on the primary display only.
 - Notifications come from Windows' notification database, which isn't an official API. A future Windows update could change it; if that happens, the notch simply stops showing notifications.
 
+## Contributors
+
+Thanks to everyone who helps make Wisp better 🙏
+
+<table align="center">
+  <tr>
+    <td align="center" width="160">
+      <a href="https://github.com/kexlyu24"><img src="https://avatars.githubusercontent.com/u/201588681?v=4&s=160" width="80" height="80" alt="kexlyu24"><br><sub><b>kexlyu24</b></sub></a><br>
+      <sub>Creator</sub>
+    </td>
+    <td align="center" width="160">
+      <a href="https://github.com/overhaulpxl"><img src="https://avatars.githubusercontent.com/u/179252797?v=4&s=160" width="80" height="80" alt="overhaulpxl"><br><sub><b>overhaulpxl</b></sub></a><br>
+      <sub>Per-app volume, calendar, idle performance</sub>
+    </td>
+  </tr>
+</table>
+
+Want to help? Open an issue or a pull request into `dev`.
+
 ## Credits
 
-- Contributors: [@overhaulpxl](https://github.com/overhaulpxl) (per-app volume, calendar schedule, idle performance).
 - Lyrics from [LRCLIB](https://lrclib.net), a free, open lyrics database (please be kind to their servers), with NetEase Cloud Music as a fallback.
 - [Inter](https://rsms.me/inter/) font by The Inter Project Authors, bundled under the SIL Open Font License 1.1 (`assets/fonts/Inter-LICENSE.txt`).
 - Design inspired by Apple's Dynamic Island and the macOS notch. This is an independent project, not affiliated with Apple, and contains no Apple code or assets.
