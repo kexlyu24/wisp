@@ -722,6 +722,13 @@ struct State {
     cal_time: Option<u32>,
     /// End time of the event being edited, kept unless a new one is typed.
     cal_end: String,
+    /// Composer unfold (0 closed, 1 open) and the day's list fade-in after a date change.
+    compose_t: f64,
+    compose_v: f64,
+    agenda_t: f64,
+    agenda_v: f64,
+    /// The date whose list `agenda_t` animates in.
+    agenda_key: (i32, u32, u32),
     cal_scroll: usize,
     high_surrogate: u16,
     pomo: tasks::Pomodoro,
@@ -933,6 +940,11 @@ impl State {
             cal_editing_id: None,
             cal_time: Some(9 * 60),
             cal_end: String::new(),
+            compose_t: 0.,
+            compose_v: 0.,
+            agenda_t: 1.,
+            agenda_v: 0.,
+            agenda_key: (0, 0, 0),
             cal_scroll: 0,
             high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
@@ -1908,6 +1920,35 @@ impl State {
                 );
             }
         }
+        // Calendar agenda: the composer unfolds, and a newly picked date's events fade in.
+        let date = (
+            self.calendar.selected_year,
+            self.calendar.selected_month,
+            self.calendar.selected_day,
+        );
+        if date != self.agenda_key {
+            self.agenda_key = date;
+            self.agenda_t = 0.;
+            self.agenda_v = 0.;
+        }
+        let compose_target = if self.cal_editing { 1. } else { 0. };
+        let agenda_animating = if self.reduced_motion {
+            let moving = self.compose_t != compose_target || self.agenda_t != 1.;
+            (self.compose_t, self.compose_v) = (compose_target, 0.);
+            (self.agenda_t, self.agenda_v) = (1., 0.);
+            moving
+        } else {
+            let a = spring(
+                &mut self.compose_t,
+                &mut self.compose_v,
+                compose_target,
+                22.,
+                0.86,
+                dt,
+            );
+            let b = spring(&mut self.agenda_t, &mut self.agenda_v, 1., 14., 1., dt);
+            a || b
+        };
         // Minimal mode: the closed notch shrinks to a sliver at the top edge while it would cover a window.
         let mini_target = if self.covered && !self.expanded {
             1.
@@ -1958,6 +1999,7 @@ impl State {
             || notice_animating
             || mini_animating
             || settings_animating
+            || agenda_animating
     }
     /// Pulls new notifications, starts the next one when the notch is free, and retires finished ones.
     unsafe fn update_notices(&mut self, hwnd: Hwnd, now: std::time::Instant) {
@@ -3841,20 +3883,38 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         short_months[sel_m - 1],
         s.calendar.selected_day
     );
+    // `c` unfolds the composer; `p` fades in the selected day's title and events.
+    let c = s.compose_t.clamp(0., 1.);
+    let p = s.agenda_t.clamp(0., 1.);
     text_opt(
-        dc, s, 6, &sel_title, WHITE, AGENDA_X, 38., AGENDA_W, 26., false, o, dx,
+        dc,
+        s,
+        6,
+        &sel_title,
+        WHITE,
+        AGENDA_X,
+        38. + (1. - p) * 4.,
+        AGENDA_W,
+        26.,
+        false,
+        o * (0.35 + 0.65 * p),
+        dx,
     );
 
     // The field: "Add an event" until clicked, then the title being typed.
     let (fx, fy, fw, fh) = (AGENDA_X, AGENDA_FIELD_Y, AGENDA_W, AGENDA_FIELD_H);
-    if s.cal_editing {
-        round_opt(s, fx, fy, fw, fh, 10., BLUE, o, dx);
-        round_opt(s, fx + 1.5, fy + 1.5, fw - 3., fh - 3., 8.5, rgb(30, 30, 32), o, dx);
+    let bg = if s.hover == 5000 && !s.cal_editing {
+        rgb(36, 36, 38)
     } else {
-        let bg = if s.hover == 5000 { rgb(36, 36, 38) } else { rgb(28, 28, 30) };
-        round_opt(s, fx, fy, fw, fh, 10., bg, o, dx);
+        rgb(28, 28, 30)
+    };
+    round_opt(s, fx, fy, fw, fh, 10., bg, o, dx);
+    if c > 0.001 {
+        // The focus ring fades in as the composer opens.
+        round_opt(s, fx, fy, fw, fh, 10., BLUE, o * c, dx);
+        round_opt(s, fx + 1.5, fy + 1.5, fw - 3., fh - 3., 8.5, rgb(30, 30, 32), o * c, dx);
     }
-    let plus = if s.cal_editing { BLUE } else { SECONDARY };
+    let plus = blend_color(SECONDARY, BLUE, c);
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
     round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
     let (tx, tw) = (fx + 28., fw - 36.);
@@ -3876,17 +3936,20 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
     }
 
-    // While composing: the time picker and the buttons.
-    if s.cal_editing {
-        let ty = AGENDA_TIME_Y;
-        text_opt(dc, s, 3, "Time", TERTIARY, fx, ty, 36., 24., false, o, dx);
+    // While composing: the time picker and the buttons slide out from under the field.
+    // They fade over the second half of the motion, so the list sliding up never shows
+    // through a half-faded button.
+    let oc = o * ((c - 0.5) / 0.5).clamp(0., 1.);
+    if oc > 0.005 {
+        let ty = AGENDA_TIME_Y - (1. - c) * 30.;
+        text_opt(dc, s, 3, "Time", TERTIARY, fx, ty, 36., 24., false, oc, dx);
         for (code, x, label) in [(5004, fx + 38., "\u{2212}"), (5005, fx + 118., "+")] {
             let bg = if s.hover == code { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
-            pill_opt(s, x, ty, 26., 24., bg, o, dx);
-            text_opt(dc, s, 1, label, WHITE, x, ty - 1., 26., 24., true, o, dx);
+            pill_opt(s, x, ty, 26., 24., bg, oc, dx);
+            text_opt(dc, s, 1, label, WHITE, x, ty - 1., 26., 24., true, oc, dx);
         }
         let time_label = s.cal_time.map(tasks::format_time).unwrap_or_else(|| "All day".into());
-        text_opt(dc, s, 1, &time_label, WHITE, fx + 64., ty, 54., 24., true, o, dx);
+        text_opt(dc, s, 1, &time_label, WHITE, fx + 64., ty, 54., 24., true, oc, dx);
         let all_day = s.cal_time.is_none();
         let chip_bg = if all_day {
             rgb(64, 64, 70)
@@ -3895,14 +3958,14 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         } else {
             rgb(28, 28, 32)
         };
-        pill_opt(s, fx + 150., ty, 46., 24., chip_bg, o, dx);
+        pill_opt(s, fx + 150., ty, 46., 24., chip_bg, oc, dx);
         let chip_fg = if all_day { WHITE } else { SECONDARY };
-        text_opt(dc, s, 3, "All day", chip_fg, fx + 150., ty, 46., 24., true, o, dx);
+        text_opt(dc, s, 3, "All day", chip_fg, fx + 150., ty, 46., 24., true, oc, dx);
 
-        let by = AGENDA_BTN_Y;
+        let by = AGENDA_BTN_Y - (1. - c) * 30.;
         let cancel_bg = if s.hover == 5007 { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
-        pill_opt(s, fx, by, 94., 26., cancel_bg, o, dx);
-        text_opt(dc, s, 1, "Cancel", WHITE, fx, by, 94., 26., true, o, dx);
+        pill_opt(s, fx, by, 94., 26., cancel_bg, oc, dx);
+        text_opt(dc, s, 1, "Cancel", WHITE, fx, by, 94., 26., true, oc, dx);
         let can_save = !tasks::split_leading_time(&s.cal_input).2.trim().is_empty();
         let save_bg = if !can_save {
             rgb(40, 40, 44)
@@ -3911,20 +3974,23 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         } else {
             WHITE
         };
-        pill_opt(s, fx + 102., by, 94., 26., save_bg, o, dx);
+        pill_opt(s, fx + 102., by, 94., 26., save_bg, oc, dx);
         let save_label = if s.cal_editing_id.is_some() { "Save" } else { "Add" };
         let save_fg = if can_save { rgb(0, 0, 0) } else { TERTIARY };
-        text_opt(dc, s, 1, save_label, save_fg, fx + 102., by, 94., 26., true, o, dx);
+        text_opt(dc, s, 1, save_label, save_fg, fx + 102., by, 94., 26., true, oc, dx);
     }
 
-    // The list of the day's events.
+    // The list of the day's events. It follows the composer down; rows that no longer fit
+    // fade out, and after a date change the rows fade in one after another.
     let schedules = s.calendar.selected_schedules();
-    let (list_y, rows) = s.agenda_rows();
+    let (closed_y, open_y) = (AGENDA_FIELD_Y + AGENDA_FIELD_H + 8., AGENDA_BTN_Y + 34.);
+    let list_y = closed_y + (open_y - closed_y) * c;
+    let rows = s.agenda_rows().1;
     if schedules.is_empty() {
-        if !s.cal_editing {
-            text_opt(
-                dc, s, 2, "No events", SECONDARY, fx, list_y + 26., fw, 20., true, o, dx,
-            );
+        let oe = o * (1. - c) * p;
+        if oe > 0.01 {
+            let y = list_y + 26. + (1. - p) * 6.;
+            text_opt(dc, s, 2, "No events", SECONDARY, fx, y, fw, 20., true, oe, dx);
             text_opt(
                 dc,
                 s,
@@ -3932,39 +3998,74 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 "Use \u{201c}Add an event\u{201d} to plan this day",
                 TERTIARY,
                 fx,
-                list_y + 48.,
+                y + 22.,
                 fw,
                 16.,
                 true,
-                o,
+                oe,
                 dx,
             );
         }
     } else {
-        for (i, item) in schedules.iter().skip(s.cal_scroll).take(rows).enumerate() {
+        for (i, item) in schedules.iter().skip(s.cal_scroll).take(5).enumerate() {
             let idx = s.cal_scroll + i;
-            let ry = list_y + i as f64 * AGENDA_ROW_H;
+            let appear = ((p - i as f64 * 0.12) / 0.55).clamp(0., 1.);
+            let ry = list_y + i as f64 * AGENDA_ROW_H + (1. - appear) * 6.;
+            let fits = if i < 2 { 1. } else { 1. - c };
+            let or = o * appear * fits;
+            if or < 0.01 || ry + AGENDA_ROW_H > CAL_H - 6. {
+                continue;
+            }
             let row_hover = s.hover == 5200 + idx as i32;
             let del_hover = s.hover == 5300 + idx as i32;
             let editing_this = s.cal_editing_id == Some(item.id);
             if row_hover || del_hover || editing_this {
-                round_opt(s, fx, ry, fw, AGENDA_ROW_H - 2., 8., rgb(34, 34, 38), o, dx);
+                round_opt(s, fx, ry, fw, AGENDA_ROW_H - 2., 8., rgb(34, 34, 38), or, dx);
             }
-            let time = if item.start_time.is_empty() { "All day" } else { item.start_time.as_str() };
-            text_opt(dc, s, 3, time, SECONDARY, fx + 8., ry, 48., AGENDA_ROW_H - 2., false, o, dx);
+            let time = if item.start_time.is_empty() {
+                "All day"
+            } else {
+                item.start_time.as_str()
+            };
+            text_opt(
+                dc,
+                s,
+                3,
+                time,
+                SECONDARY,
+                fx + 8.,
+                ry,
+                48.,
+                AGENDA_ROW_H - 2.,
+                false,
+                or,
+                dx,
+            );
             let title_w = if row_hover || del_hover { fw - 84. } else { fw - 64. };
             text_opt(
-                dc, s, 2, &item.title, WHITE, fx + 58., ry, title_w, AGENDA_ROW_H - 2., false, o, dx,
+                dc,
+                s,
+                2,
+                &item.title,
+                WHITE,
+                fx + 58.,
+                ry,
+                title_w,
+                AGENDA_ROW_H - 2.,
+                false,
+                or,
+                dx,
             );
             if row_hover || del_hover {
-                draw_close_button_opt(s, fx + fw - 12., ry + 13., del_hover, o, dx);
+                draw_close_button_opt(s, fx + fw - 12., ry + 13., del_hover, or, dx);
             }
         }
         let hidden = schedules.len().saturating_sub(s.cal_scroll + rows);
-        if hidden > 0 {
+        // Shown once the composer has settled, so it never sits on top of a sliding row.
+        if hidden > 0 && (c < 0.02 || c > 0.98) {
             let more = format!("{} more \u{00b7} scroll", hidden);
             let y = list_y + rows as f64 * AGENDA_ROW_H;
-            text_opt(dc, s, 3, &more, TERTIARY, fx, y, fw, 16., true, o, dx);
+            text_opt(dc, s, 3, &more, TERTIARY, fx, y, fw, 16., true, o * p, dx);
         }
     }
 
@@ -7539,6 +7640,11 @@ mod tests {
             cal_editing_id: None,
             cal_time: Some(9 * 60),
             cal_end: String::new(),
+            compose_t: 0.,
+            compose_v: 0.,
+            agenda_t: 1.,
+            agenda_v: 0.,
+            agenda_key: (0, 0, 0),
             cal_scroll: 0,
             high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
