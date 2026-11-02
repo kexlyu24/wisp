@@ -1,6 +1,6 @@
 [package]
 name = "wisp"
-version = "0.1.8"
+version = "0.1.8+hf"
 edition = "2021"
 description = "An original, animated Windows desktop notch"
 license = "MIT"
