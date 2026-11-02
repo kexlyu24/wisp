@@ -1,6 +1,8 @@
 //! Universal Native Volume Control for Wisp
 //! Controls internal player volume directly across 5 supported players:
-//! 1. Spotify Desktop (`SpotifyVolumeAdapter`) via Windows UI Automation `RangeValuePattern` [0.0, 1.0].
+//! 1. Spotify Desktop (`SpotifySessionVolumeAdapter`) via its Windows Core Audio session (Volume
+//!    Mixer). Its in-app slider can't be driven: through UI Automation it steals focus, moves in
+//!    10% key steps after ~2 s, and ignores changes while minimized.
 //! 2. Spotifast (`SpotifastVolumeAdapter`) via native CLI IPC [0.0, 100.0].
 //! 3. Apple Music for Windows (`AppleMusicVolumeAdapter`) via Windows UI Automation `RangeValuePattern`.
 //! 4. Google Chrome (`ChromeYouTubeVolumeAdapter`) via Windows Core Audio session volume (`ISimpleAudioVolume`).
@@ -9,28 +11,23 @@
 //! Strict volume routing isolation: Never touches `IAudioEndpointVolume`. Browser volume targets only the matching application's session.
 //! Background operation: Does not bring target windows to foreground, restore minimized windows, or switch tabs.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, POINT};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindow,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, SetForegroundWindow, SetWindowPos, WindowFromPoint, GA_ROOT, GW_HWNDNEXT,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    FindWindowExW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
 /// Common normalized volume interface for all five target players.
@@ -50,20 +47,6 @@ pub fn normalize_volume(v: f32) -> f32 {
         0.
     } else {
         v.clamp(0., 1.)
-    }
-}
-
-/// Maps Wisp volume [0.0, 1.0] to Spotify native slider value [0.0, 1.0].
-pub fn map_to_spotify_range(v: f32) -> f64 {
-    normalize_volume(v) as f64
-}
-
-/// Maps Spotify native slider value to Wisp volume [0.0, 1.0].
-pub fn map_from_spotify_range(v: f64) -> f32 {
-    if v.is_nan() {
-        0.
-    } else {
-        (v as f32).clamp(0., 1.)
     }
 }
 
@@ -112,37 +95,6 @@ pub fn process_name(pid: u32) -> String {
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         path.rsplit('\\').next().unwrap_or_default().to_string()
-    }
-}
-
-/// Locates the top-level main window of Spotify Desktop.
-pub fn find_spotify_window() -> Option<HWND> {
-    unsafe {
-        let mut curr =
-            FindWindowW(windows::core::w!("Chrome_WidgetWin_1"), None).unwrap_or_default();
-        while !curr.is_invalid() {
-            let mut pid = 0;
-            let _ = GetWindowThreadProcessId(curr, Some(&mut pid));
-            if pid != 0 {
-                let pname = process_name(pid);
-                if pname.eq_ignore_ascii_case("spotify.exe") {
-                    let len = GetWindowTextLengthW(curr);
-                    let visible = IsWindowVisible(curr).as_bool();
-                    let iconic = IsIconic(curr).as_bool();
-                    if len > 0 && (visible || iconic) {
-                        return Some(curr);
-                    }
-                }
-            }
-            curr = FindWindowExW(
-                HWND::default(),
-                curr,
-                windows::core::w!("Chrome_WidgetWin_1"),
-                None,
-            )
-            .unwrap_or_default();
-        }
-        None
     }
 }
 
@@ -209,679 +161,6 @@ pub fn find_applemusic_window() -> Option<HWND> {
             curr = FindWindowExW(HWND::default(), curr, None, None).unwrap_or_default();
         }
         None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 1. Spotify Desktop Volume Adapter
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[allow(dead_code)]
-pub enum VolumeUpdateStatus {
-    Idle = 0,
-    Pending = 1,
-    Confirmed = 2,
-    Failed = 3,
-}
-
-pub struct SpotifyVolumeAdapter {
-    tx: Option<Sender<DesktopCommand>>,
-    cached_level: Arc<AtomicU32>,
-    cached_muted: Arc<AtomicBool>,
-    pub is_connected: Arc<AtomicBool>,
-    last_unmuted: Arc<Mutex<f32>>,
-    update_status: Arc<AtomicU8>,
-}
-
-impl SpotifyVolumeAdapter {
-    pub fn new() -> Self {
-        Self {
-            tx: None,
-            cached_level: Arc::new(AtomicU32::new(f32::to_bits(-1.))),
-            cached_muted: Arc::new(AtomicBool::new(false)),
-            is_connected: Arc::new(AtomicBool::new(false)),
-            last_unmuted: Arc::new(Mutex::new(0.5)),
-            update_status: Arc::new(AtomicU8::new(VolumeUpdateStatus::Idle as u8)),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn update_status(&self) -> VolumeUpdateStatus {
-        match self.update_status.load(Ordering::Relaxed) {
-            1 => VolumeUpdateStatus::Pending,
-            2 => VolumeUpdateStatus::Confirmed,
-            3 => VolumeUpdateStatus::Failed,
-            _ => VolumeUpdateStatus::Idle,
-        }
-    }
-
-    fn ensure_worker(&mut self) -> Sender<DesktopCommand> {
-        if let Some(ref tx) = self.tx {
-            return tx.clone();
-        }
-        let (tx, rx) = channel::<DesktopCommand>();
-        let cached_level = self.cached_level.clone();
-        let cached_muted = self.cached_muted.clone();
-        let is_connected = self.is_connected.clone();
-        let last_unmuted = self.last_unmuted.clone();
-        let update_status = self.update_status.clone();
-
-        thread::Builder::new()
-            .name("wisp-spotify-uia".into())
-            .spawn(move || {
-                spotify_worker_loop(
-                    rx,
-                    cached_level,
-                    cached_muted,
-                    is_connected,
-                    last_unmuted,
-                    update_status,
-                );
-            })
-            .ok();
-
-        self.tx = Some(tx.clone());
-        tx
-    }
-}
-
-impl VolumeAdapter for SpotifyVolumeAdapter {
-    fn is_available(&self) -> bool {
-        self.is_connected.load(Ordering::Relaxed)
-    }
-
-    fn get_volume(&self) -> Option<f32> {
-        if !self.is_connected.load(Ordering::Relaxed) {
-            return None;
-        }
-        let bits = self.cached_level.load(Ordering::Relaxed);
-        let val = f32::from_bits(bits);
-        if val < 0. {
-            None
-        } else {
-            Some(val)
-        }
-    }
-
-    fn set_volume(&mut self, value: f32) -> bool {
-        let level = normalize_volume(value);
-        self.cached_level
-            .store(f32::to_bits(level), Ordering::Relaxed);
-        if level > 0. {
-            self.cached_muted.store(false, Ordering::Relaxed);
-            if let Ok(mut unmuted) = self.last_unmuted.lock() {
-                *unmuted = level;
-            }
-        }
-        self.update_status
-            .store(VolumeUpdateStatus::Pending as u8, Ordering::Relaxed);
-        let tx = self.ensure_worker();
-        let _ = tx.send(DesktopCommand::SetLevel(level));
-        true
-    }
-
-    fn get_muted(&self) -> Option<bool> {
-        if !self.is_connected.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some(self.cached_muted.load(Ordering::Relaxed))
-    }
-
-    fn set_muted(&mut self, value: bool) -> bool {
-        self.cached_muted.store(value, Ordering::Relaxed);
-        self.update_status
-            .store(VolumeUpdateStatus::Pending as u8, Ordering::Relaxed);
-        let tx = self.ensure_worker();
-        let _ = tx.send(DesktopCommand::SetMuted(value));
-        true
-    }
-
-    fn reconnect(&mut self) {
-        let tx = self.ensure_worker();
-        let _ = tx.send(DesktopCommand::Reconnect);
-    }
-
-    /// Stops the worker but keeps the last known level, so reopening the panel shows the
-    /// slider at once while the worker reconnects (it hides it if Spotify is gone).
-    fn disconnect(&mut self) {
-        self.update_status
-            .store(VolumeUpdateStatus::Idle as u8, Ordering::Relaxed);
-        self.tx = None;
-    }
-}
-
-#[link(name = "user32")]
-extern "system" {
-    fn AttachThreadInput(idAttach: u32, idAttachTo: u32, fAttach: BOOL) -> BOOL;
-    fn GetLastInputInfo(plii: *mut LASTINPUTINFO) -> BOOL;
-}
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetTickCount() -> u32;
-}
-
-#[repr(C)]
-struct LASTINPUTINFO {
-    cb_size: u32,
-    dw_time: u32,
-}
-
-fn get_last_input_tick() -> u32 {
-    let mut lii = LASTINPUTINFO {
-        cb_size: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dw_time: 0,
-    };
-    unsafe {
-        if GetLastInputInfo(&mut lii).as_bool() {
-            lii.dw_time
-        } else {
-            0
-        }
-    }
-}
-
-/// Preserves the user's active foreground window and Z-order across Spotify UI Automation actions.
-/// Chromium's accessibility implementation natively sets focus to sliders and buttons when
-/// RangeValuePattern::SetValue or InvokePattern::Invoke is invoked, which can cause Spotify
-/// or its child windows (Chrome_RenderWidgetHostHWND) to steal foreground focus and rise in Z-order.
-/// This guard detects user input, prevents restoring stale windows on concurrent user interaction,
-/// and ensures Spotify is kept in the background without stealing focus.
-struct SpotifyFocusGuard {
-    spotify_hwnd: HWND,
-    spotify_pid: u32,
-    last_known_good_fg: HWND,
-}
-
-impl SpotifyFocusGuard {
-    fn new(spotify_hwnd: HWND) -> Self {
-        let mut pid = 0;
-        if !spotify_hwnd.is_invalid() {
-            unsafe {
-                GetWindowThreadProcessId(spotify_hwnd, Some(&mut pid));
-            }
-        }
-        let cur_fg = unsafe { GetForegroundWindow() };
-        let mut cur_pid = 0;
-        if !cur_fg.is_invalid() {
-            unsafe {
-                GetWindowThreadProcessId(cur_fg, Some(&mut cur_pid));
-            }
-        }
-        let initial_good = if !cur_fg.is_invalid() && cur_pid != pid && cur_fg != spotify_hwnd {
-            cur_fg
-        } else {
-            HWND::default()
-        };
-
-        Self {
-            spotify_hwnd,
-            spotify_pid: pid,
-            last_known_good_fg: initial_good,
-        }
-    }
-
-    unsafe fn find_intentional_target(spotify_hwnd: HWND, spotify_pid: u32) -> Option<HWND> {
-        // 1. Check window directly under mouse cursor
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_ok() {
-            let hit = WindowFromPoint(pt);
-            if !hit.is_invalid() {
-                let root = GetAncestor(hit, GA_ROOT);
-                if !root.is_invalid() && root != spotify_hwnd {
-                    let mut pid = 0;
-                    GetWindowThreadProcessId(root, Some(&mut pid));
-                    if pid != 0 && pid != spotify_pid && IsWindowVisible(root).as_bool() {
-                        return Some(root);
-                    }
-                }
-            }
-        }
-
-        // 2. Scan Z-order immediately beneath Spotify (e.g. for Alt+Tab or keyboard switch)
-        if !spotify_hwnd.is_invalid() {
-            let mut next = GetWindow(spotify_hwnd, GW_HWNDNEXT).unwrap_or_default();
-            while !next.is_invalid() {
-                if IsWindowVisible(next).as_bool() {
-                    let mut pid = 0;
-                    GetWindowThreadProcessId(next, Some(&mut pid));
-                    if pid != 0 && pid != spotify_pid && next != spotify_hwnd {
-                        let mut title = [0u16; 64];
-                        let len = GetWindowTextW(next, &mut title);
-                        if len > 0 {
-                            let s = String::from_utf16_lossy(&title[..len as usize]);
-                            if s != "Default IME" && s != "MSCTFIME UI" {
-                                return Some(next);
-                            }
-                        }
-                    }
-                }
-                next = GetWindow(next, GW_HWNDNEXT).unwrap_or_default();
-            }
-        }
-        None
-    }
-
-    unsafe fn restore_foreground(target_hwnd: HWND) -> bool {
-        if target_hwnd.is_invalid() || !IsWindow(target_hwnd).as_bool() {
-            return false;
-        }
-        let current_fg = GetForegroundWindow();
-        if current_fg == target_hwnd {
-            return true;
-        }
-
-        let current_thread = GetCurrentThreadId();
-        let fg_thread = GetWindowThreadProcessId(current_fg, None);
-        let target_thread = GetWindowThreadProcessId(target_hwnd, None);
-
-        if fg_thread != 0 && fg_thread != current_thread {
-            let _ = AttachThreadInput(current_thread, fg_thread, BOOL::from(true));
-        }
-        if target_thread != 0 && target_thread != current_thread {
-            let _ = AttachThreadInput(current_thread, target_thread, BOOL::from(true));
-        }
-
-        let ok = SetForegroundWindow(target_hwnd).as_bool();
-
-        if fg_thread != 0 && fg_thread != current_thread {
-            let _ = AttachThreadInput(current_thread, fg_thread, BOOL::from(false));
-        }
-        if target_thread != 0 && target_thread != current_thread {
-            let _ = AttachThreadInput(current_thread, target_thread, BOOL::from(false));
-        }
-
-        ok
-    }
-
-    fn execute<F, R>(&mut self, action: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let fg_before = unsafe { GetForegroundWindow() };
-        let mut fg_before_pid = 0;
-        if !fg_before.is_invalid() {
-            unsafe {
-                GetWindowThreadProcessId(fg_before, Some(&mut fg_before_pid));
-            }
-        }
-
-        let spotify_was_fg = !fg_before.is_invalid()
-            && (fg_before_pid == self.spotify_pid || fg_before == self.spotify_hwnd);
-
-        if !spotify_was_fg && !fg_before.is_invalid() && unsafe { IsWindow(fg_before).as_bool() } {
-            self.last_known_good_fg = fg_before;
-        }
-
-        let was_iconic = if !self.spotify_hwnd.is_invalid() {
-            unsafe { IsIconic(self.spotify_hwnd).as_bool() }
-        } else {
-            false
-        };
-
-        let input_before = get_last_input_tick();
-        let t_start = unsafe { GetTickCount() };
-
-        let result = action();
-
-        if spotify_was_fg {
-            // User intentionally focused Spotify; do not interfere with foreground
-            return result;
-        }
-
-        let input_after = get_last_input_tick();
-        let has_new_user_input = input_after > input_before
-            && (input_after >= t_start || t_start.wrapping_sub(input_after) < 50);
-
-        // Check if Spotify stole focus immediately or within micro-window
-        for poll in 0..3 {
-            let fg_after = unsafe { GetForegroundWindow() };
-            let mut fg_after_pid = 0;
-            if !fg_after.is_invalid() {
-                unsafe {
-                    GetWindowThreadProcessId(fg_after, Some(&mut fg_after_pid));
-                }
-            }
-
-            if (fg_after_pid != 0 && fg_after_pid == self.spotify_pid)
-                || fg_after == self.spotify_hwnd
-            {
-                let target_restore = if has_new_user_input {
-                    // New user input occurred during UIA execution.
-                    // Preserve the user's intentional application choice rather than stale fg_before.
-                    unsafe { Self::find_intentional_target(self.spotify_hwnd, self.spotify_pid) }
-                } else {
-                    // No new user input occurred; Spotify focus was an involuntary UIA side-effect.
-                    let good =
-                        if !fg_before.is_invalid() && unsafe { IsWindow(fg_before).as_bool() } {
-                            fg_before
-                        } else {
-                            self.last_known_good_fg
-                        };
-                    if !good.is_invalid() && unsafe { IsWindow(good).as_bool() } {
-                        Some(good)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(target) = target_restore {
-                    if target != fg_after && unsafe { IsWindow(target).as_bool() } {
-                        unsafe {
-                            if !was_iconic && !self.spotify_hwnd.is_invalid() {
-                                let _ = SetWindowPos(
-                                    self.spotify_hwnd,
-                                    target,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                );
-                            }
-                            Self::restore_foreground(target);
-                        }
-                    }
-                }
-                break;
-            }
-            if poll < 2 {
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-
-        result
-    }
-}
-
-struct PendingVerification {
-    target_level: Option<f32>,
-    target_muted: Option<bool>,
-    deadline: Instant,
-    last_read: Instant,
-}
-
-fn spotify_worker_loop(
-    rx: Receiver<DesktopCommand>,
-    cached_level: Arc<AtomicU32>,
-    cached_muted: Arc<AtomicBool>,
-    is_connected: Arc<AtomicBool>,
-    last_unmuted: Arc<Mutex<f32>>,
-    update_status: Arc<AtomicU8>,
-) {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let automation =
-            match CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_ALL) {
-                Ok(a) => a,
-                Err(_) => return,
-            };
-
-        let cond_slider_type = match automation.CreatePropertyCondition(
-            UIA_ControlTypePropertyId,
-            &windows::core::VARIANT::from(UIA_SliderControlTypeId.0 as i32),
-        ) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let cond_slider_name = match automation.CreatePropertyCondition(
-            UIA_NamePropertyId,
-            &windows::core::VARIANT::from("Change volume"),
-        ) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let cond_slider = match automation.CreateAndCondition(&cond_slider_type, &cond_slider_name)
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let cond_btn_type = match automation.CreatePropertyCondition(
-            UIA_ControlTypePropertyId,
-            &windows::core::VARIANT::from(UIA_ButtonControlTypeId.0 as i32),
-        ) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let cond_mute_name = match automation
-            .CreatePropertyCondition(UIA_NamePropertyId, &windows::core::VARIANT::from("Mute"))
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let cond_mute_btn = automation
-            .CreateAndCondition(&cond_btn_type, &cond_mute_name)
-            .ok();
-
-        let cond_unmute_name = match automation
-            .CreatePropertyCondition(UIA_NamePropertyId, &windows::core::VARIANT::from("Unmute"))
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let cond_unmute_btn = automation
-            .CreateAndCondition(&cond_btn_type, &cond_unmute_name)
-            .ok();
-        // The mute button is one element whose name flips between "Mute" and "Unmute". It is
-        // found once per connection: searching Spotify's whole tree costs ~80 ms per lookup.
-        let cond_mute_toggle = match (&cond_mute_btn, &cond_unmute_btn) {
-            (Some(m), Some(u)) => automation.CreateOrCondition(m, u).ok(),
-            _ => None,
-        };
-
-        let mut current_hwnd = HWND::default();
-        let mut focus_guard = SpotifyFocusGuard::new(HWND::default());
-        let mut slider_pattern: Option<IUIAutomationRangeValuePattern> = None;
-        let mut mute_elem: Option<IUIAutomationElement> = None;
-        // Spotify's accessibility value lags a change by about 2 s, and a SetValue while it is
-        // minimized blocks for about as long, so a change is held this long before readbacks win.
-        const SETTLE: Duration = Duration::from_millis(4000);
-        const POLL: Duration = Duration::from_millis(500);
-        let is_muted_now = |mute_elem: &Option<IUIAutomationElement>| -> Option<bool> {
-            let name = mute_elem.as_ref()?.CurrentName().ok()?.to_string();
-            Some(name.eq_ignore_ascii_case("Unmute"))
-        };
-        let mut last_poll = Instant::now() - Duration::from_secs(1);
-        let mut last_reconnect = Instant::now() - Duration::from_secs(10);
-        let mut pending: Option<PendingVerification> = None;
-        // Set by our own changes; see the minimized case in the poll below.
-        let mut own_change = false;
-        let mut hidden_since_change = false;
-        let mut shown_at: Option<Instant> = None;
-
-        loop {
-            let wait_dur = if pending.is_some() {
-                Duration::from_millis(50)
-            } else if slider_pattern.is_some() {
-                POLL.saturating_sub(last_poll.elapsed())
-            } else {
-                Duration::from_millis(1000).saturating_sub(last_poll.elapsed())
-            };
-
-            let mut cmd = match rx.recv_timeout(wait_dur) {
-                Ok(c) => Some(c),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
-            while let Ok(next) = rx.try_recv() {
-                cmd = Some(next);
-            }
-
-            let is_explicit_reconnect = matches!(cmd, Some(DesktopCommand::Reconnect));
-            let need_reconnect = slider_pattern.is_none() || current_hwnd.is_invalid();
-
-            if need_reconnect
-                && (is_explicit_reconnect
-                    || last_reconnect.elapsed() >= Duration::from_millis(1000))
-            {
-                last_reconnect = Instant::now();
-                if let Some(hwnd) = find_spotify_window() {
-                    current_hwnd = hwnd;
-                    focus_guard = SpotifyFocusGuard::new(hwnd);
-                    if let Ok(elem) = automation.ElementFromHandle(hwnd) {
-                        if let Ok(slider_elem) = elem.FindFirst(TreeScope_Descendants, &cond_slider)
-                        {
-                            if let Ok(unk) = slider_elem.GetCurrentPattern(UIA_RangeValuePatternId)
-                            {
-                                if let Ok(pat) = unk.cast::<IUIAutomationRangeValuePattern>() {
-                                    slider_pattern = Some(pat);
-                                    mute_elem = cond_mute_toggle
-                                        .as_ref()
-                                        .and_then(|c| elem.FindFirst(TreeScope_Descendants, c).ok());
-                                    is_connected.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                }
-                if slider_pattern.is_none() {
-                    current_hwnd = HWND::default();
-                    mute_elem = None;
-                    is_connected.store(false, Ordering::Relaxed);
-                }
-            }
-
-            if let Some(cmd) = cmd {
-                if let Some(ref pat) = slider_pattern {
-                    match cmd {
-                        DesktopCommand::SetLevel(lvl) => {
-                            let target = map_to_spotify_range(lvl);
-                            let res = focus_guard.execute(|| pat.SetValue(target));
-                            if res.is_ok() {
-                                own_change = true;
-                                cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
-                                if lvl > 0. {
-                                    cached_muted.store(false, Ordering::Relaxed);
-                                }
-                                pending = Some(PendingVerification {
-                                    target_level: Some(lvl),
-                                    target_muted: if lvl > 0. { Some(false) } else { None },
-                                    deadline: Instant::now() + SETTLE,
-                                    last_read: Instant::now(),
-                                });
-                                update_status
-                                    .store(VolumeUpdateStatus::Pending as u8, Ordering::Relaxed);
-                            } else {
-                                slider_pattern = None;
-                                is_connected.store(false, Ordering::Relaxed);
-                                update_status
-                                    .store(VolumeUpdateStatus::Failed as u8, Ordering::Relaxed);
-                                pending = None;
-                            }
-                        }
-                        DesktopCommand::SetMuted(muted) => {
-                            let mut handled = false;
-                            if let (Some(btn), Some(now_muted)) = (&mute_elem, is_muted_now(&mute_elem)) {
-                                if now_muted == muted {
-                                    handled = true;
-                                } else if let Ok(unk) = btn.GetCurrentPattern(UIA_InvokePatternId) {
-                                    if let Ok(inv) = unk.cast::<IUIAutomationInvokePattern>() {
-                                        let _ = focus_guard.execute(|| inv.Invoke());
-                                        handled = true;
-                                    }
-                                }
-                            }
-                            if !handled {
-                                let res = focus_guard.execute(|| {
-                                    if muted {
-                                        pat.SetValue(0.0)
-                                    } else {
-                                        let restore =
-                                            last_unmuted.lock().map(|u| *u).unwrap_or(0.5).max(0.1);
-                                        pat.SetValue(map_to_spotify_range(restore))
-                                    }
-                                });
-                                if res.is_err() {
-                                    slider_pattern = None;
-                                    is_connected.store(false, Ordering::Relaxed);
-                                }
-                            }
-                            cached_muted.store(muted, Ordering::Relaxed);
-                            own_change = true;
-                            pending = Some(PendingVerification {
-                                target_level: None,
-                                target_muted: Some(muted),
-                                deadline: Instant::now() + SETTLE,
-                                last_read: Instant::now(),
-                            });
-                            update_status
-                                .store(VolumeUpdateStatus::Pending as u8, Ordering::Relaxed);
-                        }
-                        DesktopCommand::Reconnect => {}
-                    }
-                }
-            } else if let Some(ref mut p) = pending {
-                // A change is confirmed once Spotify reads back the target. Its readback can lag
-                // well behind, so after SETTLE the change is simply kept, never the stale reading.
-                if p.last_read.elapsed() >= Duration::from_millis(100) {
-                    p.last_read = Instant::now();
-                    let confirmed = match p.target_level {
-                        Some(target) => slider_pattern
-                            .as_ref()
-                            .and_then(|pat| pat.CurrentValue().ok())
-                            .is_some_and(|v| (map_from_spotify_range(v) - target).abs() <= 0.02),
-                        None => p
-                            .target_muted
-                            .is_some_and(|m| is_muted_now(&mute_elem) == Some(m)),
-                    };
-                    let timed_out = Instant::now() >= p.deadline;
-                    if confirmed || timed_out {
-                        let status = if confirmed {
-                            VolumeUpdateStatus::Confirmed
-                        } else {
-                            VolumeUpdateStatus::Failed
-                        };
-                        update_status.store(status as u8, Ordering::Relaxed);
-                        pending = None;
-                        last_poll = Instant::now();
-                    }
-                }
-            } else if last_poll.elapsed() >= POLL {
-                last_poll = Instant::now();
-                // While Spotify is minimized its accessibility tree stops updating, so after a
-                // change of ours a readback would be stale; trust our value until it is shown
-                // again and has had SETTLE to catch up.
-                let iconic = !current_hwnd.is_invalid() && IsIconic(current_hwnd).as_bool();
-                if iconic && own_change {
-                    hidden_since_change = true;
-                    continue;
-                }
-                if hidden_since_change {
-                    hidden_since_change = false;
-                    shown_at = Some(Instant::now());
-                }
-                if shown_at.is_some_and(|t| t.elapsed() < SETTLE) {
-                    continue;
-                }
-                shown_at = None;
-                own_change = false;
-                if let Some(ref pat) = slider_pattern {
-                    if let Ok(val) = pat.CurrentValue() {
-                        let lvl = map_from_spotify_range(val);
-                        cached_level.store(f32::to_bits(lvl), Ordering::Relaxed);
-                        let is_muted = is_muted_now(&mute_elem).unwrap_or(lvl <= 0.005);
-                        cached_muted.store(is_muted, Ordering::Relaxed);
-                        if lvl > 0.005 && !is_muted {
-                            if let Ok(mut u) = last_unmuted.lock() {
-                                *u = lvl;
-                            }
-                        }
-                        is_connected.store(true, Ordering::Relaxed);
-                        update_status.store(VolumeUpdateStatus::Idle as u8, Ordering::Relaxed);
-                    } else {
-                        slider_pattern = None;
-                        mute_elem = None;
-                        is_connected.store(false, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1154,12 +433,15 @@ impl VolumeAdapter for AppleMusicVolumeAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// 4 & 5. Chrome & Edge Browser Audio Session Volume Adapters (Windows Core Audio)
+// 4. Spotify, Chrome & Edge: the app's own Windows audio session (Volume Mixer)
 // ---------------------------------------------------------------------------
 
 /// Finds all active or inactive audio sessions belonging to the specified executable name (e.g. "chrome.exe", "msedge.exe").
 /// Returns matching ISimpleAudioVolume instances, sorted with active sessions first.
-pub fn find_browser_audio_sessions(target_exe: &str) -> Vec<ISimpleAudioVolume> {
+/// The audio sessions of `target_exe` (e.g. "spotify.exe") on every active output device, as
+/// listed in the Volume Mixer; active ones first. Apps can play to a device other than the
+/// default one, so all of them are searched.
+pub fn find_app_audio_sessions(target_exe: &str) -> Vec<ISimpleAudioVolume> {
     let mut active = Vec::new();
     let mut inactive = Vec::new();
     unsafe {
@@ -1169,44 +451,44 @@ pub fn find_browser_audio_sessions(target_exe: &str) -> Vec<ISimpleAudioVolume> 
         else {
             return active;
         };
-        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) else {
+        let Ok(devices) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
             return active;
         };
-        let Ok(mgr) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
-            return active;
-        };
-        let Ok(session_enum) = mgr.GetSessionEnumerator() else {
-            return active;
-        };
-        let count = session_enum.GetCount().unwrap_or(0);
-        for i in 0..count {
-            let Ok(session) = session_enum.GetSession(i) else {
+        for d in 0..devices.GetCount().unwrap_or(0) {
+            let Ok(device) = devices.Item(d) else {
                 continue;
             };
-            let Ok(control2) = session.cast::<IAudioSessionControl2>() else {
+            let Ok(mgr) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
                 continue;
             };
-            let Ok(pid) = control2.GetProcessId() else {
+            let Ok(session_enum) = mgr.GetSessionEnumerator() else {
                 continue;
             };
-            if pid == 0 {
-                continue;
-            }
-            let pname = process_name(pid);
-            if !pname.eq_ignore_ascii_case(target_exe) {
-                continue;
-            }
-            let state = control2.GetState().unwrap_or(AudioSessionStateInactive);
-            if state == AudioSessionStateExpired {
-                continue;
-            }
-            let Ok(vol) = session.cast::<ISimpleAudioVolume>() else {
-                continue;
-            };
-            if state == AudioSessionStateActive {
-                active.push(vol);
-            } else {
-                inactive.push(vol);
+            for i in 0..session_enum.GetCount().unwrap_or(0) {
+                let Ok(session) = session_enum.GetSession(i) else {
+                    continue;
+                };
+                let Ok(control2) = session.cast::<IAudioSessionControl2>() else {
+                    continue;
+                };
+                let Ok(pid) = control2.GetProcessId() else {
+                    continue;
+                };
+                if pid == 0 || !process_name(pid).eq_ignore_ascii_case(target_exe) {
+                    continue;
+                }
+                let state = control2.GetState().unwrap_or(AudioSessionStateInactive);
+                if state == AudioSessionStateExpired {
+                    continue;
+                }
+                let Ok(vol) = session.cast::<ISimpleAudioVolume>() else {
+                    continue;
+                };
+                if state == AudioSessionStateActive {
+                    active.push(vol);
+                } else {
+                    inactive.push(vol);
+                }
             }
         }
     }
@@ -1214,7 +496,7 @@ pub fn find_browser_audio_sessions(target_exe: &str) -> Vec<ISimpleAudioVolume> 
     active
 }
 
-pub struct BrowserAudioSessionVolumeAdapter {
+pub struct AudioSessionVolumeAdapter {
     target_exe: &'static str,
     cached_level: AtomicU32,
     cached_muted: AtomicBool,
@@ -1223,7 +505,7 @@ pub struct BrowserAudioSessionVolumeAdapter {
     last_poll: Mutex<Instant>,
 }
 
-impl BrowserAudioSessionVolumeAdapter {
+impl AudioSessionVolumeAdapter {
     pub fn new(target_exe: &'static str) -> Self {
         Self {
             target_exe,
@@ -1243,7 +525,7 @@ impl BrowserAudioSessionVolumeAdapter {
                 }
             }
         }
-        let sessions = find_browser_audio_sessions(self.target_exe);
+        let sessions = find_app_audio_sessions(self.target_exe);
         if let Ok(mut last) = self.last_poll.lock() {
             *last = Instant::now();
         }
@@ -1273,7 +555,7 @@ impl BrowserAudioSessionVolumeAdapter {
     }
 }
 
-impl VolumeAdapter for BrowserAudioSessionVolumeAdapter {
+impl VolumeAdapter for AudioSessionVolumeAdapter {
     fn is_available(&self) -> bool {
         if self.is_connected.load(Ordering::Relaxed) {
             self.poll_sessions_if_due(false);
@@ -1300,7 +582,7 @@ impl VolumeAdapter for BrowserAudioSessionVolumeAdapter {
 
     fn set_volume(&mut self, value: f32) -> bool {
         let level = normalize_volume(value);
-        let sessions = find_browser_audio_sessions(self.target_exe);
+        let sessions = find_app_audio_sessions(self.target_exe);
         if sessions.is_empty() {
             self.is_connected.store(false, Ordering::Relaxed);
             return false;
@@ -1344,7 +626,7 @@ impl VolumeAdapter for BrowserAudioSessionVolumeAdapter {
     }
 
     fn set_muted(&mut self, value: bool) -> bool {
-        let sessions = find_browser_audio_sessions(self.target_exe);
+        let sessions = find_app_audio_sessions(self.target_exe);
         if sessions.is_empty() {
             return false;
         }
@@ -1379,8 +661,9 @@ impl VolumeAdapter for BrowserAudioSessionVolumeAdapter {
     }
 }
 
-pub type ChromeYouTubeVolumeAdapter = BrowserAudioSessionVolumeAdapter;
-pub type EdgeYouTubeVolumeAdapter = BrowserAudioSessionVolumeAdapter;
+pub type SpotifySessionVolumeAdapter = AudioSessionVolumeAdapter;
+pub type ChromeYouTubeVolumeAdapter = AudioSessionVolumeAdapter;
+pub type EdgeYouTubeVolumeAdapter = AudioSessionVolumeAdapter;
 
 // ---------------------------------------------------------------------------
 // Orchestrator: Unified Wisp Volume
@@ -1388,7 +671,7 @@ pub type EdgeYouTubeVolumeAdapter = BrowserAudioSessionVolumeAdapter;
 
 pub struct Volume {
     app: String,
-    spotify: Arc<Mutex<SpotifyVolumeAdapter>>,
+    spotify: Arc<Mutex<SpotifySessionVolumeAdapter>>,
     spotifast: Arc<Mutex<SpotifastVolumeAdapter>>,
     apple_music: Arc<Mutex<AppleMusicVolumeAdapter>>,
     chrome: Arc<Mutex<ChromeYouTubeVolumeAdapter>>,
@@ -1399,13 +682,13 @@ impl Volume {
     pub fn none() -> Self {
         Self {
             app: String::new(),
-            spotify: Arc::new(Mutex::new(SpotifyVolumeAdapter::new())),
+            spotify: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new("spotify.exe"))),
             spotifast: Arc::new(Mutex::new(SpotifastVolumeAdapter::new())),
             apple_music: Arc::new(Mutex::new(AppleMusicVolumeAdapter::new())),
-            chrome: Arc::new(Mutex::new(BrowserAudioSessionVolumeAdapter::new(
+            chrome: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
                 "chrome.exe",
             ))),
-            edge: Arc::new(Mutex::new(BrowserAudioSessionVolumeAdapter::new(
+            edge: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
                 "msedge.exe",
             ))),
         }
@@ -1655,14 +938,7 @@ mod tests {
 
     #[test]
     fn test_range_mapping() {
-        assert!((map_to_spotify_range(0.8) - 0.8).abs() < 1e-6);
-        assert_eq!(map_to_spotify_range(-0.1), 0.0);
-        assert_eq!(map_to_spotify_range(1.2), 1.0);
 
-        assert!((map_from_spotify_range(0.4) - 0.4).abs() < 1e-6);
-        assert_eq!(map_from_spotify_range(-0.5), 0.0);
-        assert_eq!(map_from_spotify_range(1.5), 1.0);
-        assert_eq!(map_from_spotify_range(f64::NAN), 0.0);
 
         assert!((map_to_spotifast_range(0.75) - 75.0).abs() < 1e-6);
         assert_eq!(map_to_spotifast_range(-0.1), 0.0);
@@ -1771,6 +1047,24 @@ mod tests {
         assert!(after.is_some_and(|v| (v - before).abs() < 0.015));
     }
 
+    /// Halves and restores the running Spotify's Volume Mixer level through the facade:
+    /// `cargo test live_spotify_session -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_spotify_session() {
+        let mut vol = Volume::none();
+        vol.refresh("spotify");
+        let (before, muted) = vol.get().expect("Spotify must be running with an audio session");
+        println!("before {before:.2} muted {muted}");
+        vol.set_level(before / 2.);
+        let sessions = find_app_audio_sessions("spotify.exe");
+        let now = unsafe { sessions[0].GetMasterVolume().unwrap() };
+        println!("after halving {now:.2}");
+        vol.set_level(before);
+        assert!((now - before / 2.).abs() < 0.01);
+        assert!(vol.get().is_some_and(|(l, _)| (l - before).abs() < 0.01));
+    }
+
     #[test]
     fn test_parse_spotifast_now_playing_volume() {
         let raw = "playing\tSweet Fantasy\tMagnolia Celebration\tFantasia\t93208\t396000\t73\toff\toff\thttps://x\tno\tSpotifast\n";
@@ -1796,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_browser_audio_session_adapter_nonexistent() {
-        let mut adapter = BrowserAudioSessionVolumeAdapter::new("nonexistent_app_12345.exe");
+        let mut adapter = AudioSessionVolumeAdapter::new("nonexistent_app_12345.exe");
         assert!(!adapter.is_available());
         assert_eq!(adapter.get_volume(), None);
         assert_eq!(adapter.get_muted(), None);
@@ -1810,8 +1104,8 @@ mod tests {
 
     #[test]
     fn test_browser_audio_session_isolation() {
-        let mut chrome = BrowserAudioSessionVolumeAdapter::new("chrome.exe");
-        let mut edge = BrowserAudioSessionVolumeAdapter::new("msedge.exe");
+        let mut chrome = AudioSessionVolumeAdapter::new("chrome.exe");
+        let mut edge = AudioSessionVolumeAdapter::new("msedge.exe");
 
         // Disconnect both
         chrome.disconnect();
@@ -1827,7 +1121,7 @@ mod tests {
         assert!(!edge.set_muted(true));
 
         // Unrelated app session volume must never be touched
-        let mut bogus = BrowserAudioSessionVolumeAdapter::new("calculator.exe");
+        let mut bogus = AudioSessionVolumeAdapter::new("calculator.exe");
         bogus.reconnect();
         assert!(!bogus.is_available());
         assert_eq!(bogus.get_volume(), None);
@@ -1838,9 +1132,9 @@ mod tests {
     #[test]
     fn test_browser_audio_sessions_independent_of_master_volume() {
         // Enumerate sessions to verify query safety and isolation
-        let chrome_sessions = find_browser_audio_sessions("chrome.exe");
-        let edge_sessions = find_browser_audio_sessions("msedge.exe");
-        let spotify_sessions = find_browser_audio_sessions("spotify.exe");
+        let chrome_sessions = find_app_audio_sessions("chrome.exe");
+        let edge_sessions = find_app_audio_sessions("msedge.exe");
+        let spotify_sessions = find_app_audio_sessions("spotify.exe");
 
         // Verify that chrome query returns only chrome sessions, edge only edge sessions
         println!("Detected Chrome audio sessions: {}", chrome_sessions.len());
@@ -1852,94 +1146,15 @@ mod tests {
     }
 
     #[test]
-    fn test_spotify_uia_live_if_running() {
-        if let Some(hwnd) = find_spotify_window() {
-            println!("Verified Spotify running under HWND: {:?}", hwnd);
-            let mut pid = 0;
-            unsafe {
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            }
-            let fg_before = unsafe { GetForegroundWindow() };
-            let iconic_before = unsafe { IsIconic(hwnd).as_bool() };
-
-            let mut adapter = SpotifyVolumeAdapter::new();
-            adapter.reconnect();
-            let start = Instant::now();
-            while !adapter.is_available() && start.elapsed() < Duration::from_secs(10) {
-                thread::sleep(Duration::from_millis(100));
-            }
-            if adapter.is_available() {
-                if let Some(orig) = adapter.get_volume() {
-                    // Test Matrix: 80%, 40%, 20%, mute, unmute, restore
-                    adapter.set_volume(0.80);
-                    thread::sleep(Duration::from_millis(300));
-                    assert_eq!(adapter.get_volume(), Some(0.80));
-
-                    adapter.set_volume(0.40);
-                    thread::sleep(Duration::from_millis(300));
-                    assert_eq!(adapter.get_volume(), Some(0.40));
-
-                    adapter.set_volume(0.20);
-                    thread::sleep(Duration::from_millis(300));
-                    assert_eq!(adapter.get_volume(), Some(0.20));
-
-                    adapter.set_muted(true);
-                    let start_mute = Instant::now();
-                    while adapter.get_muted() != Some(true)
-                        && start_mute.elapsed() < Duration::from_secs(3)
-                    {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    assert_eq!(adapter.get_muted(), Some(true));
-
-                    adapter.set_muted(false);
-                    let start_unmute = Instant::now();
-                    while adapter.get_muted() != Some(false)
-                        && start_unmute.elapsed() < Duration::from_secs(3)
-                    {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    assert_eq!(adapter.get_muted(), Some(false));
-
-                    adapter.set_volume(orig);
-                    let start_restore = Instant::now();
-                    while adapter.get_volume() != Some(orig)
-                        && start_restore.elapsed() < Duration::from_secs(3)
-                    {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    assert_eq!(adapter.get_volume(), Some(orig));
-
-                    // Verify foreground window and iconic state invariance
-                    let fg_after = unsafe { GetForegroundWindow() };
-                    let mut fg_after_pid = 0;
-                    unsafe {
-                        GetWindowThreadProcessId(fg_after, Some(&mut fg_after_pid));
-                    }
-                    let iconic_after = unsafe { IsIconic(hwnd).as_bool() };
-
-                    assert_eq!(
-                        iconic_before, iconic_after,
-                        "Spotify minimized state must remain invariant"
-                    );
-                    if !fg_before.is_invalid() && fg_before != hwnd {
-                        assert_ne!(fg_after_pid, pid, "Spotify must not steal foreground focus");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn test_chrome_session_live_if_running() {
-        let mut chrome = BrowserAudioSessionVolumeAdapter::new("chrome.exe");
+        let mut chrome = AudioSessionVolumeAdapter::new("chrome.exe");
         chrome.reconnect();
         if chrome.is_available() {
             if let Some(orig) = chrome.get_volume() {
                 println!("Chrome live session initial volume: {}", orig);
 
                 // Read Spotify volume before
-                let spotify_sessions_before = find_browser_audio_sessions("spotify.exe");
+                let spotify_sessions_before = find_app_audio_sessions("spotify.exe");
                 let spotify_vol_before = spotify_sessions_before
                     .first()
                     .and_then(|s| unsafe { s.GetMasterVolume().ok() });
@@ -1979,7 +1194,7 @@ mod tests {
                 assert!((v_restored - orig).abs() <= 0.02);
 
                 // Verify Spotify session was completely untouched (isolation)
-                let spotify_sessions_after = find_browser_audio_sessions("spotify.exe");
+                let spotify_sessions_after = find_app_audio_sessions("spotify.exe");
                 let spotify_vol_after = spotify_sessions_after
                     .first()
                     .and_then(|s| unsafe { s.GetMasterVolume().ok() });
@@ -2035,18 +1250,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_spotify_volume_update_status() {
-        let mut adapter = SpotifyVolumeAdapter::new();
-        assert_eq!(adapter.update_status(), VolumeUpdateStatus::Idle);
-        adapter.is_connected.store(true, Ordering::Relaxed);
-        assert!(adapter.set_volume(0.75));
-        assert_eq!(adapter.update_status(), VolumeUpdateStatus::Pending);
-        assert_eq!(adapter.get_volume(), Some(0.75));
-        assert!(adapter.set_muted(true));
-        assert_eq!(adapter.update_status(), VolumeUpdateStatus::Pending);
-        assert_eq!(adapter.get_muted(), Some(true));
-        adapter.disconnect();
-        assert_eq!(adapter.update_status(), VolumeUpdateStatus::Idle);
-    }
 }
