@@ -2,6 +2,22 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
+## [0.1.8hf] - 2026-11-02
+
+Hotfix for 0.1.8.
+
+### Fixed
+- **Spotify volume** did almost nothing and made the notch slider flicker: driving Spotify's in-app slider through UI Automation blocks ~2 s, steals the focus, moves in 10% key steps and is ignored while minimized. Spotify now uses its own Windows audio session (Volume Mixer), which is instant and works minimized; `SpotifyVolumeAdapter`, its worker and `SpotifyFocusGuard` are removed.
+- **Spotify became "always on top"** after a volume change: the focus guard re-stacked it behind the topmost notch.
+- **Spotifast volume jumped up and down**: `spotifast volume` processes overtook each other during a drag, and its internal volume file was read and written. Commands now run in order (newest drag level only), the level comes from `spotifast now-playing --raw`, its files are left alone, unmute restores the previous level, and mute works.
+- Audio sessions are found on every active output device, not only the default one.
+
+### Improved
+- **Calendar agenda**: an "Add an event" composer with a title, a time picker (− / + in 15-minute steps) or All day, and Cancel / Add buttons; click an event to edit it. Typed times (`9:30 Standup`) still work, an empty time is all day, and the composer and the day's events animate.
+
+### Known limitations
+- Apple Music's volume adapter only detects the app; it does not change the volume yet.
+
 ## [0.1.8] - 2026-11-02
 
 ### Added
