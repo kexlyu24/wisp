@@ -36,7 +36,7 @@ It sits at the top of your screen, shows what's playing and your notifications, 
 
 ### 📅 Calendar
 - A month view in the style of Apple's Calendar widget, with today marked in red. Flip through months and pick any date.
-- **Your own schedule**: add, edit and delete events for the selected date (`09:30-10:00 Standup`, or just a title for 09:00). Dates with events get a marker.
+- **Your own agenda**: click **Add an event**, type a title, pick a time with − / + (or **All day**) and press **Add**. Click an event to change it, or its × to delete it. Dates with events get a dot.
 - Scroll or swipe through every page; the panel reshapes itself for each one.
 
 <img src="assets/previews/pages.gif" alt="Scrolling through Now Playing, Calendar, To-do, Pomodoro, Shelf and Settings" width="560">

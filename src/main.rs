@@ -553,6 +553,16 @@ const EXP_H: f64 = 196.;
 const NP_W: f64 = 460.;
 const CAL_W: f64 = 440.;
 const CAL_H: f64 = 260.;
+/// Calendar agenda (left pane): field, time row and buttons while composing, then the list.
+const AGENDA_X: f64 = 20.;
+const AGENDA_W: f64 = 196.;
+const AGENDA_FIELD_Y: f64 = 68.;
+const AGENDA_FIELD_H: f64 = 30.;
+const AGENDA_TIME_Y: f64 = 106.;
+const AGENDA_BTN_Y: f64 = 138.;
+const AGENDA_ROW_H: f64 = 28.;
+/// Steps of the time picker, in minutes.
+const AGENDA_STEP: u32 = 15;
 const DIB_W: f64 = EXP_W + 48.;
 const TODO_W: f64 = 440.;
 const POMO_W: f64 = 440.;
@@ -708,6 +718,17 @@ struct State {
     cal_input: String,
     cal_editing: bool,
     cal_editing_id: Option<u64>,
+    /// The composer's time in minutes after midnight; None is all day.
+    cal_time: Option<u32>,
+    /// End time of the event being edited, kept unless a new one is typed.
+    cal_end: String,
+    /// Composer unfold (0 closed, 1 open) and the day's list fade-in after a date change.
+    compose_t: f64,
+    compose_v: f64,
+    agenda_t: f64,
+    agenda_v: f64,
+    /// The date whose list `agenda_t` animates in.
+    agenda_key: (i32, u32, u32),
     cal_scroll: usize,
     high_surrogate: u16,
     pomo: tasks::Pomodoro,
@@ -917,6 +938,13 @@ impl State {
             cal_input: String::new(),
             cal_editing: false,
             cal_editing_id: None,
+            cal_time: Some(9 * 60),
+            cal_end: String::new(),
+            compose_t: 0.,
+            compose_v: 0.,
+            agenda_t: 1.,
+            agenda_v: 0.,
+            agenda_key: (0, 0, 0),
             cal_scroll: 0,
             high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
@@ -1471,25 +1499,52 @@ impl State {
         }
     }
     /// Calendar hit targets: 5000 add input, 5001 prev month, 5002 next month, 5003 today, 5100+day cell, 5200+i row select/edit, 5300+i row delete, -1 none.
+    /// First list row's y and how many rows fit: the composer pushes the list down.
+    fn agenda_rows(&self) -> (f64, usize) {
+        if self.cal_editing {
+            (AGENDA_BTN_Y + 34., 2)
+        } else {
+            (AGENDA_FIELD_Y + AGENDA_FIELD_H + 8., 5)
+        }
+    }
+    /// Agenda codes: 5000 field, 5004/5005 time −/+, 5006 all day, 5007 Cancel, 5008 Add/Save,
+    /// 5200+i edit row i, 5300+i delete it. Month grid: 5001/5002 month −/+, 5003 Today, 5100+day.
     fn cal_hit(&self, x: f64, y: f64) -> i32 {
         if !(16. ..CAL_W - 16.).contains(&x) {
             return -1;
         }
-        if x <= 220. {
-            if (68. ..96.).contains(&y) && (20. ..216.).contains(&x) {
+        if x <= AGENDA_X + AGENDA_W + 4. {
+            let inside = |x0: f64, w: f64, y0: f64, h: f64| (x0..x0 + w).contains(&x) && (y0..y0 + h).contains(&y);
+            if inside(AGENDA_X, AGENDA_W, AGENDA_FIELD_Y, AGENDA_FIELD_H) {
                 return 5000;
             }
-            if (100. ..248.).contains(&y) {
-                let row_h = 28.;
-                let row_idx = ((y - 100.) / row_h).floor() as usize;
-                let items = self.calendar.selected_schedules();
-                let actual_idx = self.cal_scroll + row_idx;
-                if actual_idx < items.len() && row_idx < 5 {
-                    if (194. ..216.).contains(&x) {
-                        return 5300 + actual_idx as i32;
+            if self.cal_editing {
+                if inside(AGENDA_X + 38., 26., AGENDA_TIME_Y, 24.) {
+                    return 5004;
+                }
+                if inside(AGENDA_X + 118., 26., AGENDA_TIME_Y, 24.) {
+                    return 5005;
+                }
+                if inside(AGENDA_X + 150., 46., AGENDA_TIME_Y, 24.) {
+                    return 5006;
+                }
+                if inside(AGENDA_X, 94., AGENDA_BTN_Y, 26.) {
+                    return 5007;
+                }
+                if inside(AGENDA_X + 102., 94., AGENDA_BTN_Y, 26.) {
+                    return 5008;
+                }
+            }
+            let (list_y, rows) = self.agenda_rows();
+            if y >= list_y {
+                let row = ((y - list_y) / AGENDA_ROW_H).floor() as usize;
+                let idx = self.cal_scroll + row;
+                if row < rows && idx < self.calendar.selected_schedules().len() {
+                    return if x >= AGENDA_X + AGENDA_W - 24. {
+                        5300 + idx as i32
                     } else {
-                        return 5200 + actual_idx as i32;
-                    }
+                        5200 + idx as i32
+                    };
                 }
             }
             return -1;
@@ -1526,70 +1581,86 @@ impl State {
         }
         -1
     }
+    /// Opens the composer for a new event: next full hour today, 09:00 on other days.
+    unsafe fn start_new_event(&mut self, hwnd: Hwnd) {
+        if !self.cal_editing || self.cal_editing_id.is_some() {
+            self.cal_input.clear();
+            self.cal_editing_id = None;
+            self.cal_end.clear();
+            let mut now = Time::default();
+            GetLocalTime(&mut now);
+            let today = self.calendar.selected_year == now.year as i32
+                && self.calendar.selected_month == now.month as u32
+                && self.calendar.selected_day == now.day as u32;
+            self.cal_time = Some(if today {
+                ((now.hour as u32 + 1) * 60).min(23 * 60)
+            } else {
+                9 * 60
+            });
+        }
+        self.cal_editing = true;
+        SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
+    }
+    fn close_composer(&mut self) {
+        self.cal_editing = false;
+        self.cal_editing_id = None;
+        self.cal_input.clear();
+        self.cal_end.clear();
+    }
+    /// Moves the picked time by `steps` × 15 minutes, wrapping around midnight.
+    fn step_cal_time(&mut self, steps: i32) {
+        let day = 24 * 60;
+        let now = self.cal_time.unwrap_or(9 * 60) as i32;
+        let snapped = now - now.rem_euclid(AGENDA_STEP as i32);
+        let base = if steps > 0 || snapped == now { snapped } else { snapped + AGENDA_STEP as i32 };
+        self.cal_time = Some((base + steps * AGENDA_STEP as i32).rem_euclid(day) as u32);
+    }
+    /// Saves the composer. A time typed before the title (`9:30 Standup`) wins over the picker.
     fn commit_cal_schedule(&mut self) {
-        let text = self.cal_input.trim().to_string();
-        if text.is_empty() {
+        let (typed_start, typed_end, title) = tasks::split_leading_time(&self.cal_input);
+        if title.trim().is_empty() {
             return;
         }
-        let mut parts = text.splitn(2, ' ');
-        let first = parts.next().unwrap_or("");
-        let rest = parts.next().unwrap_or("");
-        let (st, et, title) =
-            if first.contains(':') && tasks::is_valid_time(first.split('-').next().unwrap_or("")) {
-                let mut tr = first.split('-');
-                let start = tr.next().unwrap_or("09:00");
-                let end = tr.next().unwrap_or("");
-                (
-                    start.to_string(),
-                    end.to_string(),
-                    if rest.is_empty() {
-                        first.to_string()
-                    } else {
-                        rest.to_string()
-                    },
-                )
-            } else {
-                ("09:00".to_string(), String::new(), text)
-            };
-        if let Some(id) = self.cal_editing_id.take() {
+        let start = typed_start.or(self.cal_time);
+        let st = start.map(tasks::format_time).unwrap_or_default();
+        let et = match (typed_end, start) {
+            (Some(end), _) => tasks::format_time(end),
+            (None, Some(_)) => self.cal_end.clone(),
+            (None, None) => String::new(),
+        };
+        if let Some(id) = self.cal_editing_id {
             self.calendar.edit_schedule(id, &st, &et, &title, "");
         } else {
             self.calendar.add_schedule(&st, &et, &title, "");
         }
-        self.cal_input.clear();
-        self.cal_editing = false;
+        self.close_composer();
     }
     unsafe fn cal_click(&mut self, hwnd: Hwnd, hit: i32) {
         match hit {
-            5000 => {
-                self.cal_editing_id = None;
-                self.cal_editing = true;
-                SetForegroundWindow(hwnd);
-                SetFocus(hwnd);
-            }
-            5001 => {
-                self.cal_editing = false;
-                self.cal_editing_id = None;
-                self.calendar.prev_month();
-            }
-            5002 => {
-                self.cal_editing = false;
-                self.cal_editing_id = None;
-                self.calendar.next_month();
-            }
+            5000 => self.start_new_event(hwnd),
+            5001 => self.calendar.prev_month(),
+            5002 => self.calendar.next_month(),
             5003 => {
-                self.cal_editing = false;
-                self.cal_editing_id = None;
                 let mut now = Time::default();
                 GetLocalTime(&mut now);
                 self.calendar.view_year = now.year as i32;
                 self.calendar.view_month = now.month as u32;
                 self.calendar
                     .select_date(now.year as i32, now.month as u32, now.day as u32);
+                self.cal_scroll = 0;
             }
+            5004 | 5005 => self.step_cal_time(if hit == 5004 { -1 } else { 1 }),
+            5006 => {
+                self.cal_time = match self.cal_time {
+                    Some(_) => None,
+                    None => Some(9 * 60),
+                }
+            }
+            5007 => self.close_composer(),
+            5008 => self.commit_cal_schedule(),
+            // Picking a date keeps an open composer: the event goes to the new date.
             5101..=5131 => {
-                self.cal_editing = false;
-                self.cal_editing_id = None;
                 let day = (hit - 5100) as u32;
                 self.calendar
                     .select_date(self.calendar.view_year, self.calendar.view_month, day);
@@ -1599,8 +1670,12 @@ impl State {
                 let idx = (hit - 5200) as usize;
                 let items = self.calendar.selected_schedules();
                 if let Some(item) = items.get(idx) {
-                    self.cal_editing_id = Some(item.id);
-                    self.cal_input = format!("{} {}", item.start_time, item.title);
+                    let (id, title, end) = (item.id, item.title.clone(), item.end_time.clone());
+                    let time = tasks::parse_time(&item.start_time);
+                    self.cal_editing_id = Some(id);
+                    self.cal_input = title;
+                    self.cal_time = time;
+                    self.cal_end = end;
                     self.cal_editing = true;
                     SetForegroundWindow(hwnd);
                     SetFocus(hwnd);
@@ -1611,14 +1686,14 @@ impl State {
                 let items = self.calendar.selected_schedules();
                 if let Some(item) = items.get(idx) {
                     let id = item.id;
+                    if self.cal_editing_id == Some(id) {
+                        self.close_composer();
+                    }
                     self.calendar.delete_schedule(id);
                     self.hover = -1;
                 }
             }
-            _ => {
-                self.cal_editing = false;
-                self.cal_editing_id = None;
-            }
+            _ => {}
         }
     }
     fn pomo_click(&mut self, hit: i32) {
@@ -1845,6 +1920,35 @@ impl State {
                 );
             }
         }
+        // Calendar agenda: the composer unfolds, and a newly picked date's events fade in.
+        let date = (
+            self.calendar.selected_year,
+            self.calendar.selected_month,
+            self.calendar.selected_day,
+        );
+        if date != self.agenda_key {
+            self.agenda_key = date;
+            self.agenda_t = 0.;
+            self.agenda_v = 0.;
+        }
+        let compose_target = if self.cal_editing { 1. } else { 0. };
+        let agenda_animating = if self.reduced_motion {
+            let moving = self.compose_t != compose_target || self.agenda_t != 1.;
+            (self.compose_t, self.compose_v) = (compose_target, 0.);
+            (self.agenda_t, self.agenda_v) = (1., 0.);
+            moving
+        } else {
+            let a = spring(
+                &mut self.compose_t,
+                &mut self.compose_v,
+                compose_target,
+                22.,
+                0.86,
+                dt,
+            );
+            let b = spring(&mut self.agenda_t, &mut self.agenda_v, 1., 14., 1., dt);
+            a || b
+        };
         // Minimal mode: the closed notch shrinks to a sliver at the top edge while it would cover a window.
         let mini_target = if self.covered && !self.expanded {
             1.
@@ -1895,6 +1999,7 @@ impl State {
             || notice_animating
             || mini_animating
             || settings_animating
+            || agenda_animating
     }
     /// Pulls new notifications, starts the next one when the notch is free, and retires finished ones.
     unsafe fn update_notices(&mut self, hwnd: Hwnd, now: std::time::Instant) {
@@ -3753,159 +3858,214 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
 
-    // 1. Left pane: Selected Date & Schedule CRUD (x: 20. .. 218.)
+    // 1. Left pane: the agenda of the selected date.
+    let weekdays = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     let sel_m = (s.calendar.selected_month as usize).clamp(1, 12);
-    let sel_title = format!(
-        "{} {}, {}",
-        short_months[sel_m - 1],
+    let weekday = tasks::weekday_of(
+        s.calendar.selected_year,
+        s.calendar.selected_month,
         s.calendar.selected_day,
-        s.calendar.selected_year
+    ) as usize;
+    let is_today = s.calendar.selected_year == now.year as i32
+        && s.calendar.selected_month == now.month as u32
+        && s.calendar.selected_day == now.day as u32;
+    let sel_title = format!(
+        "{}, {} {}",
+        if is_today { "Today" } else { weekdays[weekday % 7] },
+        short_months[sel_m - 1],
+        s.calendar.selected_day
     );
+    // `c` unfolds the composer; `p` fades in the selected day's title and events.
+    let c = s.compose_t.clamp(0., 1.);
+    let p = s.agenda_t.clamp(0., 1.);
     text_opt(
-        dc, s, 6, &sel_title, WHITE, 20., 40., 196., 24., false, o, dx,
+        dc,
+        s,
+        6,
+        &sel_title,
+        WHITE,
+        AGENDA_X,
+        38. + (1. - p) * 4.,
+        AGENDA_W,
+        26.,
+        false,
+        o * (0.35 + 0.65 * p),
+        dx,
     );
 
-    // Input row / Add button (y: 68. .. 94.)
-    let input_hover = s.hover == 5000;
-    let border_color = if s.cal_editing {
-        BLUE
-    } else if input_hover {
-        rgb(70, 70, 76)
+    // The field: "Add an event" until clicked, then the title being typed.
+    let (fx, fy, fw, fh) = (AGENDA_X, AGENDA_FIELD_Y, AGENDA_W, AGENDA_FIELD_H);
+    let bg = if s.hover == 5000 && !s.cal_editing {
+        rgb(36, 36, 38)
     } else {
-        rgb(44, 44, 48)
+        rgb(28, 28, 30)
     };
-    let bg_color = if s.cal_editing {
-        rgb(24, 24, 28)
+    round_opt(s, fx, fy, fw, fh, 10., bg, o, dx);
+    if c > 0.001 {
+        // The focus ring fades in as the composer opens.
+        round_opt(s, fx, fy, fw, fh, 10., BLUE, o * c, dx);
+        round_opt(s, fx + 1.5, fy + 1.5, fw - 3., fh - 3., 8.5, rgb(30, 30, 32), o * c, dx);
+    }
+    let plus = blend_color(SECONDARY, BLUE, c);
+    round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
+    round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
+    let (tx, tw) = (fx + 28., fw - 36.);
+    let mut shown = s.cal_input.as_str();
+    while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
+        let mut chars = shown.chars();
+        chars.next();
+        shown = chars.as_str();
+    }
+    if s.cal_input.is_empty() {
+        let hint = if s.cal_editing { "Event title" } else { "Add an event" };
+        let color = if s.cal_editing { TERTIARY } else { SECONDARY };
+        text_opt(dc, s, 1, hint, color, tx, fy, tw, fh, false, o, dx);
     } else {
-        rgb(18, 18, 20)
-    };
-    round_opt(s, 20., 68., 196., 26., 6., border_color, o, dx);
-    round_opt(s, 21., 69., 194., 24., 5., bg_color, o, dx);
-
-    if s.cal_editing {
-        text_opt(
-            dc,
-            s,
-            3,
-            &s.cal_input,
-            WHITE,
-            26.,
-            73.,
-            168.,
-            18.,
-            false,
-            o,
-            dx,
-        );
-        if (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-            let cursor_x = 26. + s.cal_input.chars().count() as f64 * 6.8;
-            round_opt(s, cursor_x, 73., 1.5, 14., 0.5, BLUE, o, dx);
-        }
-    } else if s.cal_input.is_empty() {
-        text_opt(
-            dc,
-            s,
-            3,
-            "+ Add (HH:MM Title)",
-            TERTIARY,
-            26.,
-            73.,
-            168.,
-            18.,
-            false,
-            o,
-            dx,
-        );
-    } else {
-        text_opt(
-            dc,
-            s,
-            3,
-            &s.cal_input,
-            SECONDARY,
-            26.,
-            73.,
-            168.,
-            18.,
-            false,
-            o,
-            dx,
-        );
+        text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
+    }
+    if s.cal_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+        let caret = if shown.is_empty() { 0. } else { text_width(dc, s, 1, shown) };
+        round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
     }
 
-    // Schedule items list
+    // While composing: the time picker and the buttons slide out from under the field.
+    // They fade over the second half of the motion, so the list sliding up never shows
+    // through a half-faded button.
+    let oc = o * ((c - 0.5) / 0.5).clamp(0., 1.);
+    if oc > 0.005 {
+        let ty = AGENDA_TIME_Y - (1. - c) * 30.;
+        text_opt(dc, s, 3, "Time", TERTIARY, fx, ty, 36., 24., false, oc, dx);
+        for (code, x, label) in [(5004, fx + 38., "\u{2212}"), (5005, fx + 118., "+")] {
+            let bg = if s.hover == code { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
+            pill_opt(s, x, ty, 26., 24., bg, oc, dx);
+            text_opt(dc, s, 1, label, WHITE, x, ty - 1., 26., 24., true, oc, dx);
+        }
+        let time_label = s.cal_time.map(tasks::format_time).unwrap_or_else(|| "All day".into());
+        text_opt(dc, s, 1, &time_label, WHITE, fx + 64., ty, 54., 24., true, oc, dx);
+        let all_day = s.cal_time.is_none();
+        let chip_bg = if all_day {
+            rgb(64, 64, 70)
+        } else if s.hover == 5006 {
+            rgb(44, 44, 48)
+        } else {
+            rgb(28, 28, 32)
+        };
+        pill_opt(s, fx + 150., ty, 46., 24., chip_bg, oc, dx);
+        let chip_fg = if all_day { WHITE } else { SECONDARY };
+        text_opt(dc, s, 3, "All day", chip_fg, fx + 150., ty, 46., 24., true, oc, dx);
+
+        let by = AGENDA_BTN_Y - (1. - c) * 30.;
+        let cancel_bg = if s.hover == 5007 { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
+        pill_opt(s, fx, by, 94., 26., cancel_bg, oc, dx);
+        text_opt(dc, s, 1, "Cancel", WHITE, fx, by, 94., 26., true, oc, dx);
+        let can_save = !tasks::split_leading_time(&s.cal_input).2.trim().is_empty();
+        let save_bg = if !can_save {
+            rgb(40, 40, 44)
+        } else if s.hover == 5008 {
+            rgb(232, 232, 237)
+        } else {
+            WHITE
+        };
+        pill_opt(s, fx + 102., by, 94., 26., save_bg, oc, dx);
+        let save_label = if s.cal_editing_id.is_some() { "Save" } else { "Add" };
+        let save_fg = if can_save { rgb(0, 0, 0) } else { TERTIARY };
+        text_opt(dc, s, 1, save_label, save_fg, fx + 102., by, 94., 26., true, oc, dx);
+    }
+
+    // The list of the day's events. It follows the composer down; rows that no longer fit
+    // fade out, and after a date change the rows fade in one after another.
     let schedules = s.calendar.selected_schedules();
+    let (closed_y, open_y) = (AGENDA_FIELD_Y + AGENDA_FIELD_H + 8., AGENDA_BTN_Y + 34.);
+    let list_y = closed_y + (open_y - closed_y) * c;
+    let rows = s.agenda_rows().1;
     if schedules.is_empty() {
-        text_opt(
-            dc,
-            s,
-            2,
-            "No events for this date",
-            TERTIARY,
-            20.,
-            135.,
-            196.,
-            20.,
-            true,
-            o,
-            dx,
-        );
-        text_opt(
-            dc,
-            s,
-            3,
-            "Click + to add",
-            blend_color(0, TERTIARY, 0.6),
-            20.,
-            158.,
-            196.,
-            16.,
-            true,
-            o,
-            dx,
-        );
-    } else {
-        let row_h = 28.;
-        for (i, item) in schedules.iter().skip(s.cal_scroll).take(5).enumerate() {
-            let actual_idx = s.cal_scroll + i;
-            let ry = 100. + i as f64 * row_h;
-            let is_row_hover = s.hover == 5200 + actual_idx as i32;
-            let is_del_hover = s.hover == 5300 + actual_idx as i32;
-            if is_row_hover || is_del_hover {
-                round_opt(s, 20., ry, 196., row_h - 2., 6., rgb(34, 34, 38), o, dx);
-            }
-            pill_opt(s, 24., ry + 4., 40., 18., blend_color(0, BLUE, 0.22), o, dx);
+        let oe = o * (1. - c) * p;
+        if oe > 0.01 {
+            let y = list_y + 26. + (1. - p) * 6.;
+            text_opt(dc, s, 2, "No events", SECONDARY, fx, y, fw, 20., true, oe, dx);
             text_opt(
                 dc,
                 s,
                 3,
-                &item.start_time,
-                BLUE,
-                24.,
-                ry + 4.,
-                40.,
-                18.,
+                "Use \u{201c}Add an event\u{201d} to plan this day",
+                TERTIARY,
+                fx,
+                y + 22.,
+                fw,
+                16.,
                 true,
-                o,
+                oe,
                 dx,
             );
+        }
+    } else {
+        for (i, item) in schedules.iter().skip(s.cal_scroll).take(5).enumerate() {
+            let idx = s.cal_scroll + i;
+            let appear = ((p - i as f64 * 0.12) / 0.55).clamp(0., 1.);
+            let ry = list_y + i as f64 * AGENDA_ROW_H + (1. - appear) * 6.;
+            let fits = if i < 2 { 1. } else { 1. - c };
+            let or = o * appear * fits;
+            if or < 0.01 || ry + AGENDA_ROW_H > CAL_H - 6. {
+                continue;
+            }
+            let row_hover = s.hover == 5200 + idx as i32;
+            let del_hover = s.hover == 5300 + idx as i32;
+            let editing_this = s.cal_editing_id == Some(item.id);
+            if row_hover || del_hover || editing_this {
+                round_opt(s, fx, ry, fw, AGENDA_ROW_H - 2., 8., rgb(34, 34, 38), or, dx);
+            }
+            let time = if item.start_time.is_empty() {
+                "All day"
+            } else {
+                item.start_time.as_str()
+            };
+            text_opt(
+                dc,
+                s,
+                3,
+                time,
+                SECONDARY,
+                fx + 8.,
+                ry,
+                48.,
+                AGENDA_ROW_H - 2.,
+                false,
+                or,
+                dx,
+            );
+            let title_w = if row_hover || del_hover { fw - 84. } else { fw - 64. };
             text_opt(
                 dc,
                 s,
                 2,
                 &item.title,
                 WHITE,
-                68.,
-                ry + 4.,
-                122.,
-                18.,
+                fx + 58.,
+                ry,
+                title_w,
+                AGENDA_ROW_H - 2.,
                 false,
-                o,
+                or,
                 dx,
             );
-            if is_row_hover || is_del_hover {
-                draw_close_button_opt(s, 204., ry + 13., is_del_hover, o, dx);
+            if row_hover || del_hover {
+                draw_close_button_opt(s, fx + fw - 12., ry + 13., del_hover, or, dx);
             }
+        }
+        let hidden = schedules.len().saturating_sub(s.cal_scroll + rows);
+        // Shown once the composer has settled, so it never sits on top of a sliding row.
+        if hidden > 0 && (c < 0.02 || c > 0.98) {
+            let more = format!("{} more \u{00b7} scroll", hidden);
+            let y = list_y + rows as f64 * AGENDA_ROW_H;
+            text_opt(dc, s, 3, &more, TERTIARY, fx, y, fw, 16., true, o * p, dx);
         }
     }
 
@@ -4025,7 +4185,7 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         );
 
         if has_event {
-            let dot_color = if is_today { WHITE } else { BLUE };
+            let dot_color = if is_today { WHITE } else { SECONDARY };
             pill_opt(s, x + col / 2. - 1.5, y + 16., 3., 3., dot_color, o, dx);
         }
     }
@@ -6745,7 +6905,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     return 0;
                 }
                 if s.cal_editing {
-                    s.cal_editing = false;
+                    s.close_composer();
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
@@ -7478,6 +7638,13 @@ mod tests {
             cal_input: String::new(),
             cal_editing: false,
             cal_editing_id: None,
+            cal_time: Some(9 * 60),
+            cal_end: String::new(),
+            compose_t: 0.,
+            compose_v: 0.,
+            agenda_t: 1.,
+            agenda_v: 0.,
+            agenda_key: (0, 0, 0),
             cal_scroll: 0,
             high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
