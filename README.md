@@ -63,7 +63,22 @@ Every behavior, size and timing is documented in **[docs/BEHAVIOR.md](docs/BEHAV
 
 ## Contributors
 
-<p><a href="https://github.com/kexlyu24"><img src="https://avatars.githubusercontent.com/u/201588681?v=4&s=120" width="60" height="60" alt="kexlyu24"></a>&nbsp;<a href="https://github.com/overhaulpxl"><img src="https://avatars.githubusercontent.com/u/179252797?v=4&s=120" width="60" height="60" alt="overhaulpxl"></a></p>
+<table>
+  <tr>
+    <td align="center" width="230">
+      <a href="https://github.com/kexlyu24"><img src="https://avatars.githubusercontent.com/u/201588681?v=4&s=200" width="88" height="88" alt="kexlyu24"></a><br>
+      <a href="https://github.com/kexlyu24"><b>kexlyu24</b></a><br>
+      <sub>🛠️ Creator &amp; maintainer</sub>
+    </td>
+    <td align="center" width="230">
+      <a href="https://github.com/overhaulpxl"><img src="https://avatars.githubusercontent.com/u/179252797?v=4&s=200" width="88" height="88" alt="overhaulpxl"></a><br>
+      <a href="https://github.com/overhaulpxl"><b>overhaulpxl</b></a><br>
+      <sub>🔊 Volume · 📅 Calendar · ⚡ Performance</sub>
+    </td>
+  </tr>
+</table>
+
+Thanks for helping make Wisp better! Want to join? Open an issue, or a pull request into `dev`.
 
 ## Credits
 
