@@ -1,4 +1,4 @@
-WISP 0.1.8 FOR WINDOWS
+WISP 0.1.8 HOTFIX (0.1.8hf) FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
@@ -33,16 +33,17 @@ Want the exact original look? SF Pro is a free download from Apple:
   - Hover the notch to open it. Move away to close it.
   - Scroll or swipe on the open notch to switch pages:
     Now Playing, Calendar, To-do, Pomodoro, Shelf, Settings.
-  - Calendar: pick a date and click the field on the left to add an
-    event, e.g. "09:30-10:00 Standup" (just a title means 09:00). Click
-    an event to edit it, or its x to delete it.
+  - Calendar: pick a date, click "Add an event", type a title, set the
+    time with - / + (or choose "All day") and click Add. Click an event
+    to change it, or its x to delete it.
   - Pomodoro: between sessions, use the - / + buttons to change the length
     of focus, short and long breaks. Your lengths are saved.
   - Play music in Spotify, Apple Music or Spotifast, or a video in
     Chrome or Edge. The notch shows the track, and the lyrics button
     (bottom left) shows synced lyrics.
-  - The volume slider moves the player's own volume slider (for Chrome
-    and Edge, that browser's volume). Your Windows volume stays as it is.
+  - The volume slider changes only the player: Spotifast's own slider
+    follows it; for Spotify, Chrome and Edge it sets that app's level in
+    the Windows Volume Mixer. Your Windows volume stays as it is.
   - Drop files on the notch to keep them on the shelf. Drag them back out.
   - Notifications from any app pop up in the notch.
   - When the notch would hide something (say, browser tabs that reach

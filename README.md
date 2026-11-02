@@ -24,7 +24,7 @@ It sits at the top of your screen, shows what's playing and your notifications, 
 - Detects **Spotify**, **Apple Music** and **Spotifast** through Windows media sessions. Browsers and other apps are ignored.
 - Shows the album artwork, title, artist and a scrubber you can click to seek, plus previous / play-pause / next controls.
 - An activity waveform takes its color from the artwork.
-- A **volume slider linked to the player's own volume**: it moves Spotify's, Spotifast's or Apple Music's own slider, and for Chrome and Edge it sets that browser's volume. Your system volume and other apps stay as they are.
+- A **volume slider for the player only**: it moves Spotifast's own slider, and sets Spotify's, Chrome's or Edge's level in the Windows Volume Mixer. Your system volume and other apps stay as they are.
 
 ### 🎤 Synced lyrics
 - Real-time lyrics in the style of Apple Music, from [LRCLIB](https://lrclib.net), with NetEase Cloud Music as a fallback for songs LRCLIB lacks. The current line is highlighted and the column glides to the next one on a spring.
@@ -36,7 +36,7 @@ It sits at the top of your screen, shows what's playing and your notifications, 
 
 ### 📅 Calendar
 - A month view in the style of Apple's Calendar widget, with today marked in red. Flip through months and pick any date.
-- **Your own schedule**: add, edit and delete events for the selected date (`09:30-10:00 Standup`, or just a title for 09:00). Dates with events get a marker.
+- **Your own agenda**: click **Add an event**, type a title, pick a time with − / + (or **All day**) and press **Add**. Click an event to change it, or its × to delete it. Dates with events get a dot.
 - Scroll or swipe through every page; the panel reshapes itself for each one.
 
 <img src="assets/previews/pages.gif" alt="Scrolling through Now Playing, Calendar, To-do, Pomodoro, Shelf and Settings" width="560">
@@ -167,7 +167,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 
 - **Rendering**: a layered window drawn with GDI+ (antialiased shapes and SF Symbols-style icons) and GDI text, presented with `UpdateLayeredWindow`.
 - **Animation**: spring physics, so changing direction mid-motion keeps the current speed. While the notch itself moves, frames are locked to the display (`DwmFlush`); while only small things move, a timer at the display rate runs them; at rest Wisp ticks about 10 times a second. Text, icons and artwork are cached, so a frame takes well under a millisecond.
-- **Media**: Windows `GlobalSystemMediaTransportControlsSessionManager` for track info and playback control. The volume follows the player's own slider through UI Automation (Spotify, Apple Music) or Spotifast's `spotifast volume` command; Chrome and Edge use their Core Audio session.
+- **Media**: Windows `GlobalSystemMediaTransportControlsSessionManager` for track info and playback control. The volume uses Spotifast's `spotifast volume` command, and the app's own Windows audio session (Volume Mixer) for Spotify, Chrome and Edge.
 - **Lyrics**: a background worker using WinRT `HttpClient` that talks to LRCLIB (falling back to NetEase), with an on-disk cache.
 - **Notifications**: read-only from the Action Center's database through the system's `winsqlite3.dll`.
 - **Minimal mode**: walks the window z-order and checks the screen pixels beside the notch for content.
@@ -179,7 +179,7 @@ Wisp is a single native Rust executable written directly against Win32, with no 
 | `src/render.rs` | Thin GDI+ wrapper |
 | `src/media.rs` | Media session polling and control |
 | `src/lyrics.rs` | LRCLIB and NetEase clients, LRC parsing, cache |
-| `src/volume.rs` | The player's own volume (UI Automation, Spotifast commands, browser sessions) |
+| `src/volume.rs` | The player's volume (Spotifast commands, per-app audio sessions) |
 | `src/tasks.rs` | To-do and Pomodoro logic |
 | `src/tray.rs` | Tray icon and its menu |
 | `src/settings.rs` | Settings file and Start with Windows |
