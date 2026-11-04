@@ -18,7 +18,7 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 
 ## Features
 
-- 🎵 **Now Playing** for Spotify, Apple Music, Spotifast, and Chrome or Edge, with artwork, seeking, controls and a volume slider for that app only
+- 🎵 **Now Playing** for Spotify, Apple Music, Spotifast, the SoundCloud app, and Chrome or Edge, with artwork, seeking, controls and a volume slider for that app only
 - 🎤 **Synced lyrics** in the panel and in the closed notch, from LRCLIB with NetEase as a fallback, cached for offline use
 - 🔔 **Notifications** from any app pop up in the notch
 - 📅 **Calendar** with your own events, ✅ **to-dos**, and a ⏱️ **Pomodoro** timer with adjustable lengths

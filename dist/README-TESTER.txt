@@ -38,8 +38,8 @@ Want the exact original look? SF Pro is a free download from Apple:
     to change it, or its x to delete it.
   - Pomodoro: between sessions, use the - / + buttons to change the length
     of focus, short and long breaks. Your lengths are saved.
-  - Play music in Spotify, Apple Music or Spotifast, or a video in
-    Chrome or Edge. The notch shows the track, and the lyrics button
+  - Play music in Spotify, Apple Music, Spotifast or the SoundCloud app,
+    or a video in Chrome or Edge. The notch shows the track, and the lyrics button
     (bottom left) shows synced lyrics.
   - The volume slider changes only the player: Spotifast's own slider
     follows it; for Spotify, Chrome and Edge it sets that app's level in

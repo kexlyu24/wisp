@@ -664,6 +664,7 @@ impl VolumeAdapter for AudioSessionVolumeAdapter {
 pub type SpotifySessionVolumeAdapter = AudioSessionVolumeAdapter;
 pub type ChromeYouTubeVolumeAdapter = AudioSessionVolumeAdapter;
 pub type EdgeYouTubeVolumeAdapter = AudioSessionVolumeAdapter;
+pub type SoundCloudVolumeAdapter = AudioSessionVolumeAdapter;
 
 // ---------------------------------------------------------------------------
 // Orchestrator: Unified Wisp Volume
@@ -676,6 +677,7 @@ pub struct Volume {
     apple_music: Arc<Mutex<AppleMusicVolumeAdapter>>,
     chrome: Arc<Mutex<ChromeYouTubeVolumeAdapter>>,
     edge: Arc<Mutex<EdgeYouTubeVolumeAdapter>>,
+    soundcloud: Arc<Mutex<SoundCloudVolumeAdapter>>,
 }
 
 impl Volume {
@@ -690,6 +692,9 @@ impl Volume {
             ))),
             edge: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
                 "msedge.exe",
+            ))),
+            soundcloud: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
+                "soundcloud.exe",
             ))),
         }
     }
@@ -706,7 +711,7 @@ impl Volume {
     pub fn is_supported(&self) -> bool {
         matches!(
             self.app.to_lowercase().as_str(),
-            "spotify" | "spotifast" | "applemusic" | "chrome" | "msedge"
+            "spotify" | "spotifast" | "applemusic" | "chrome" | "msedge" | "soundcloud"
         )
     }
 
@@ -725,6 +730,7 @@ impl Volume {
             }
             "chrome" => self.chrome.lock().map_or(false, |a| a.is_available()),
             "msedge" => self.edge.lock().map_or(false, |a| a.is_available()),
+            "soundcloud" => self.soundcloud.lock().map_or(false, |a| a.is_available()),
             _ => false,
         }
     }
@@ -752,6 +758,9 @@ impl Volume {
                 "msedge" => {
                     let _ = self.edge.lock().map(|mut a| a.disconnect());
                 }
+                "soundcloud" => {
+                    let _ = self.soundcloud.lock().map(|mut a| a.disconnect());
+                }
                 _ => {}
             }
         }
@@ -771,6 +780,9 @@ impl Volume {
             }
             "msedge" => {
                 let _ = self.edge.lock().map(|mut a| a.reconnect());
+            }
+            "soundcloud" => {
+                let _ = self.soundcloud.lock().map(|mut a| a.reconnect());
             }
             _ => {}
         }
@@ -795,6 +807,9 @@ impl Volume {
                 }
                 "msedge" => {
                     let _ = self.edge.lock().map(|mut a| a.disconnect());
+                }
+                "soundcloud" => {
+                    let _ = self.soundcloud.lock().map(|mut a| a.disconnect());
                 }
                 _ => {}
             }
@@ -834,6 +849,12 @@ impl Volume {
                 let m = a.get_muted().unwrap_or(false);
                 Some((v, m))
             }
+            "soundcloud" => {
+                let a = self.soundcloud.lock().ok()?;
+                let v = a.get_volume()?;
+                let m = a.get_muted().unwrap_or(false);
+                Some((v, m))
+            }
             _ => None,
         }
     }
@@ -857,6 +878,9 @@ impl Volume {
             "msedge" => {
                 let _ = self.edge.lock().map(|mut a| a.set_volume(level));
             }
+            "soundcloud" => {
+                let _ = self.soundcloud.lock().map(|mut a| a.set_volume(level));
+            }
             _ => {}
         }
     }
@@ -878,6 +902,9 @@ impl Volume {
             }
             "msedge" => {
                 let _ = self.edge.lock().map(|mut a| a.set_muted(muted));
+            }
+            "soundcloud" => {
+                let _ = self.soundcloud.lock().map(|mut a| a.set_muted(muted));
             }
             _ => {}
         }
@@ -989,6 +1016,10 @@ mod tests {
             assert!(vol.is_supported());
 
             vol.refresh("applemusic");
+            assert!(!vol.is_spotify());
+            assert!(vol.is_supported());
+
+            vol.refresh("soundcloud");
             assert!(!vol.is_spotify());
             assert!(vol.is_supported());
 
