@@ -23,6 +23,7 @@ type Handle = *mut c_void;
 /// Icons are handed over as `ICON_PX`² premultiplied BGRA pixels.
 pub const ICON_PX: usize = 96;
 
+#[derive(Clone, Debug)]
 pub struct Notice {
     /// Application User Model ID; `shell:AppsFolder\<aumid>` opens the app.
     pub aumid: String,
@@ -34,6 +35,7 @@ pub struct Notice {
     pub picture: bool,
     /// The sender asked for a circular crop (`hint-crop="circle"`).
     pub circle: bool,
+    pub arrival: i64,
 }
 
 static MODULE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| unsafe {
@@ -63,10 +65,18 @@ sqlite! {
     fn sqlite3_column_text(stmt: Handle, column: i32) -> *const u8;
     fn sqlite3_column_bytes(stmt: Handle, column: i32) -> i32;
     fn sqlite3_finalize(stmt: Handle) -> i32;
+    fn sqlite3_close_v2(db: Handle) -> i32;
 }
 const ROW: i32 = 100;
 
 struct Db(Handle);
+impl Drop for Db {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { sqlite3_close_v2(self.0) };
+        }
+    }
+}
 impl Db {
     unsafe fn open() -> Option<Self> {
         let path = std::env::var("LOCALAPPDATA").ok()?
@@ -80,7 +90,7 @@ impl Db {
         if sqlite3_open_v2(name.as_ptr(), &mut db, 1, std::ptr::null())? != 0 || db.is_null() {
             return None;
         }
-        sqlite3_busy_timeout(db, 250);
+        sqlite3_busy_timeout(db, 1000);
         Some(Self(db))
     }
     /// Runs `sql` with `?1` bound to `arg`, calling `row` for each result row.
@@ -142,7 +152,12 @@ const WAIT_OBJECT_0: u32 = 0;
 
 unsafe fn run(tx: Sender<Notice>) {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    let Some(db) = Db::open() else { return };
+    let mut db = loop {
+        if let Some(db) = Db::open() {
+            break db;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    };
     let mut last = 0i64;
     db.query(
         "select max([Order]) from Notification where ?1=?1",
@@ -162,7 +177,7 @@ unsafe fn run(tx: Sender<Notice>) {
         .map(|p| {
             FindFirstChangeNotificationW(
                 p.as_ptr(),
-                0,
+                1,
                 FILE_NOTIFY_CHANGE_FILE_NAME
                     | FILE_NOTIFY_CHANGE_LAST_WRITE
                     | FILE_NOTIFY_CHANGE_SIZE,
@@ -171,27 +186,21 @@ unsafe fn run(tx: Sender<Notice>) {
         .unwrap_or(std::ptr::null_mut());
     let valid_handle = !change_handle.is_null() && change_handle as isize != -1;
 
+    let mut consecutive_errors = 0;
     loop {
-        let mut woke_by_change = false;
         if valid_handle {
-            let res = WaitForSingleObject(change_handle, 2000);
+            let res = WaitForSingleObject(change_handle, 500);
             if res == WAIT_OBJECT_0 {
                 FindNextChangeNotification(change_handle);
-                woke_by_change = true;
             }
         } else {
-            std::thread::sleep(Duration::from_millis(1500));
-            woke_by_change = true;
-        }
-
-        if !woke_by_change {
-            continue;
+            std::thread::sleep(Duration::from_millis(500));
         }
 
         let mut rows = Vec::new();
         let ok = db.query(
-            "select n.[Order], h.PrimaryId, n.Payload, n.ArrivalTime from Notification n \
-             join NotificationHandler h on h.RecordId = n.HandlerId \
+            "select n.[Order], coalesce(h.PrimaryId, ''), n.Payload, n.ArrivalTime from Notification n \
+             left join NotificationHandler h on h.RecordId = n.HandlerId \
              where n.[Order] > ?1 and n.Type = 'toast' order by n.[Order]",
             last,
             |stmt| {
@@ -204,11 +213,23 @@ unsafe fn run(tx: Sender<Notice>) {
             },
         );
         if !ok {
+            consecutive_errors += 1;
+            if consecutive_errors >= 5 {
+                if let Some(new_db) = Db::open() {
+                    db = new_db;
+                    consecutive_errors = 0;
+                }
+            }
             continue;
         }
+        consecutive_errors = 0;
+
+        let now = filetime_now();
         for (order, aumid, payload, arrival) in rows {
             last = last.max(order);
-            if filetime_now() - arrival > 30 * 10_000_000 {
+            // Drop toasts that arrived more than 60 seconds ago or with excessive future drift.
+            let age = now - arrival;
+            if (age > 60 * 10_000_000 || age < -60 * 10_000_000) && arrival != 0 {
                 continue;
             }
             let Some(toast) = parse_toast(&payload) else {
@@ -227,6 +248,7 @@ unsafe fn run(tx: Sender<Notice>) {
                 icon: picture.or(app_icon),
                 circle: toast.circle,
                 aumid,
+                arrival,
             };
             if tx.send(notice).is_err() {
                 if valid_handle {
@@ -235,6 +257,72 @@ unsafe fn run(tx: Sender<Notice>) {
                 return;
             }
         }
+    }
+}
+
+/// Loads the most recent toast notifications from Windows Action Center database.
+pub fn load_recent(limit: usize) -> Vec<Notice> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Some(db) = Db::open() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        db.query(
+            "select coalesce(h.PrimaryId, ''), n.Payload, n.ArrivalTime from Notification n \
+             left join NotificationHandler h on h.RecordId = n.HandlerId \
+             where n.Type = 'toast' order by n.[Order] desc limit ?1",
+            limit as i64,
+            |stmt| {
+                rows.push((
+                    String::from_utf8_lossy(&column_bytes(stmt, 0, false)).into_owned(),
+                    String::from_utf8_lossy(&column_bytes(stmt, 1, true)).into_owned(),
+                    sqlite3_column_int64(stmt, 2).unwrap_or(0),
+                ));
+            },
+        );
+        let mut apps: HashMap<String, (String, Option<Vec<u32>>)> = HashMap::new();
+        let mut notices = Vec::with_capacity(rows.len());
+        for (aumid, payload, arrival) in rows {
+            let Some(toast) = parse_toast(&payload) else {
+                continue;
+            };
+            let (app, app_icon) = apps
+                .entry(aumid.clone())
+                .or_insert_with(|| app_info(&aumid))
+                .clone();
+            let picture = toast.image.as_deref().and_then(load_picture);
+            notices.push(Notice {
+                app,
+                title: toast.title,
+                body: toast.body,
+                picture: picture.is_some(),
+                icon: picture.or(app_icon),
+                circle: toast.circle,
+                aumid,
+                arrival,
+            });
+        }
+        notices
+    }
+}
+
+/// Formats a Windows FILETIME into a friendly relative time ("now", "5m ago", "2h ago", "1d ago").
+pub fn relative_time(arrival: i64) -> String {
+    if arrival <= 0 {
+        return "now".to_string();
+    }
+    let now = filetime_now();
+    let diff = now.saturating_sub(arrival);
+    let sec = diff / 10_000_000;
+    if sec < 60 {
+        "now".to_string()
+    } else if sec < 3600 {
+        format!("{}m ago", sec / 60)
+    } else if sec < 86400 {
+        format!("{}h ago", sec / 3600)
+    } else {
+        format!("{}d ago", sec / 86400)
     }
 }
 
@@ -265,7 +353,7 @@ pub fn parse_toast(xml: &str) -> Option<Toast> {
             break;
         };
         let attrs = &after[..open_end];
-        if attrs.ends_with('/') {
+        if attrs.trim().ends_with('/') {
             rest = &after[open_end + 1..];
             continue;
         }
@@ -317,10 +405,13 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 /// `C:\…` or `file:///C:/…` (percent-encoded) become a local path; web and app-data URIs are skipped.
 fn local_path(src: &str) -> Option<String> {
-    let path = if let Some(rest) = src.strip_prefix("file:///") {
+    let raw = src.trim();
+    let path = if let Some(rest) = raw.strip_prefix("file:///") {
         percent_decode(rest).replace('/', "\\")
-    } else if src.len() > 2 && src.as_bytes()[1] == b':' {
-        src.to_string()
+    } else if let Some(rest) = raw.strip_prefix("file://") {
+        percent_decode(rest).replace('/', "\\")
+    } else if raw.len() > 2 && raw.as_bytes()[1] == b':' {
+        raw.to_string()
     } else {
         return None;
     };
@@ -523,6 +614,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formats_relative_time() {
+        assert_eq!(relative_time(0), "now");
+        let now = filetime_now();
+        assert_eq!(relative_time(now), "now");
+        // 5 seconds ago
+        assert_eq!(relative_time(now - 5 * 10_000_000), "now");
+        // 5 minutes ago
+        assert_eq!(relative_time(now - 5 * 60 * 10_000_000), "5m ago");
+        // 2 hours ago
+        assert_eq!(relative_time(now - 2 * 3600 * 10_000_000), "2h ago");
+        // 3 days ago
+        assert_eq!(relative_time(now - 3 * 86400 * 10_000_000), "3d ago");
+    }
+
+    #[test]
     fn reads_title_body_and_logo() {
         let xml = r#"<toast><visual><binding template="ToastGeneric"><text>Mira &amp; Co</text><text>Hey, are you
             coming?</text><text placement="attribution">via Web</text><image placement="appLogoOverride" hint-crop="circle" src="file:///C:/Users/Me/avatar%20one.png"/></binding></visual></toast>"#;
@@ -549,6 +655,13 @@ mod tests {
         .is_none());
         let web = parse_toast(r#"<toast><visual><binding><text>A</text><image placement="appLogoOverride" src="https://x/y.png"/></binding></visual></toast>"#).unwrap();
         assert_eq!(web.image, None);
+        let spaced_empty = parse_toast(r#"<toast><visual><binding><text>Title</text><text id="1" /><text>Body</text></binding></visual></toast>"#).unwrap();
+        assert_eq!(spaced_empty.title, "Title");
+        assert_eq!(spaced_empty.body, "Body");
+        assert_eq!(local_path("file:///C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("file://C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("C:\\path\\to\\img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("https://example.com/a.png"), None);
         assert_eq!(
             unescape_xml("&#x1F44B; &#65; &bogus; &"),
             "\u{1F44B} A &bogus; &"
@@ -561,6 +674,39 @@ mod live {
     use super::*;
 
     /// Reads this PC's notification database: `cargo test live_notifications -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn test_start_receives_toast() {
+        let rx = start();
+        // Give worker thread a moment to initialize and query max order
+        std::thread::sleep(Duration::from_millis(500));
+        let title_rand = format!("WispTest_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        let cmd = format!(r#"
+            $template = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);
+            $texts = $template.GetElementsByTagName('text');
+            $texts.Item(0).AppendChild($template.CreateTextNode('{title_rand}')) | Out-Null;
+            $texts.Item(1).AppendChild($template.CreateTextNode('Testing live delivery')) | Out-Null;
+            $toast = [Windows.UI.Notifications.ToastNotification]::new($template);
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WispTestApp').Show($toast);
+        "#);
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &cmd])
+            .output();
+
+        let start_time = std::time::Instant::now();
+        let mut found = false;
+        while start_time.elapsed() < Duration::from_secs(4) {
+            if let Ok(notice) = rx.recv_timeout(Duration::from_millis(500)) {
+                println!("Received notice: {} - {}", notice.title, notice.body);
+                if notice.title == title_rand {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Notification should be received by start() receiver!");
+    }
+
     #[test]
     #[ignore]
     fn live_notifications() {
