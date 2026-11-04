@@ -1,4 +1,4 @@
-WISP 0.1.8 HOTFIX (0.1.8hf) FOR WINDOWS
+WISP 0.1.9 FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
