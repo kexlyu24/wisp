@@ -682,7 +682,11 @@ mod tests {
         let chrome = "chrome.exe";
         // Paused everywhere: the desktop app wins over a browser tab Windows calls current.
         assert_eq!(
-            choose(&[c(chrome, false, true), c(soundcloud, false, false)], "", ""),
+            choose(
+                &[c(chrome, false, true), c(soundcloud, false, false)],
+                "",
+                ""
+            ),
             Some(1)
         );
         // Playing beats paused, and Windows' current session beats the rest.

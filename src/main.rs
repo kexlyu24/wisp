@@ -566,20 +566,23 @@ const AGENDA_STEP: u32 = 15;
 const DIB_W: f64 = EXP_W + 48.;
 const TODO_W: f64 = 440.;
 const POMO_W: f64 = 440.;
+const QUICK_W: f64 = 440.;
+const QUICK_H: f64 = 250.;
 const TAB_MUSIC: usize = 0;
 const TAB_CAL: usize = 1;
 const TAB_TODO: usize = 2;
 const TAB_POMO: usize = 3;
 const TAB_SHELF: usize = 4;
-const TAB_SETTINGS: usize = 5;
-const TAB_COUNT: usize = 6;
+const TAB_QUICK: usize = 5;
+const TAB_SETTINGS: usize = 6;
+const TAB_COUNT: usize = 7;
 fn page_w(tab: usize) -> f64 {
-    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, SET_W][tab.min(TAB_COUNT - 1)]
+    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, QUICK_W, SET_W][tab.min(TAB_COUNT - 1)]
 }
 /// Settings page: two inset grouped cards of switches, the music-player segmented control, a footer.
 const SET_W: f64 = 440.;
-const SET_H: f64 = 246.;
-const SET_CARD_Y: f64 = 64.;
+const SET_H: f64 = 328.;
+const SET_CARD_Y: f64 = 60.;
 const SET_ROW_H: f64 = 32.;
 const SET_CARD_W: f64 = 190.;
 /// Switch rows in layout order: four in the "Notch" card, three in "General". Ids are `tray::item`s.
@@ -611,7 +614,7 @@ const ART_SIZE: f64 = 72.;
 const TRANSPORT_X: [f64; 3] = [182., 230., 278.];
 const NP_LYRICS_H: f64 = 300.;
 const LYRIC_ART: f64 = 44.;
-const DIB_H: f64 = NP_LYRICS_H + 40.;
+const DIB_H: f64 = NP_LYRICS_H + 60.;
 // Collapsed lyric line: the notch widens to fit it, up to MAX_LYRIC_W.
 const MAX_LYRIC_W: f64 = 620.;
 const LYRICS_BTN_X: f64 = 40.;
@@ -714,6 +717,14 @@ struct State {
     todo_input: String,
     todo_editing: bool,
     todo_scroll: usize,
+    quick_items: Vec<tasks::QuickItem>,
+    quick_input: String,
+    quick_editing: bool,
+    quick_scroll: usize,
+    quick_add_mode: bool,
+    quick_name_input: String,
+    quick_cmd_input: String,
+    quick_add_field: usize,
     calendar: tasks::CalendarState,
     cal_input: String,
     cal_editing: bool,
@@ -754,6 +765,7 @@ struct State {
     vol_level: f32,
     vol_muted: bool,
     vol_drag: bool,
+    blur_drag: bool,
     clyric_t: f64,
     clyric_tv: f64,
     lyric_w: f64,
@@ -785,6 +797,8 @@ struct State {
     notice_v: f64,
     notice_hover: bool,
     settings: settings::Settings,
+    settings_subpage: usize,
+    bg_custom_pixels: Option<(usize, usize, Vec<u32>)>,
     autostart: bool,
     switch_t: [f64; 7],
     switch_v: [f64; 7],
@@ -870,6 +884,28 @@ impl State {
         let shelf_items = if smoke { Vec::new() } else { load_shelf() };
         let shelf_saved = serialize_shelf(&shelf_items);
         let (vol_level, vol_muted) = volume.get().unwrap_or((-1., false));
+        let loaded_settings = if smoke {
+            settings::Settings::default()
+        } else {
+            settings::Settings::load()
+        };
+        let mut bg_custom_pixels = None;
+        if !smoke {
+            if let Some(bg_path) = tasks::data_path("background.png") {
+                if bg_path.exists() {
+                    if let Some(path_str) = bg_path.to_str() {
+                        let h = (DIB_H * scale).ceil() as usize;
+                        bg_custom_pixels = prepare_custom_bg(
+                            path_str,
+                            stride,
+                            h,
+                            loaded_settings.bg_blur,
+                            loaded_settings.bg_pos,
+                        );
+                    }
+                }
+            }
+        }
         Self {
             expanded: false,
             progress: 0.,
@@ -925,6 +961,18 @@ impl State {
             todo_input: String::new(),
             todo_editing: false,
             todo_scroll: 0,
+            quick_items: if smoke {
+                tasks::default_quick_items()
+            } else {
+                tasks::load_quick_items()
+            },
+            quick_input: String::new(),
+            quick_editing: false,
+            quick_scroll: 0,
+            quick_add_mode: false,
+            quick_name_input: String::new(),
+            quick_cmd_input: String::new(),
+            quick_add_field: 0,
             calendar: tasks::CalendarState::new(
                 now.year as i32,
                 now.month as u32,
@@ -970,6 +1018,7 @@ impl State {
             vol_level,
             vol_muted,
             vol_drag: false,
+            blur_drag: false,
             clyric_t: 0.,
             clyric_tv: 0.,
             lyric_w: COL_W,
@@ -1016,11 +1065,9 @@ impl State {
             cover_switched: std::time::Instant::now(),
             cover_w: 0.,
             deep_idle_ticks: 0,
-            settings: if smoke {
-                settings::Settings::default()
-            } else {
-                settings::Settings::load()
-            },
+            settings: loaded_settings,
+            settings_subpage: 0,
+            bg_custom_pixels,
         }
     }
     fn px(&self, n: f64) -> i32 {
@@ -1052,6 +1099,8 @@ impl State {
             SET_H
         } else if tab == TAB_CAL {
             CAL_H
+        } else if tab == TAB_QUICK {
+            QUICK_H
         } else {
             EXP_H
         }
@@ -1287,6 +1336,18 @@ impl State {
             self.vol_muted = false;
         }
     }
+    fn set_blur_x(&mut self, x: f64) {
+        const TRACK_X0: f64 = 86.;
+        const TRACK_X1: f64 = 352.;
+        const MAX_BLUR: u32 = 30;
+        let frac = ((x - TRACK_X0) / (TRACK_X1 - TRACK_X0)).clamp(0., 1.);
+        let new_blur = (frac * MAX_BLUR as f64).round() as u32;
+        if new_blur != self.settings.bg_blur {
+            self.settings.bg_blur = new_blur;
+            self.reload_custom_bg();
+            self.apply_settings();
+        }
+    }
     fn music_click(&mut self, x: f64, hit: i32) {
         match hit {
             0 => media::prev(),
@@ -1371,23 +1432,25 @@ impl State {
             52.
         }
     }
-    /// Header tab positions: the five pages from the left, Settings alone at the right edge.
+    /// Header tab positions: the pages from the left, Settings alone at the right edge.
     fn tab_x(&self, tab: usize) -> (f64, f64) {
         if tab < TAB_SHELF {
-            (26. + 38. * tab as f64, 34.)
+            (24. + 35. * tab as f64, 34.)
         } else if tab == TAB_SHELF {
-            (178., self.shelf_tab_w())
+            (164., self.shelf_tab_w())
+        } else if tab == TAB_QUICK {
+            (164. + self.shelf_tab_w() + 3., 34.)
         } else {
-            (self.panel_w_now() - 26. - 34., 34.)
+            (self.panel_w_now() - 24. - 34., 34.)
         }
     }
     /// Right edge of the header tabs.
     fn tabs_end(&self) -> f64 {
-        178. + self.shelf_tab_w()
+        self.tab_x(TAB_QUICK).0 + 34.
     }
-    /// Where the shelf's folder breadcrumb starts: after the shelf tab.
+    /// Where the shelf's folder breadcrumb starts: after the tabs.
     fn breadcrumb_x(&self) -> f64 {
-        self.tabs_end() + 16.
+        self.tabs_end() + 10.
     }
     fn has_clear(&self, tab: usize) -> bool {
         match tab {
@@ -1403,7 +1466,7 @@ impl State {
         }
         if self.active_tab == TAB_SHELF && self.active_folder.is_some() {
             let bx = self.breadcrumb_x();
-            if (bx..bx + 130.).contains(&x) {
+            if (bx..bx + 84.).contains(&x) {
                 return 12;
             }
         }
@@ -1498,6 +1561,181 @@ impl State {
             }
         }
     }
+    /// Quick Access targets: 6000 search field, 6001 clear search, 6002 add button,
+    /// 6010 name field, 6011 command field, 6012 save, 6013 cancel,
+    /// 6099 run typed command, 7000+i delete shortcut, 8000+i launch shortcut.
+    fn quick_hit(&self, x: f64, y: f64) -> i32 {
+        if !(40. ..QUICK_H).contains(&y) {
+            return -1;
+        }
+        let sw = QUICK_W - 48. - 72.;
+        if (44. ..76.).contains(&y) {
+            let bx = QUICK_W - 24. - 64.;
+            if (bx..bx + 64.).contains(&x) {
+                return 6002;
+            }
+            if !self.quick_input.is_empty() && (24. + sw - 24. ..24. + sw - 4.).contains(&x) {
+                return 6001;
+            }
+            if (24. ..24. + sw).contains(&x) {
+                return 6000;
+            }
+        }
+        if self.quick_add_mode {
+            if (120. ..150.).contains(&y) && (36. ..QUICK_W - 36.).contains(&x) {
+                return 6010;
+            }
+            if (156. ..186.).contains(&y) && (36. ..QUICK_W - 36.).contains(&x) {
+                return 6011;
+            }
+            if (196. ..226.).contains(&y) {
+                if (QUICK_W - 176. ..QUICK_W - 112.).contains(&x) {
+                    return 6013;
+                }
+                if (QUICK_W - 104. ..QUICK_W - 36.).contains(&x) {
+                    return 6012;
+                }
+            }
+            return -1;
+        }
+        let filtered = tasks::filter_quick_items(&self.quick_items, &self.quick_input);
+        if filtered.is_empty() {
+            if !self.quick_input.trim().is_empty()
+                && (140. ..178.).contains(&y)
+                && (44. ..QUICK_W - 44.).contains(&x)
+            {
+                return 6099;
+            }
+            return -1;
+        }
+        let card_w = 190.;
+        let card_h = 44.;
+        let start_idx = self.quick_scroll * 2;
+        for k in 0..6 {
+            let item_idx = start_idx + k;
+            if item_idx >= filtered.len() {
+                break;
+            }
+            let col = k % 2;
+            let row = k / 2;
+            let cx = 24. + col as f64 * (card_w + 12.);
+            let cy = 86. + row as f64 * (card_h + 8.);
+            if (cx..cx + card_w).contains(&x) && (cy..cy + card_h).contains(&y) {
+                if (cx + card_w - 28. ..cx + card_w - 6.).contains(&x)
+                    && (cy + 8. ..cy + 34.).contains(&y)
+                {
+                    return 7000 + item_idx as i32;
+                }
+                return 8000 + item_idx as i32;
+            }
+        }
+        -1
+    }
+    fn commit_quick_item(&mut self) {
+        let cmd = self.quick_cmd_input.trim().to_string();
+        let name = self.quick_name_input.trim().to_string();
+        if cmd.is_empty() && name.is_empty() {
+            self.quick_add_mode = false;
+            return;
+        }
+        let final_name = if name.is_empty() { cmd.clone() } else { name };
+        let final_cmd = if cmd.is_empty() {
+            final_name.clone()
+        } else {
+            cmd
+        };
+        self.quick_items.push(tasks::QuickItem {
+            name: final_name,
+            command: final_cmd,
+        });
+        if !self.smoke {
+            tasks::save_quick_items(&self.quick_items);
+        }
+        self.quick_name_input.clear();
+        self.quick_cmd_input.clear();
+        self.quick_add_mode = false;
+        self.quick_add_field = 0;
+    }
+    unsafe fn quick_click(&mut self, hwnd: Hwnd, hit: i32) {
+        match hit {
+            6000 => {
+                self.quick_editing = true;
+                self.quick_add_mode = false;
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+            }
+            6001 => {
+                self.quick_input.clear();
+                self.quick_scroll = 0;
+            }
+            6002 => {
+                self.quick_add_mode = !self.quick_add_mode;
+                self.quick_editing = false;
+                self.quick_name_input.clear();
+                self.quick_cmd_input.clear();
+                self.quick_add_field = 0;
+                if self.quick_add_mode {
+                    SetForegroundWindow(hwnd);
+                    SetFocus(hwnd);
+                }
+            }
+            6010 => {
+                self.quick_add_field = 0;
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+            }
+            6011 => {
+                self.quick_add_field = 1;
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+            }
+            6012 => {
+                self.commit_quick_item();
+            }
+            6013 => {
+                self.quick_add_mode = false;
+                self.quick_name_input.clear();
+                self.quick_cmd_input.clear();
+            }
+            6099 => {
+                let cmd = self.quick_input.trim().to_string();
+                if !cmd.is_empty() {
+                    launch_app(&cmd);
+                    self.expanded = false;
+                    self.layout(hwnd);
+                }
+            }
+            h if (7000..8000).contains(&h) => {
+                let idx = (h - 7000) as usize;
+                let filtered = tasks::filter_quick_items(&self.quick_items, &self.quick_input);
+                if idx < filtered.len() {
+                    let target_name = filtered[idx].name.clone();
+                    let target_cmd = filtered[idx].command.clone();
+                    if let Some(pos) = self
+                        .quick_items
+                        .iter()
+                        .position(|it| it.name == target_name && it.command == target_cmd)
+                    {
+                        self.quick_items.remove(pos);
+                        if !self.smoke {
+                            tasks::save_quick_items(&self.quick_items);
+                        }
+                    }
+                }
+            }
+            h if h >= 8000 => {
+                let idx = (h - 8000) as usize;
+                let filtered = tasks::filter_quick_items(&self.quick_items, &self.quick_input);
+                if idx < filtered.len() {
+                    let cmd = filtered[idx].command.clone();
+                    launch_app(&cmd);
+                    self.expanded = false;
+                    self.layout(hwnd);
+                }
+            }
+            _ => {}
+        }
+    }
     /// Calendar hit targets: 5000 add input, 5001 prev month, 5002 next month, 5003 today, 5100+day cell, 5200+i row select/edit, 5300+i row delete, -1 none.
     /// First list row's y and how many rows fit: the composer pushes the list down.
     fn agenda_rows(&self) -> (f64, usize) {
@@ -1514,7 +1752,9 @@ impl State {
             return -1;
         }
         if x <= AGENDA_X + AGENDA_W + 4. {
-            let inside = |x0: f64, w: f64, y0: f64, h: f64| (x0..x0 + w).contains(&x) && (y0..y0 + h).contains(&y);
+            let inside = |x0: f64, w: f64, y0: f64, h: f64| {
+                (x0..x0 + w).contains(&x) && (y0..y0 + h).contains(&y)
+            };
             if inside(AGENDA_X, AGENDA_W, AGENDA_FIELD_Y, AGENDA_FIELD_H) {
                 return 5000;
             }
@@ -1613,7 +1853,11 @@ impl State {
         let day = 24 * 60;
         let now = self.cal_time.unwrap_or(9 * 60) as i32;
         let snapped = now - now.rem_euclid(AGENDA_STEP as i32);
-        let base = if steps > 0 || snapped == now { snapped } else { snapped + AGENDA_STEP as i32 };
+        let base = if steps > 0 || snapped == now {
+            snapped
+        } else {
+            snapped + AGENDA_STEP as i32
+        };
         self.cal_time = Some((base + steps * AGENDA_STEP as i32).rem_euclid(day) as u32);
     }
     /// Saves the composer. A time typed before the title (`9:30 Standup`) wins over the picker.
@@ -1856,6 +2100,10 @@ impl State {
         if self.active_tab != TAB_CAL {
             self.cal_editing = false;
         }
+        if self.active_tab != TAB_QUICK {
+            self.quick_editing = false;
+            self.quick_add_mode = false;
+        }
         let timer_target = if self.pomo.active() { 1. } else { 0. };
         let timer_animating = if self.reduced_motion {
             let moving = self.timer_t != timer_target || self.timer_vel != 0.;
@@ -2094,15 +2342,70 @@ impl State {
         }
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
-    /// Settings page targets: 5000+k switch row, 5200 Quit, -1 none.
+    /// Settings page targets: 5000+k switch row, 5200 Quit, 5250 Appearance drilldown, 5260 Back,
+    /// 5300..=5304 style, 5310..=5313 opacity, 5320 import, 5321 reset, 5330..=5332 pos, 5340..=5343 blur, -1 none.
     fn settings_hit(&self, x: f64, y: f64) -> i32 {
+        if self.settings_subpage == 1 {
+            // Back button (< Settings)
+            if (10. ..34.).contains(&y) && (24. ..116.).contains(&x) {
+                return 5260;
+            }
+            // Style pills (Frost, Aura, Slate, OLED, Image)
+            if (64. ..88.).contains(&y) {
+                for i in 0..5 {
+                    let bx = 30. + i as f64 * 76.;
+                    if (bx..bx + 72.).contains(&x) {
+                        return 5300 + i as i32;
+                    }
+                }
+            }
+            // Image row (Import / Change, Reset)
+            if (124. ..148.).contains(&y) {
+                if (34. ..164.).contains(&x) {
+                    return 5320;
+                }
+                if self.bg_custom_pixels.is_some() && (172. ..232.).contains(&x) {
+                    return 5321;
+                }
+            }
+            // Position pills (Top 5330, Center 5331, Bottom 5332)
+            if (156. ..178.).contains(&y) {
+                for i in 0..3 {
+                    let px = 110. + i as f64 * 70.;
+                    if (px..px + 64.).contains(&x) {
+                        return 5330 + i as i32;
+                    }
+                }
+            }
+            // Blur slider line (y = 208..234, x = 76..364)
+            if (208. ..234.).contains(&y) && (76. ..364.).contains(&x) {
+                return 5340;
+            }
+            // Opacity pills (70% 5310, 80% 5311, 90% 5312, 100% 5313)
+            if (242. ..264.).contains(&y) {
+                for i in 0..4 {
+                    let bx = 96. + i as f64 * 72.;
+                    if (bx..bx + 66.).contains(&x) {
+                        return 5310 + i as i32;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        // Main Settings page
         for k in 0..SETTING_ROWS.len() {
             let (cx, ry) = setting_row(k);
             if (cx..cx + SET_CARD_W).contains(&x) && (ry..ry + SET_ROW_H).contains(&y) {
                 return 5000 + k as i32;
             }
         }
-        if (208. ..234.).contains(&y) && (SET_W - 24. - 92. ..SET_W - 24.).contains(&x) {
+        // Appearance drilldown card
+        if (208. ..256.).contains(&y) && (24. ..416.).contains(&x) {
+            return 5250;
+        }
+        // Quit button
+        if (298. ..322.).contains(&y) && (SET_W - 24. - 84. ..SET_W - 24.).contains(&x) {
             return 5200;
         }
         -1
@@ -2113,7 +2416,116 @@ impl State {
             5200 => {
                 DestroyWindow(hwnd);
             }
+            5250 => {
+                self.settings_subpage = 1;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            5260 => {
+                self.settings_subpage = 0;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            5300..=5304 => {
+                let style = (hit - 5300) as u32;
+                if style == 4 && self.bg_custom_pixels.is_none() {
+                    self.import_custom_bg(hwnd);
+                } else {
+                    self.settings.bg_style = style;
+                    self.apply_settings();
+                    if !self.smoke {
+                        self.settings.save();
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            5310..=5313 => {
+                let opacities = [70, 80, 90, 100];
+                self.settings.bg_opacity = opacities[(hit - 5310) as usize];
+                self.apply_settings();
+                if !self.smoke {
+                    self.settings.save();
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            5320 => {
+                self.import_custom_bg(hwnd);
+            }
+            5321 => {
+                self.reset_custom_bg(hwnd);
+            }
+            5330..=5332 => {
+                // 5330: Top (pos 1), 5331: Center (pos 0), 5332: Bottom (pos 2)
+                self.settings.bg_pos = match hit - 5330 {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                };
+                self.reload_custom_bg();
+                self.apply_settings();
+                if !self.smoke {
+                    self.settings.save();
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            5340 => {
+                if !self.smoke {
+                    self.settings.save();
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
             _ => {}
+        }
+    }
+    unsafe fn import_custom_bg(&mut self, hwnd: Hwnd) {
+        if let Some(file_path) = open_image_dialog(hwnd) {
+            let h = (DIB_H * self.scale).ceil() as usize;
+            if let Some(prepared) = prepare_custom_bg(
+                &file_path,
+                self.stride,
+                h,
+                self.settings.bg_blur,
+                self.settings.bg_pos,
+            ) {
+                if let Some(dest) = tasks::data_path("background.png") {
+                    let _ = std::fs::copy(&file_path, dest);
+                }
+                self.bg_custom_pixels = Some(prepared);
+                self.settings.bg_style = 4;
+                self.apply_settings();
+                if !self.smoke {
+                    self.settings.save();
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+        }
+    }
+    unsafe fn reset_custom_bg(&mut self, hwnd: Hwnd) {
+        if let Some(dest) = tasks::data_path("background.png") {
+            let _ = std::fs::remove_file(dest);
+        }
+        self.bg_custom_pixels = None;
+        if self.settings.bg_style == 4 {
+            self.settings.bg_style = 0;
+        }
+        self.apply_settings();
+        if !self.smoke {
+            self.settings.save();
+        }
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+    fn reload_custom_bg(&mut self) {
+        if let Some(dest) = tasks::data_path("background.png") {
+            if dest.exists() {
+                if let Some(path_str) = dest.to_str() {
+                    let h = (DIB_H * self.scale).ceil() as usize;
+                    self.bg_custom_pixels = prepare_custom_bg(
+                        path_str,
+                        self.stride,
+                        h,
+                        self.settings.bg_blur,
+                        self.settings.bg_pos,
+                    );
+                }
+            }
         }
     }
     /// Settings that take effect outside the drawing code: motion and animations.
@@ -2662,6 +3074,63 @@ unsafe fn open_in_explorer(path: &str) {
         1,
     );
 }
+unsafe fn launch_app(cmd: &str) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if trimmed.contains("://") || trimmed.starts_with("ms-") {
+        ShellExecuteW(
+            null_mut(),
+            wide("open").as_ptr(),
+            wide(trimmed).as_ptr(),
+            null_mut(),
+            null_mut(),
+            1,
+        );
+        return;
+    }
+    if std::path::Path::new(trimmed).exists() {
+        ShellExecuteW(
+            null_mut(),
+            wide("open").as_ptr(),
+            wide(trimmed).as_ptr(),
+            null_mut(),
+            null_mut(),
+            1,
+        );
+        return;
+    }
+    let (exe, args) = if let Some((first, rest)) = trimmed.split_once(' ') {
+        (first, rest)
+    } else {
+        (trimmed, "")
+    };
+    let w_exe = wide(exe);
+    let w_args = if args.is_empty() {
+        Vec::new()
+    } else {
+        wide(args)
+    };
+    let args_ptr = if args.is_empty() {
+        null_mut()
+    } else {
+        w_args.as_ptr()
+    };
+    let res = ShellExecuteW(
+        null_mut(),
+        wide("open").as_ptr(),
+        w_exe.as_ptr(),
+        args_ptr,
+        null_mut(),
+        1,
+    );
+    if (res as usize) <= 32 {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn();
+    }
+}
 unsafe fn open_file_dialog(hwnd: Hwnd) -> Vec<String> {
     let mut buffer = vec![0u16; 8192];
     let filter = wide("All Files (*.*)\0*.*\0");
@@ -2701,6 +3170,82 @@ unsafe fn open_file_dialog(hwnd: Hwnd) -> Vec<String> {
         }
     }
     Vec::new()
+}
+unsafe fn open_image_dialog(hwnd: Hwnd) -> Option<String> {
+    let mut buffer = vec![0u16; 1024];
+    let filter = wide("Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.webp)\0*.png;*.jpg;*.jpeg;*.bmp;*.webp\0All Files (*.*)\0*.*\0");
+    let title = wide("Choose Background Image");
+    let mut ofn: OpenFileNameW = std::mem::zeroed();
+    ofn.struct_size = std::mem::size_of::<OpenFileNameW>() as u32;
+    ofn.hwnd_owner = hwnd;
+    ofn.filter = filter.as_ptr();
+    ofn.file = buffer.as_mut_ptr();
+    ofn.max_file = buffer.len() as u32;
+    ofn.title = title.as_ptr();
+    ofn.flags = 0x00080000 | 0x00001000 | 0x00000800;
+    if GetOpenFileNameW(&mut ofn) != 0 {
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(0);
+        if len > 0 {
+            return Some(String::from_utf16_lossy(&buffer[..len]));
+        }
+    }
+    None
+}
+fn prepare_custom_bg(
+    path: &str,
+    target_w: usize,
+    target_h: usize,
+    blur_level: u32,
+    pos: u32,
+) -> Option<(usize, usize, Vec<u32>)> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let target_w = target_w.max(100) as u32;
+    let target_h = target_h.max(100) as u32;
+
+    let (orig_w, orig_h) = (img.width(), img.height());
+    let ratio_w = orig_w as f64 / target_w as f64;
+    let ratio_h = orig_h as f64 / target_h as f64;
+
+    let cropped = if ratio_h > ratio_w {
+        let crop_h = (target_h as f64 * ratio_w).round() as u32;
+        let crop_h = crop_h.min(orig_h);
+        let crop_y = match pos {
+            1 => 0,
+            2 => orig_h.saturating_sub(crop_h),
+            _ => (orig_h.saturating_sub(crop_h)) / 2,
+        };
+        img.crop_imm(0, crop_y, orig_w, crop_h)
+    } else {
+        let crop_w = (target_w as f64 * ratio_h).round() as u32;
+        let crop_w = crop_w.min(orig_w);
+        let crop_x = match pos {
+            1 => 0,
+            2 => orig_w.saturating_sub(crop_w),
+            _ => (orig_w.saturating_sub(crop_w)) / 2,
+        };
+        img.crop_imm(crop_x, 0, crop_w, orig_h)
+    };
+
+    let resized = cropped.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+
+    let sigma = blur_level as f32;
+    let processed = if sigma > 0.5 {
+        image::imageops::blur(&resized.to_rgba8(), sigma)
+    } else {
+        resized.to_rgba8()
+    };
+
+    let pixels: Vec<u32> = processed
+        .pixels()
+        .map(|p| {
+            let r = ((p[0] as u32 * 40 + 14 * 60) / 100).min(255);
+            let g = ((p[1] as u32 * 40 + 15 * 60) / 100).min(255);
+            let b = ((p[2] as u32 * 40 + 18 * 60) / 100).min(255);
+            (r << 16) | (g << 8) | b
+        })
+        .collect();
+    Some((target_w as usize, target_h as usize, pixels))
 }
 /// Rendered text, kept as 8-bit coverage masks. GDI text with SF Pro costs ~100 µs a string, which
 /// dominated every frame; a cached mask blends in a few µs. Keyed by font, flags, box size and text;
@@ -3879,7 +4424,11 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         && s.calendar.selected_day == now.day as u32;
     let sel_title = format!(
         "{}, {} {}",
-        if is_today { "Today" } else { weekdays[weekday % 7] },
+        if is_today {
+            "Today"
+        } else {
+            weekdays[weekday % 7]
+        },
         short_months[sel_m - 1],
         s.calendar.selected_day
     );
@@ -3912,7 +4461,17 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
     if c > 0.001 {
         // The focus ring fades in as the composer opens.
         round_opt(s, fx, fy, fw, fh, 10., BLUE, o * c, dx);
-        round_opt(s, fx + 1.5, fy + 1.5, fw - 3., fh - 3., 8.5, rgb(30, 30, 32), o * c, dx);
+        round_opt(
+            s,
+            fx + 1.5,
+            fy + 1.5,
+            fw - 3.,
+            fh - 3.,
+            8.5,
+            rgb(30, 30, 32),
+            o * c,
+            dx,
+        );
     }
     let plus = blend_color(SECONDARY, BLUE, c);
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
@@ -3925,14 +4484,22 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         shown = chars.as_str();
     }
     if s.cal_input.is_empty() {
-        let hint = if s.cal_editing { "Event title" } else { "Add an event" };
+        let hint = if s.cal_editing {
+            "Event title"
+        } else {
+            "Add an event"
+        };
         let color = if s.cal_editing { TERTIARY } else { SECONDARY };
         text_opt(dc, s, 1, hint, color, tx, fy, tw, fh, false, o, dx);
     } else {
         text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
     }
     if s.cal_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let caret = if shown.is_empty() { 0. } else { text_width(dc, s, 1, shown) };
+        let caret = if shown.is_empty() {
+            0.
+        } else {
+            text_width(dc, s, 1, shown)
+        };
         round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
     }
 
@@ -3944,12 +4511,32 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         let ty = AGENDA_TIME_Y - (1. - c) * 30.;
         text_opt(dc, s, 3, "Time", TERTIARY, fx, ty, 36., 24., false, oc, dx);
         for (code, x, label) in [(5004, fx + 38., "\u{2212}"), (5005, fx + 118., "+")] {
-            let bg = if s.hover == code { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
+            let bg = if s.hover == code {
+                rgb(52, 52, 56)
+            } else {
+                rgb(36, 36, 40)
+            };
             pill_opt(s, x, ty, 26., 24., bg, oc, dx);
             text_opt(dc, s, 1, label, WHITE, x, ty - 1., 26., 24., true, oc, dx);
         }
-        let time_label = s.cal_time.map(tasks::format_time).unwrap_or_else(|| "All day".into());
-        text_opt(dc, s, 1, &time_label, WHITE, fx + 64., ty, 54., 24., true, oc, dx);
+        let time_label = s
+            .cal_time
+            .map(tasks::format_time)
+            .unwrap_or_else(|| "All day".into());
+        text_opt(
+            dc,
+            s,
+            1,
+            &time_label,
+            WHITE,
+            fx + 64.,
+            ty,
+            54.,
+            24.,
+            true,
+            oc,
+            dx,
+        );
         let all_day = s.cal_time.is_none();
         let chip_bg = if all_day {
             rgb(64, 64, 70)
@@ -3960,10 +4547,27 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         };
         pill_opt(s, fx + 150., ty, 46., 24., chip_bg, oc, dx);
         let chip_fg = if all_day { WHITE } else { SECONDARY };
-        text_opt(dc, s, 3, "All day", chip_fg, fx + 150., ty, 46., 24., true, oc, dx);
+        text_opt(
+            dc,
+            s,
+            3,
+            "All day",
+            chip_fg,
+            fx + 150.,
+            ty,
+            46.,
+            24.,
+            true,
+            oc,
+            dx,
+        );
 
         let by = AGENDA_BTN_Y - (1. - c) * 30.;
-        let cancel_bg = if s.hover == 5007 { rgb(52, 52, 56) } else { rgb(36, 36, 40) };
+        let cancel_bg = if s.hover == 5007 {
+            rgb(52, 52, 56)
+        } else {
+            rgb(36, 36, 40)
+        };
         pill_opt(s, fx, by, 94., 26., cancel_bg, oc, dx);
         text_opt(dc, s, 1, "Cancel", WHITE, fx, by, 94., 26., true, oc, dx);
         let can_save = !tasks::split_leading_time(&s.cal_input).2.trim().is_empty();
@@ -3975,9 +4579,26 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
             WHITE
         };
         pill_opt(s, fx + 102., by, 94., 26., save_bg, oc, dx);
-        let save_label = if s.cal_editing_id.is_some() { "Save" } else { "Add" };
+        let save_label = if s.cal_editing_id.is_some() {
+            "Save"
+        } else {
+            "Add"
+        };
         let save_fg = if can_save { rgb(0, 0, 0) } else { TERTIARY };
-        text_opt(dc, s, 1, save_label, save_fg, fx + 102., by, 94., 26., true, oc, dx);
+        text_opt(
+            dc,
+            s,
+            1,
+            save_label,
+            save_fg,
+            fx + 102.,
+            by,
+            94.,
+            26.,
+            true,
+            oc,
+            dx,
+        );
     }
 
     // The list of the day's events. It follows the composer down; rows that no longer fit
@@ -3990,7 +4611,20 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
         let oe = o * (1. - c) * p;
         if oe > 0.01 {
             let y = list_y + 26. + (1. - p) * 6.;
-            text_opt(dc, s, 2, "No events", SECONDARY, fx, y, fw, 20., true, oe, dx);
+            text_opt(
+                dc,
+                s,
+                2,
+                "No events",
+                SECONDARY,
+                fx,
+                y,
+                fw,
+                20.,
+                true,
+                oe,
+                dx,
+            );
             text_opt(
                 dc,
                 s,
@@ -4020,7 +4654,17 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
             let del_hover = s.hover == 5300 + idx as i32;
             let editing_this = s.cal_editing_id == Some(item.id);
             if row_hover || del_hover || editing_this {
-                round_opt(s, fx, ry, fw, AGENDA_ROW_H - 2., 8., rgb(34, 34, 38), or, dx);
+                round_opt(
+                    s,
+                    fx,
+                    ry,
+                    fw,
+                    AGENDA_ROW_H - 2.,
+                    8.,
+                    rgb(34, 34, 38),
+                    or,
+                    dx,
+                );
             }
             let time = if item.start_time.is_empty() {
                 "All day"
@@ -4041,7 +4685,11 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 or,
                 dx,
             );
-            let title_w = if row_hover || del_hover { fw - 84. } else { fw - 64. };
+            let title_w = if row_hover || del_hover {
+                fw - 84.
+            } else {
+                fw - 64.
+            };
             text_opt(
                 dc,
                 s,
@@ -4709,10 +5357,556 @@ unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
         pill_opt(s, TODO_W - 14., y, 3., h, rgb(72, 72, 76), o, dx);
     }
 }
+unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if o <= 0.001 {
+        return;
+    }
+    let (sx, sy, sw, sh) = (24., 44., QUICK_W - 48. - 72., 30.);
+    let (bx, by, bw, bh) = (QUICK_W - 24. - 64., 44., 64., 30.);
+
+    // Search bar background
+    if s.quick_editing {
+        round_opt(s, sx, sy, sw, sh, 10., BLUE, o, dx);
+        round_opt(
+            s,
+            sx + 1.5,
+            sy + 1.5,
+            sw - 3.,
+            sh - 3.,
+            8.5,
+            rgb(30, 30, 32),
+            o,
+            dx,
+        );
+    } else {
+        let hover = s.hover == 6000;
+        round_opt(
+            s,
+            sx,
+            sy,
+            sw,
+            sh,
+            10.,
+            if hover {
+                rgb(36, 36, 38)
+            } else {
+                rgb(28, 28, 30)
+            },
+            o,
+            dx,
+        );
+    }
+
+    // Search icon (icon index 12)
+    icon_opt(
+        s,
+        12,
+        sx + 8.,
+        sy + 6.,
+        if s.quick_editing { BLUE } else { TERTIARY },
+        o,
+        dx,
+    );
+
+    // Search text / placeholder
+    let (tx, tw) = (sx + 30., sw - 54.);
+    if s.quick_input.is_empty() {
+        text_opt(
+            dc,
+            s,
+            1,
+            "Search or run...",
+            TERTIARY,
+            tx,
+            sy + 2.,
+            tw,
+            sh - 4.,
+            false,
+            o,
+            dx,
+        );
+    } else {
+        let mut shown = s.quick_input.as_str();
+        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        text_opt(
+            dc,
+            s,
+            1,
+            shown,
+            WHITE,
+            tx,
+            sy + 2.,
+            tw,
+            sh - 4.,
+            false,
+            o,
+            dx,
+        );
+
+        // Clear 'x' button inside search bar
+        let clr_hover = s.hover == 6001;
+        pill_opt(
+            s,
+            sx + sw - 22.,
+            sy + 7.,
+            16.,
+            16.,
+            if clr_hover {
+                rgb(54, 54, 58)
+            } else {
+                rgb(40, 40, 43)
+            },
+            o,
+            dx,
+        );
+        text_opt(
+            dc,
+            s,
+            3,
+            "x",
+            if clr_hover { WHITE } else { SECONDARY },
+            sx + sw - 22.,
+            sy + 6.,
+            16.,
+            16.,
+            true,
+            o,
+            dx,
+        );
+    }
+
+    // Caret when search editing
+    if s.quick_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+        let mut shown = s.quick_input.as_str();
+        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        let cw = text_width(dc, s, 1, shown);
+        round_opt(s, tx + cw + 1., sy + 7., 1.5, sh - 14., 0.75, BLUE, o, dx);
+    }
+
+    // "+ Add" or "Cancel" button
+    let add_hover = s.hover == 6002;
+    let add_bg = if s.quick_add_mode {
+        if add_hover {
+            rgb(54, 54, 58)
+        } else {
+            rgb(40, 40, 43)
+        }
+    } else if add_hover {
+        rgb(20, 100, 220)
+    } else {
+        rgb(10, 132, 255)
+    };
+    pill_opt(s, bx, by, bw, bh, add_bg, o, dx);
+    let add_label = if s.quick_add_mode { "Cancel" } else { "+ Add" };
+    text_opt(
+        dc,
+        s,
+        7,
+        add_label,
+        WHITE,
+        bx,
+        by + 1.,
+        bw,
+        bh - 2.,
+        true,
+        o,
+        dx,
+    );
+
+    // If in Add Mode: show composer
+    if s.quick_add_mode {
+        round_opt(
+            s,
+            24.,
+            86.,
+            QUICK_W - 48.,
+            150.,
+            12.,
+            rgb(28, 28, 30),
+            o,
+            dx,
+        );
+        text_opt(
+            dc,
+            s,
+            0,
+            "Add Shortcut",
+            WHITE,
+            36.,
+            94.,
+            200.,
+            20.,
+            false,
+            o,
+            dx,
+        );
+
+        // Field 0: App Name
+        let n_sel = s.quick_add_field == 0;
+        let n_hover = s.hover == 6010;
+        if n_sel {
+            round_opt(s, 36., 122., QUICK_W - 72., 28., 8., BLUE, o, dx);
+            round_opt(
+                s,
+                37.5,
+                123.5,
+                QUICK_W - 75.,
+                25.,
+                6.5,
+                rgb(36, 36, 40),
+                o,
+                dx,
+            );
+        } else {
+            round_opt(
+                s,
+                36.,
+                122.,
+                QUICK_W - 72.,
+                28.,
+                8.,
+                if n_hover {
+                    rgb(44, 44, 48)
+                } else {
+                    rgb(36, 36, 40)
+                },
+                o,
+                dx,
+            );
+        }
+        let n_txt = if s.quick_name_input.is_empty() {
+            "Name (e.g. Chrome, Discord)"
+        } else {
+            &s.quick_name_input
+        };
+        let n_col = if s.quick_name_input.is_empty() {
+            TERTIARY
+        } else {
+            WHITE
+        };
+        text_opt(
+            dc,
+            s,
+            2,
+            n_txt,
+            n_col,
+            46.,
+            125.,
+            QUICK_W - 92.,
+            22.,
+            false,
+            o,
+            dx,
+        );
+        if n_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+            let nw = text_width(dc, s, 2, &s.quick_name_input);
+            round_opt(s, 46. + nw + 1., 126., 1.5, 20., 0.75, BLUE, o, dx);
+        }
+
+        // Field 1: Command / Path
+        let c_sel = s.quick_add_field == 1;
+        let c_hover = s.hover == 6011;
+        if c_sel {
+            round_opt(s, 36., 158., QUICK_W - 72., 28., 8., BLUE, o, dx);
+            round_opt(
+                s,
+                37.5,
+                159.5,
+                QUICK_W - 75.,
+                25.,
+                6.5,
+                rgb(36, 36, 40),
+                o,
+                dx,
+            );
+        } else {
+            round_opt(
+                s,
+                36.,
+                158.,
+                QUICK_W - 72.,
+                28.,
+                8.,
+                if c_hover {
+                    rgb(44, 44, 48)
+                } else {
+                    rgb(36, 36, 40)
+                },
+                o,
+                dx,
+            );
+        }
+        let c_txt = if s.quick_cmd_input.is_empty() {
+            "Command / Path (e.g. chrome.exe, code, calc)"
+        } else {
+            &s.quick_cmd_input
+        };
+        let c_col = if s.quick_cmd_input.is_empty() {
+            TERTIARY
+        } else {
+            WHITE
+        };
+        text_opt(
+            dc,
+            s,
+            2,
+            c_txt,
+            c_col,
+            46.,
+            161.,
+            QUICK_W - 92.,
+            22.,
+            false,
+            o,
+            dx,
+        );
+        if c_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+            let cw = text_width(dc, s, 2, &s.quick_cmd_input);
+            round_opt(s, 46. + cw + 1., 162., 1.5, 20., 0.75, BLUE, o, dx);
+        }
+
+        // Cancel and Save buttons
+        let cancel_hover = s.hover == 6013;
+        pill_opt(
+            s,
+            QUICK_W - 176.,
+            198.,
+            64.,
+            26.,
+            if cancel_hover {
+                rgb(44, 44, 48)
+            } else {
+                rgb(36, 36, 40)
+            },
+            o,
+            dx,
+        );
+        text_opt(
+            dc,
+            s,
+            3,
+            "Cancel",
+            if cancel_hover { WHITE } else { SECONDARY },
+            QUICK_W - 176.,
+            199.,
+            64.,
+            24.,
+            true,
+            o,
+            dx,
+        );
+
+        let save_hover = s.hover == 6012;
+        let can_save =
+            !s.quick_cmd_input.trim().is_empty() || !s.quick_name_input.trim().is_empty();
+        let save_bg = if !can_save {
+            rgb(40, 40, 44)
+        } else if save_hover {
+            rgb(20, 100, 220)
+        } else {
+            rgb(10, 132, 255)
+        };
+        pill_opt(s, QUICK_W - 104., 198., 68., 26., save_bg, o, dx);
+        text_opt(
+            dc,
+            s,
+            3,
+            "Save",
+            if can_save { WHITE } else { TERTIARY },
+            QUICK_W - 104.,
+            199.,
+            68.,
+            24.,
+            true,
+            o,
+            dx,
+        );
+        return;
+    }
+
+    // Grid of Quick Access Apps
+    let filtered = tasks::filter_quick_items(&s.quick_items, &s.quick_input);
+    if filtered.is_empty() {
+        round_opt(
+            s,
+            24.,
+            86.,
+            QUICK_W - 48.,
+            110.,
+            12.,
+            rgb(28, 28, 30),
+            o,
+            dx,
+        );
+        text_opt(
+            dc,
+            s,
+            0,
+            "No matching app found",
+            SECONDARY,
+            24.,
+            108.,
+            QUICK_W - 48.,
+            24.,
+            true,
+            o,
+            dx,
+        );
+        let run_hint = format!(
+            "Press Enter or click here to run \"{}\"",
+            s.quick_input.trim()
+        );
+        let run_hover = s.hover == 6099;
+        if run_hover {
+            pill_opt(s, 44., 144., QUICK_W - 88., 32., rgb(40, 40, 46), o, dx);
+        }
+        text_opt(
+            dc,
+            s,
+            2,
+            &run_hint,
+            if run_hover { BLUE } else { TERTIARY },
+            44.,
+            146.,
+            QUICK_W - 88.,
+            28.,
+            true,
+            o,
+            dx,
+        );
+        return;
+    }
+
+    let card_w = 190.;
+    let card_h = 44.;
+    let start_idx = s.quick_scroll * 2;
+    for k in 0..6 {
+        let item_idx = start_idx + k;
+        if item_idx >= filtered.len() {
+            break;
+        }
+        let col = k % 2;
+        let row = k / 2;
+        let cx = 24. + col as f64 * (card_w + 12.);
+        let cy = 86. + row as f64 * (card_h + 8.);
+
+        let hit_launch = 8000 + item_idx as i32;
+        let hit_del = 7000 + item_idx as i32;
+        let card_hover = s.hover == hit_launch;
+        let del_hover = s.hover == hit_del;
+
+        let bg = if card_hover {
+            rgb(40, 40, 44)
+        } else {
+            rgb(28, 28, 30)
+        };
+        round_opt(s, cx, cy, card_w, card_h, 10., bg, o, dx);
+
+        // App badge (30x30 rounded square with initial letter)
+        let badge_bg = match item_idx % 4 {
+            0 => rgb(10, 132, 255),
+            1 => rgb(255, 159, 10),
+            2 => rgb(48, 209, 88),
+            _ => rgb(175, 82, 222),
+        };
+        round_opt(s, cx + 7., cy + 7., 30., 30., 8., badge_bg, o, dx);
+        let initial = filtered[item_idx]
+            .name
+            .chars()
+            .next()
+            .unwrap_or('A')
+            .to_uppercase()
+            .to_string();
+        text_opt(
+            dc,
+            s,
+            0,
+            &initial,
+            WHITE,
+            cx + 7.,
+            cy + 8.,
+            30.,
+            28.,
+            true,
+            o,
+            dx,
+        );
+
+        let text_w = if card_hover || del_hover {
+            card_w - 74.
+        } else {
+            card_w - 52.
+        };
+        text_opt(
+            dc,
+            s,
+            7,
+            &filtered[item_idx].name,
+            WHITE,
+            cx + 44.,
+            cy + 6.,
+            text_w,
+            18.,
+            false,
+            o,
+            dx,
+        );
+        text_opt(
+            dc,
+            s,
+            2,
+            &filtered[item_idx].command,
+            SECONDARY,
+            cx + 44.,
+            cy + 24.,
+            text_w,
+            16.,
+            false,
+            o,
+            dx,
+        );
+
+        if card_hover || del_hover {
+            let del_bg = if del_hover {
+                rgb(255, 69, 58)
+            } else {
+                rgb(44, 44, 48)
+            };
+            pill_opt(s, cx + card_w - 24., cy + 14., 16., 16., del_bg, o, dx);
+            text_opt(
+                dc,
+                s,
+                3,
+                "x",
+                WHITE,
+                cx + card_w - 24.,
+                cy + 13.,
+                16.,
+                16.,
+                true,
+                o,
+                dx,
+            );
+        }
+    }
+}
 // Apple Clock timer layout: progress ring with the countdown, phase picker, and Reset / Start pills.
 /// Settings, in the style of iOS / macOS dark mode: inset grouped cards with switches, a segmented
 /// control for the music player, and a footer with the version and Quit.
 unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if s.settings_subpage == 1 {
+        settings_background_page(dc, s, dx, o);
+        return;
+    }
+
     const CARD: u32 = 0x1e1c1c; // rgb(28,28,30), the grouped-card fill
     text_opt(
         dc, s, 3, "NOTCH", SECONDARY, 36., 44., 140., 16., false, o, dx,
@@ -4821,10 +6015,96 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
         "Changes save automatically.",
         SECONDARY,
         238.,
-        SET_CARD_Y + 3. * SET_ROW_H + 8.,
+        SET_CARD_Y + 3. * SET_ROW_H + 6.,
         SET_CARD_W - 12.,
         16.,
         false,
+        o,
+        dx,
+    );
+
+    // Appearance: Dedicated drilldown card
+    text_opt(
+        dc,
+        s,
+        3,
+        "APPEARANCE",
+        SECONDARY,
+        36.,
+        192.,
+        140.,
+        14.,
+        false,
+        o,
+        dx,
+    );
+    round_opt(s, 24., 208., 392., 48., 12., CARD, o, dx);
+
+    let hot = s.hover == 5250;
+    let pressed = s.pressed == 5250;
+    if hot || pressed {
+        round_opt(
+            s,
+            28.,
+            211.,
+            384.,
+            42.,
+            8.,
+            if pressed {
+                rgb(46, 46, 50)
+            } else {
+                rgb(38, 38, 42)
+            },
+            o,
+            dx,
+        );
+    }
+
+    text_opt(
+        dc,
+        s,
+        1,
+        "Background",
+        WHITE,
+        38.,
+        214.,
+        140.,
+        18.,
+        false,
+        o,
+        dx,
+    );
+
+    let style_str = match s.settings.bg_style {
+        0 => "Frost Glass",
+        1 => "Aura",
+        2 => "Slate",
+        3 => "OLED Black",
+        4 => "Custom Image",
+        _ => "Frost Glass",
+    };
+    let summary = format!("{} • {}% opacity", style_str, s.settings.bg_opacity);
+    text_opt(
+        dc, s, 3, &summary, SECONDARY, 38., 233., 260., 16., false, o, dx,
+    );
+
+    let btn_bg = if hot || pressed {
+        rgb(58, 58, 62)
+    } else {
+        rgb(42, 42, 46)
+    };
+    pill_opt(s, 314., 218., 92., 28., btn_bg, o, dx);
+    text_opt(
+        dc,
+        s,
+        2,
+        "Customize ›",
+        WHITE,
+        314.,
+        218.,
+        92.,
+        28.,
+        true,
         o,
         dx,
     );
@@ -4837,14 +6117,14 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
         concat!("Wisp ", env!("CARGO_PKG_VERSION")),
         SECONDARY,
         36.,
-        212.,
+        302.,
         160.,
         18.,
         false,
         o,
         dx,
     );
-    let (qx, qw) = (SET_W - 24. - 92., 92.);
+    let (qx, qw) = (SET_W - 24. - 84., 84.);
     let quit_bg = if s.pressed == 5200 {
         rgb(54, 54, 58)
     } else if s.hover == 5200 {
@@ -4852,8 +6132,332 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
     } else {
         CARD
     };
-    pill_opt(s, qx, 208., qw, 26., quit_bg, o, dx);
-    text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 208., qw, 26., true, o, dx);
+    pill_opt(s, qx, 298., qw, 24., quit_bg, o, dx);
+    text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 298., qw, 24., true, o, dx);
+}
+
+unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    const CARD: u32 = 0x1e1c1c; // rgb(28,28,30)
+
+    // Header bar: Back button on the left, Subpage Title next to it
+    let b_hot = s.hover == 5260;
+    let b_pressed = s.pressed == 5260;
+    let b_bg = if b_pressed {
+        rgb(54, 54, 58)
+    } else if b_hot {
+        rgb(42, 42, 46)
+    } else {
+        rgb(30, 28, 28)
+    };
+    let b_fg = if b_hot || b_pressed { WHITE } else { SECONDARY };
+    pill_opt(s, 24., 10., 92., 24., b_bg, o, dx);
+    text_opt(
+        dc,
+        s,
+        2,
+        "‹ Settings",
+        b_fg,
+        24.,
+        10.,
+        92.,
+        24.,
+        true,
+        o,
+        dx,
+    );
+
+    // Section 1: STYLE
+    text_opt(
+        dc, s, 3, "STYLE", SECONDARY, 36., 42., 120., 14., false, o, dx,
+    );
+    round_opt(s, 24., 58., 392., 36., 10., CARD, o, dx);
+    const STYLES: [&str; 5] = ["Frost", "Aura", "Slate", "OLED", "Image"];
+    for i in 0..5 {
+        let bx = 30. + i as f64 * 76.;
+        let hit = 5300 + i as i32;
+        let is_active = s.settings.bg_style == i as u32;
+        let hot = s.hover == hit;
+        let pressed = s.pressed == hit;
+        let bg = if is_active {
+            rgb(68, 68, 74)
+        } else if pressed {
+            rgb(46, 46, 50)
+        } else if hot {
+            rgb(38, 38, 42)
+        } else {
+            rgb(24, 24, 26)
+        };
+        let fg = if is_active || hot || pressed {
+            WHITE
+        } else {
+            SECONDARY
+        };
+        pill_opt(s, bx, 64., 72., 24., bg, o, dx);
+        text_opt(dc, s, 2, STYLES[i], fg, bx, 64., 72., 24., true, o, dx);
+    }
+
+    // Section 2: IMAGE & POSITION
+    text_opt(
+        dc,
+        s,
+        3,
+        "IMAGE & POSITION",
+        SECONDARY,
+        36.,
+        102.,
+        160.,
+        14.,
+        false,
+        o,
+        dx,
+    );
+    round_opt(s, 24., 118., 392., 64., 10., CARD, o, dx);
+
+    let has_image = s.bg_custom_pixels.is_some();
+    let btn_label = if has_image {
+        "Change Image..."
+    } else {
+        "Import Image..."
+    };
+    let imp_hot = s.hover == 5320;
+    let imp_pressed = s.pressed == 5320;
+    let imp_bg = if imp_pressed {
+        rgb(54, 54, 58)
+    } else if imp_hot {
+        rgb(44, 44, 48)
+    } else {
+        rgb(32, 32, 36)
+    };
+    pill_opt(s, 34., 124., 130., 24., imp_bg, o, dx);
+    text_opt(
+        dc, s, 2, btn_label, WHITE, 34., 124., 130., 24., true, o, dx,
+    );
+
+    if has_image {
+        let rst_hot = s.hover == 5321;
+        let rst_pressed = s.pressed == 5321;
+        let rst_bg = if rst_pressed {
+            rgb(54, 54, 58)
+        } else if rst_hot {
+            rgb(44, 44, 48)
+        } else {
+            rgb(32, 32, 36)
+        };
+        pill_opt(s, 172., 124., 60., 24., rst_bg, o, dx);
+        text_opt(
+            dc, s, 2, "Reset", SECONDARY, 172., 124., 60., 24., true, o, dx,
+        );
+
+        if s.settings.bg_style == 4 {
+            text_opt(
+                dc,
+                s,
+                3,
+                "● Active",
+                GREEN,
+                244.,
+                124.,
+                80.,
+                24.,
+                false,
+                o,
+                dx,
+            );
+        }
+    } else {
+        text_opt(
+            dc,
+            s,
+            3,
+            "PNG, JPG, BMP, WebP",
+            SECONDARY,
+            174.,
+            124.,
+            220.,
+            24.,
+            false,
+            o,
+            dx,
+        );
+    }
+
+    round_opt(s, 34., 152., 372., 1., 0., rgb(44, 44, 46), o, dx);
+
+    // Framing / Position
+    text_opt(
+        dc, s, 2, "Position", SECONDARY, 36., 156., 64., 22., false, o, dx,
+    );
+    const POSITIONS: [(&str, u32, i32); 3] =
+        [("Top", 1, 5330), ("Center", 0, 5331), ("Bottom", 2, 5332)];
+    for (idx, &(pos_label, pos_val, pos_hit)) in POSITIONS.iter().enumerate() {
+        let px = 110. + idx as f64 * 70.;
+        let is_active = s.settings.bg_pos == pos_val;
+        let hot = s.hover == pos_hit;
+        let pressed = s.pressed == pos_hit;
+        let bg = if is_active {
+            rgb(68, 68, 74)
+        } else if pressed {
+            rgb(46, 46, 50)
+        } else if hot {
+            rgb(38, 38, 42)
+        } else {
+            rgb(24, 24, 26)
+        };
+        let fg = if is_active || hot || pressed {
+            WHITE
+        } else {
+            SECONDARY
+        };
+        pill_opt(s, px, 156., 64., 22., bg, o, dx);
+        text_opt(dc, s, 2, pos_label, fg, px, 156., 64., 22., true, o, dx);
+    }
+
+    // Section 3: BLUR & OPACITY
+    text_opt(
+        dc,
+        s,
+        3,
+        "BLUR & OPACITY",
+        SECONDARY,
+        36.,
+        190.,
+        160.,
+        14.,
+        false,
+        o,
+        dx,
+    );
+    round_opt(s, 24., 206., 392., 64., 10., CARD, o, dx);
+
+    // Row 1: Blur slider line
+    text_opt(
+        dc, s, 2, "Blur", SECONDARY, 36., 210., 44., 22., false, o, dx,
+    );
+    const TRACK_X0: f64 = 86.;
+    const TRACK_X1: f64 = 352.;
+    let active = s.hover == 5340 || s.blur_drag;
+    let th = if active { 6. } else { 4. };
+    let cy = 221.;
+    let frac = (s.settings.bg_blur as f64 / 30.).clamp(0., 1.);
+    let thumb_x = TRACK_X0 + frac * (TRACK_X1 - TRACK_X0);
+
+    // Track background
+    pill_opt(
+        s,
+        TRACK_X0,
+        cy - th / 2.,
+        TRACK_X1 - TRACK_X0,
+        th,
+        rgb(52, 52, 55),
+        o,
+        dx,
+    );
+    // Filled track
+    if frac > 0.005 {
+        pill_opt(
+            s,
+            TRACK_X0,
+            cy - th / 2.,
+            (thumb_x - TRACK_X0).max(th),
+            th,
+            if active { WHITE } else { rgb(200, 200, 204) },
+            o,
+            dx,
+        );
+    }
+    // Draggable thumb knob
+    let knob_d = if active { 16. } else { 14. };
+    pill_opt(
+        s,
+        thumb_x - knob_d / 2.,
+        cy - knob_d / 2.,
+        knob_d,
+        knob_d,
+        WHITE,
+        o,
+        dx,
+    );
+
+    // Value indicator on the right
+    let val_str = if s.settings.bg_blur == 0 {
+        "None".to_string()
+    } else {
+        format!("{}px", s.settings.bg_blur)
+    };
+    text_opt(
+        dc,
+        s,
+        3,
+        &val_str,
+        if active { WHITE } else { SECONDARY },
+        360.,
+        210.,
+        46.,
+        22.,
+        true,
+        o,
+        dx,
+    );
+
+    round_opt(s, 34., 236., 372., 1., 0., rgb(44, 44, 46), o, dx);
+
+    // Row 2: Opacity
+    text_opt(
+        dc, s, 2, "Opacity", SECONDARY, 36., 242., 50., 22., false, o, dx,
+    );
+    const OPACITIES: [(u32, &str); 4] = [(70, "70%"), (80, "80%"), (90, "90%"), (100, "100%")];
+    for i in 0..4 {
+        let bx = 96. + i as f64 * 72.;
+        let hit = 5310 + i as i32;
+        let is_active = s.settings.bg_opacity == OPACITIES[i].0;
+        let hot = s.hover == hit;
+        let pressed = s.pressed == hit;
+        let bg = if is_active {
+            rgb(68, 68, 74)
+        } else if pressed {
+            rgb(46, 46, 50)
+        } else if hot {
+            rgb(38, 38, 42)
+        } else {
+            rgb(24, 24, 26)
+        };
+        let fg = if is_active || hot || pressed {
+            WHITE
+        } else {
+            SECONDARY
+        };
+        pill_opt(s, bx, 242., 66., 22., bg, o, dx);
+        text_opt(
+            dc,
+            s,
+            2,
+            OPACITIES[i].1,
+            fg,
+            bx,
+            242.,
+            66.,
+            22.,
+            true,
+            o,
+            dx,
+        );
+    }
+
+    // Subpage Footer note
+    text_opt(
+        dc,
+        s,
+        3,
+        "Live preview active • Changes save automatically.",
+        SECONDARY,
+        24.,
+        286.,
+        392.,
+        20.,
+        true,
+        o,
+        dx,
+    );
 }
 unsafe fn pomo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     let now = std::time::Instant::now();
@@ -5081,16 +6685,85 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
     GetClientRect(hwnd, &mut r);
     let dc = s.dc;
     GdiFlush();
-    for y in 0..r.bottom as usize {
-        std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize)
-            .fill(0xff000000);
-    }
-    SetBkMode(dc, 1);
     let tint = s
         .renderer
         .as_ref()
         .and_then(|r| r.tint())
         .unwrap_or(rgb(210, 210, 215));
+    let bg_style = s.settings.bg_style;
+    let bg_opacity = s.settings.bg_opacity.clamp(50, 100);
+    let bg_alpha = (bg_opacity * 255 / 100) as u32;
+
+    let (bg_r, bg_g, bg_b) = match bg_style {
+        0 => (14, 15, 18),
+        1 => {
+            let tr = (tint >> 16) & 255;
+            let tg = (tint >> 8) & 255;
+            let tb = tint & 255;
+            let r = (tr * 22 + 14 * 78) / 100;
+            let g = (tg * 22 + 15 * 78) / 100;
+            let b = (tb * 22 + 18 * 78) / 100;
+            (r, g, b)
+        }
+        2 => (26, 27, 30),
+        3 => (0, 0, 0),
+        _ => (14, 15, 18),
+    };
+
+    let r_pm = (bg_r * bg_alpha / 255) as u32;
+    let g_pm = (bg_g * bg_alpha / 255) as u32;
+    let b_pm = (bg_b * bg_alpha / 255) as u32;
+    let base_pixel = (bg_alpha << 24) | (r_pm << 16) | (g_pm << 8) | b_pm;
+
+    if bg_style == 4 {
+        if let Some((bw, bh, ref custom)) = s.bg_custom_pixels {
+            for y in 0..r.bottom as usize {
+                let row =
+                    std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize);
+                let src_y = y.min(bh.saturating_sub(1));
+                let src_offset = src_y * bw;
+                for x in 0..r.right as usize {
+                    let src_x = x.min(bw.saturating_sub(1));
+                    let src_pixel = custom[src_offset + src_x];
+                    let r = (src_pixel >> 16) & 255;
+                    let g = (src_pixel >> 8) & 255;
+                    let b = src_pixel & 255;
+                    let r_pm = r * bg_alpha / 255;
+                    let g_pm = g * bg_alpha / 255;
+                    let b_pm = b * bg_alpha / 255;
+                    row[x] = (bg_alpha << 24) | (r_pm << 16) | (g_pm << 8) | b_pm;
+                }
+            }
+        } else {
+            for y in 0..r.bottom as usize {
+                std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize)
+                    .fill(base_pixel);
+            }
+        }
+    } else {
+        for y in 0..r.bottom as usize {
+            std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize)
+                .fill(base_pixel);
+        }
+    }
+    if (bg_style == 0 || bg_style == 1 || bg_style == 4) && r.bottom > 1 && r.right > 0 {
+        let spec_a = ((bg_alpha as f64 * 0.16).round() as u32).min(255);
+        let spec_r = (255 * spec_a / 255) as u32;
+        let spec_g = (255 * spec_a / 255) as u32;
+        let spec_b = (255 * spec_a / 255) as u32;
+        let top_row = std::slice::from_raw_parts_mut(s.pixels, r.right as usize);
+        for x in 0..r.right as usize {
+            let p = top_row[x];
+            let cur_r = (p >> 16) & 255;
+            let cur_g = (p >> 8) & 255;
+            let cur_b = p & 255;
+            top_row[x] = (spec_a.max(bg_alpha) << 24)
+                | ((cur_r + spec_r).min(255) << 16)
+                | ((cur_g + spec_g).min(255) << 8)
+                | ((cur_b + spec_b).min(255));
+        }
+    }
+    SetBkMode(dc, 1);
     let rv = s.reveal();
     let cur_w = s.panel_w_now();
     let page_left = |tab: usize| (cur_w - page_w(tab)) / 2.;
@@ -5119,14 +6792,60 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
             0.,
         );
         let lit = |i: usize| blend_color(SECONDARY, WHITE, mix[i].0);
-        icon_opt(s, 2, 34., 13., lit(TAB_MUSIC), rv, 0.);
-        icon_opt(s, 5, 72., 13., lit(TAB_CAL), rv, 0.);
-        icon_opt(s, 6, 110., 13., lit(TAB_TODO), rv, 0.);
-        icon_opt(s, 7, 148., 12.5, lit(TAB_POMO), rv, 0.);
+        icon_opt(s, 2, s.tab_x(TAB_MUSIC).0 + 8., 13., lit(TAB_MUSIC), rv, 0.);
+        icon_opt(s, 5, s.tab_x(TAB_CAL).0 + 8., 13., lit(TAB_CAL), rv, 0.);
+        icon_opt(s, 6, s.tab_x(TAB_TODO).0 + 8., 13., lit(TAB_TODO), rv, 0.);
+        icon_opt(s, 7, s.tab_x(TAB_POMO).0 + 8., 12.5, lit(TAB_POMO), rv, 0.);
         if s.pomo.running {
-            pill_opt(s, 165., 25., 5., 5., phase_color(s.pomo.phase), rv, 0.);
+            pill_opt(
+                s,
+                s.tab_x(TAB_POMO).0 + 25.,
+                25.,
+                5.,
+                5.,
+                phase_color(s.pomo.phase),
+                rv,
+                0.,
+            );
         }
-        icon_opt(s, 3, 186., 12.5, lit(TAB_SHELF), rv, 0.);
+        icon_opt(
+            s,
+            3,
+            s.tab_x(TAB_SHELF).0 + 8.,
+            12.5,
+            lit(TAB_SHELF),
+            rv,
+            0.,
+        );
+        let total_count = s.total_items();
+        if total_count > 0 {
+            let bw = s.shelf_tab_w() - 36.;
+            let bx = s.tab_x(TAB_SHELF).0 + 28.;
+            pill_opt(s, bx, 15., bw, 14., rgb(66, 66, 70), rv, 0.);
+            text_opt(
+                dc,
+                s,
+                3,
+                &total_count.to_string(),
+                WHITE,
+                bx,
+                14.,
+                bw,
+                16.,
+                true,
+                rv,
+                0.,
+            );
+        }
+        icon_opt(
+            s,
+            11,
+            s.tab_x(TAB_QUICK).0 + 8.,
+            13.,
+            lit(TAB_QUICK),
+            rv,
+            0.,
+        );
         icon_opt(
             s,
             10,
@@ -5136,25 +6855,6 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
             rv,
             0.,
         );
-        let total_count = s.total_items();
-        if total_count > 0 {
-            let bw = s.shelf_tab_w() - 36.;
-            pill_opt(s, 206., 15., bw, 14., rgb(66, 66, 70), rv, 0.);
-            text_opt(
-                dc,
-                s,
-                3,
-                &total_count.to_string(),
-                WHITE,
-                206.,
-                14.,
-                bw,
-                16.,
-                true,
-                rv,
-                0.,
-            );
-        }
         for (tab, label) in [(TAB_SHELF, "Clear"), (TAB_TODO, "Clear Done")] {
             let o = mix[tab].0 * rv;
             if o <= 0. || !s.has_clear(tab) {
@@ -5192,8 +6892,10 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 TAB_CAL => calendar_page(dc, s, dx, o),
                 TAB_TODO => todo_page(dc, s, dx, o),
                 TAB_POMO => pomo_page(dc, s, dx, o),
+                TAB_SHELF => shelf_page(dc, s, dx, o),
+                TAB_QUICK => quick_page(dc, s, dx, o),
                 TAB_SETTINGS => settings_page(dc, s, dx, o),
-                _ => shelf_page(dc, s, dx, o),
+                _ => {}
             }
         }
     }
@@ -5342,12 +7044,13 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 .map(|inset| (edge - inset).clamp(0., 1.))
                 .sum::<f64>()
                 / 8.;
-            let a = (coverage * 255.).round() as u32;
             let c = *pixel;
-            *pixel = (a << 24)
-                | ((((c >> 16) & 255) * a / 255) << 16)
-                | ((((c >> 8) & 255) * a / 255) << 8)
-                | ((c & 255) * a / 255);
+            let cur_a = ((c >> 24) & 255) as f64;
+            let a = (coverage * cur_a).round() as u32;
+            let r_chan = (((c >> 16) & 255) as f64 * coverage).round() as u32;
+            let g_chan = (((c >> 8) & 255) as f64 * coverage).round() as u32;
+            let b_chan = ((c & 255) as f64 * coverage).round() as u32;
+            *pixel = (a << 24) | (r_chan << 16) | (g_chan << 8) | b_chan;
         }
     }
     let position = Point {
@@ -5682,6 +7385,25 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
             r.stroke(&[p(14.4, 4.8), p(15.6, 3.6)], false, w, color);
             r.stroke(&[p(9., 10.4), p(9., 6.8)], false, w, color);
         }
+        11 => {
+            // App grid (2x2 rounded squares)
+            let s_size = 5.2 * k;
+            let rad = 1.4 * k;
+            r.stroke_round(x + 2.5 * k, y + 2.5 * k, s_size, s_size, rad, w, color);
+            r.stroke_round(x + 10.2 * k, y + 2.5 * k, s_size, s_size, rad, w, color);
+            r.stroke_round(x + 2.5 * k, y + 10.2 * k, s_size, s_size, rad, w, color);
+            r.stroke_round(x + 10.2 * k, y + 10.2 * k, s_size, s_size, rad, w, color);
+        }
+        12 => {
+            // Search / magnifying glass
+            let cx = x + 7.2 * k;
+            let cy = y + 7.2 * k;
+            let rad = 4.2 * k;
+            r.stroke_ellipse(cx, cy, rad, rad, w, color);
+            let h_start = (cx + rad * 0.707, cy + rad * 0.707);
+            let h_end = (cx + 7.6 * k, cy + 7.6 * k);
+            r.stroke(&[h_start, h_end], false, 2.0 * k, color);
+        }
         _ => {}
     }
 }
@@ -5828,6 +7550,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         if !(c.x >= r.left && c.x < r.right && c.y >= r.top && c.y < r.bottom)
                             && !s.todo_editing
                             && !s.cal_editing
+                            && !s.quick_editing
+                            && !s.quick_add_mode
                             && !s.menu_active
                         {
                             s.expanded = false;
@@ -5841,7 +7565,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     s.last_pomo_sec = pomo_sec;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
-                if (s.todo_editing || s.cal_editing) && s.ticks % 15 == 0 {
+                if (s.todo_editing || s.cal_editing || s.quick_editing || s.quick_add_mode)
+                    && s.ticks % 15 == 0
+                {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 s.update_notices(hwnd, now);
@@ -6036,6 +7762,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     s.set_volume_x(x);
                     changed = true;
                 }
+                if s.blur_drag {
+                    s.set_blur_x(x);
+                    changed = true;
+                }
                 if s.usable() {
                     let hit = if y < HEADER_H { s.header_hit(x, y) } else { -1 };
                     let bc_hover = hit == 12;
@@ -6063,12 +7793,14 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     } else if s.active_tab == TAB_CAL
                         || s.active_tab == TAB_TODO
                         || s.active_tab == TAB_POMO
+                        || s.active_tab == TAB_QUICK
                         || s.active_tab == TAB_SETTINGS
                     {
                         let hover = match s.active_tab {
                             TAB_CAL => s.cal_hit(x, y),
                             TAB_TODO => s.todo_hit(x, y),
                             TAB_POMO => pomo_hit(x, y),
+                            TAB_QUICK => s.quick_hit(x, y),
                             _ => s.settings_hit(x, y),
                         };
                         if s.hover != hover {
@@ -6254,6 +7986,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         s.todo_hit(x, y)
                     } else if s.active_tab == TAB_POMO {
                         pomo_hit(x, y)
+                    } else if s.active_tab == TAB_QUICK {
+                        s.quick_hit(x, y)
                     } else if s.active_tab == TAB_SETTINGS {
                         s.settings_hit(x, y)
                     } else if s.active_tab != TAB_SHELF {
@@ -6315,6 +8049,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         SetCapture(hwnd);
                         s.set_volume_x(x);
                     }
+                    if pressed == 5340 && s.active_tab == TAB_SETTINGS && s.settings_subpage == 1 {
+                        s.blur_drag = true;
+                        SetCapture(hwnd);
+                        s.set_blur_x(x);
+                    }
                     if s.pressed != pressed {
                         s.pressed = pressed;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -6337,7 +8076,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     && !s.menu_active
                     && !s.todo_editing
                     && !s.cal_editing
+                    && !s.quick_editing
+                    && !s.quick_add_mode
                     && !s.vol_drag
+                    && !s.blur_drag
                     && !s.is_dragging
                     && s.drag_source.is_none()
                 {
@@ -6382,6 +8124,15 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         s.expanded = false;
                         s.hover = -1;
                         s.layout(hwnd);
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if s.blur_drag {
+                    s.blur_drag = false;
+                    ReleaseCapture();
+                    if !s.smoke {
+                        s.settings.save();
                     }
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
@@ -6451,6 +8202,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             }
                             t if (0..TAB_COUNT as i32).contains(&t) => {
                                 s.active_tab = t as usize;
+                                s.settings_subpage = 0;
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                                 return 0;
                             }
@@ -6493,6 +8245,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else if s.active_tab == TAB_POMO {
                         s.pomo_click(pomo_hit(x, y));
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    } else if s.active_tab == TAB_QUICK {
+                        let hit = s.quick_hit(x, y);
+                        s.quick_click(hwnd, hit);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else if s.active_tab == TAB_SETTINGS {
                         let hit = s.settings_hit(x, y);
@@ -6729,6 +8485,20 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
+                if msg == 0x020a && s.usable() && s.active_tab == TAB_QUICK && y >= 80. {
+                    let filtered_len =
+                        tasks::filter_quick_items(&s.quick_items, &s.quick_input).len();
+                    if filtered_len > 6 {
+                        let max_scroll = (filtered_len.saturating_sub(1)) / 2;
+                        s.quick_scroll = if delta < 0. {
+                            (s.quick_scroll + 1).min(max_scroll)
+                        } else {
+                            s.quick_scroll.saturating_sub(1)
+                        };
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
                 if s.expanded && s.progress > 0.5 {
                     // Wheel down / swipe right goes to the next page. One page per gesture: input is
                     // dropped while a switch is still landing, and touchpad deltas accumulate to a notch.
@@ -6748,6 +8518,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             s.wheel_acc = 0.;
                             if next != s.active_tab {
                                 s.active_tab = next;
+                                s.settings_subpage = 0;
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                             }
                         }
@@ -6880,11 +8651,107 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
+            0x102 if s.active_tab == TAB_QUICK && s.quick_editing => {
+                let c = w as u16;
+                match c {
+                    8 => {
+                        s.quick_input.pop();
+                    }
+                    13 => {
+                        let filtered = tasks::filter_quick_items(&s.quick_items, &s.quick_input);
+                        if !filtered.is_empty() {
+                            let cmd = filtered[0].command.clone();
+                            launch_app(&cmd);
+                            s.expanded = false;
+                            s.layout(hwnd);
+                        } else {
+                            let cmd = s.quick_input.trim().to_string();
+                            if !cmd.is_empty() {
+                                launch_app(&cmd);
+                                s.expanded = false;
+                                s.layout(hwnd);
+                            }
+                        }
+                    }
+                    0xD800..=0xDBFF => s.high_surrogate = c,
+                    0xDC00..=0xDFFF => {
+                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
+                            if s.quick_input.chars().count() < 80 {
+                                s.quick_input.push(ch);
+                            }
+                        }
+                        s.high_surrogate = 0;
+                    }
+                    c if c >= 32 && c != 127 => {
+                        if let Some(ch) = char::from_u32(c as u32) {
+                            if s.quick_input.chars().count() < 80 {
+                                s.quick_input.push(ch);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            0x102 if s.active_tab == TAB_QUICK && s.quick_add_mode => {
+                let c = w as u16;
+                match c {
+                    8 => {
+                        if s.quick_add_field == 0 {
+                            s.quick_name_input.pop();
+                        } else {
+                            s.quick_cmd_input.pop();
+                        }
+                    }
+                    9 => {
+                        s.quick_add_field = (s.quick_add_field + 1) % 2;
+                    }
+                    13 => {
+                        if s.quick_add_field == 0 && !s.quick_name_input.is_empty() {
+                            s.quick_add_field = 1;
+                        } else {
+                            s.commit_quick_item();
+                        }
+                    }
+                    0xD800..=0xDBFF => s.high_surrogate = c,
+                    0xDC00..=0xDFFF => {
+                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
+                            let target = if s.quick_add_field == 0 {
+                                &mut s.quick_name_input
+                            } else {
+                                &mut s.quick_cmd_input
+                            };
+                            if target.chars().count() < 80 {
+                                target.push(ch);
+                            }
+                        }
+                        s.high_surrogate = 0;
+                    }
+                    c if c >= 32 && c != 127 => {
+                        if let Some(ch) = char::from_u32(c as u32) {
+                            let target = if s.quick_add_field == 0 {
+                                &mut s.quick_name_input
+                            } else {
+                                &mut s.quick_cmd_input
+                            };
+                            if target.chars().count() < 80 {
+                                target.push(ch);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
             0x0008 => {
                 // Focus moved to another app: stop typing, and close if the cursor is elsewhere.
-                if s.todo_editing || s.cal_editing {
+                if s.todo_editing || s.cal_editing || s.quick_editing || s.quick_add_mode {
                     s.todo_editing = false;
                     s.cal_editing = false;
+                    s.quick_editing = false;
+                    s.quick_add_mode = false;
                     let mut r = Rect::default();
                     GetWindowRect(hwnd, &mut r);
                     let mut c = Point::default();
@@ -6899,6 +8766,18 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
             }
             0x100 if w == 27 => {
+                if s.active_tab == TAB_QUICK {
+                    if s.quick_add_mode {
+                        s.quick_add_mode = false;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                    if s.quick_editing {
+                        s.quick_editing = false;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
                 if s.todo_editing {
                     s.todo_editing = false;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -6914,6 +8793,13 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     s.shelf_scroll = 0.;
                     s.shelf_hover = -1;
                     s.shelf_remove_hover = -1;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if s.active_tab == TAB_SETTINGS && s.settings_subpage != 0 {
+                    s.settings_subpage = 0;
+                    s.hover = -1;
+                    s.pressed = -1;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
@@ -6957,6 +8843,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         // while unless the cursor is on it.
                         s.autostart = settings::starts_with_windows();
                         s.active_tab = TAB_SETTINGS;
+                        s.settings_subpage = 0;
                         s.active_folder = None;
                         if !s.expanded {
                             s.expanded = true;
@@ -7634,6 +9521,14 @@ mod tests {
             todo_input: String::new(),
             todo_editing: false,
             todo_scroll: 0,
+            quick_items: tasks::default_quick_items(),
+            quick_input: String::new(),
+            quick_editing: false,
+            quick_scroll: 0,
+            quick_add_mode: false,
+            quick_name_input: String::new(),
+            quick_cmd_input: String::new(),
+            quick_add_field: 0,
             calendar: tasks::CalendarState::new(2026, 11, 1, Vec::new()),
             cal_input: String::new(),
             cal_editing: false,
@@ -7670,6 +9565,7 @@ mod tests {
             vol_level: -1.,
             vol_muted: false,
             vol_drag: false,
+            blur_drag: false,
             clyric_t: 0.,
             clyric_tv: 0.,
             lyric_w: COL_W,
@@ -7713,6 +9609,8 @@ mod tests {
             cover_w: 0.,
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
+            settings_subpage: 0,
+            bg_custom_pixels: None,
         };
 
         // Merge file 1 into file 0 -> creates folder with 2 items
@@ -7752,5 +9650,235 @@ mod tests {
         // Remove final item
         state.shelf_items.clear();
         assert_eq!(state.total_items(), 0);
+    }
+
+    #[test]
+    fn test_appearance_settings_and_hit_testing() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let state = State {
+            expanded: true,
+            progress: 1.,
+            velocity: 0.,
+            play_progress: 0.,
+            play_velocity: 0.,
+            reduced_motion: false,
+            scale: 1.0,
+            fonts: [null_mut(); 8],
+            ticks: 0,
+            smoke: true,
+            verified: false,
+            smoke_shelf_verified: false,
+            smoke_drag_verified: false,
+            drop_target: null_mut(),
+            media: media::Media::default(),
+            receiver: rx,
+            hover: -1,
+            pressed: -1,
+            clock: std::time::Instant::now(),
+            last_frame: std::time::Instant::now(),
+            dc: null_mut(),
+            bitmap: null_mut(),
+            original: null_mut(),
+            pixels: null_mut(),
+            stride: 720,
+            text_buffer: std::cell::RefCell::new(Vec::new()),
+            text_cache: Default::default(),
+            icon_cache: Default::default(),
+            renderer: None,
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
+            menu_active: false,
+            last_minute: 0,
+            shelf_items: Vec::new(),
+            active_tab: TAB_SETTINGS,
+            tab_from: TAB_SETTINGS,
+            tab_to: TAB_SETTINGS,
+            tab_t: 1.,
+            tab_vel: 0.,
+            panel_w: SET_W,
+            panel_vel: 0.,
+            wheel_acc: 0.,
+            todos: Vec::new(),
+            todo_input: String::new(),
+            todo_editing: false,
+            todo_scroll: 0,
+            quick_items: tasks::default_quick_items(),
+            quick_input: String::new(),
+            quick_editing: false,
+            quick_scroll: 0,
+            quick_add_mode: false,
+            quick_name_input: String::new(),
+            quick_cmd_input: String::new(),
+            quick_add_field: 0,
+            calendar: tasks::CalendarState::new(2026, 11, 1, Vec::new()),
+            cal_input: String::new(),
+            cal_editing: false,
+            cal_editing_id: None,
+            cal_time: Some(9 * 60),
+            cal_end: String::new(),
+            compose_t: 0.,
+            compose_v: 0.,
+            agenda_t: 1.,
+            agenda_v: 0.,
+            agenda_key: (0, 0, 0),
+            cal_scroll: 0,
+            high_surrogate: 0,
+            pomo: tasks::Pomodoro::new(),
+            timer_t: 0.,
+            timer_vel: 0.,
+            alert_until: None,
+            last_pomo_sec: 0,
+            lyrics_tx: None,
+            lyrics_rx: None,
+            lyrics_key: String::new(),
+            lyrics: lyrics::Status::NotFound,
+            lyrics_on: false,
+            lyrics_t: 0.,
+            lyrics_tv: 0.,
+            lyric_scroll: -1.,
+            lyric_vel: 0.,
+            lyric_heights: std::cell::RefCell::new(Vec::new()),
+            lyric_hits: std::cell::RefCell::new(Vec::new()),
+            play_pos: 0.,
+            panel_h: SET_H,
+            panel_hv: 0.,
+            volume: volume::Volume::none(),
+            vol_level: -1.,
+            vol_muted: false,
+            vol_drag: false,
+            blur_drag: false,
+            clyric_t: 0.,
+            clyric_tv: 0.,
+            lyric_w: COL_W,
+            lyric_wv: 0.,
+            lyric_w_target: COL_W,
+            clyric_key: (-2, false),
+            last_sample: -1.,
+            dragging_out: false,
+            shelf_saved: String::new(),
+            tray: None,
+            shelf_scroll: 0.,
+            shelf_hover: -1,
+            shelf_remove_hover: -1,
+            tab_hover: -1,
+            add_button_hover: false,
+            active_folder: None,
+            breadcrumb_hover: false,
+            drag_source: None,
+            drag_start_pos: (0., 0.),
+            drag_current_pos: (0., 0.),
+            is_dragging: false,
+            drag_target: None,
+            ole_drag_target: None,
+            notify_rx: None,
+            notices: std::collections::VecDeque::new(),
+            notice: None,
+            notice_until: None,
+            notice_t: 0.,
+            notice_v: 0.,
+            notice_hover: false,
+            autostart: false,
+            switch_t: [0.; 7],
+            switch_v: [0.; 7],
+            mini_t: 0.,
+            mini_v: 0.,
+            covered: false,
+            cover_pending: false,
+            cover_count: 0,
+            cover_checked: std::time::Instant::now(),
+            cover_switched: std::time::Instant::now(),
+            cover_w: 0.,
+            deep_idle_ticks: 0,
+            settings: settings::Settings::default(),
+            settings_subpage: 0,
+            bg_custom_pixels: None,
+        };
+
+        // Main Settings page (settings_subpage == 0)
+        assert_eq!(state.settings_hit(100., 230.), 5250); // Appearance Customize row
+        assert_eq!(state.settings_hit(350., 305.), 5200); // Quit button
+        assert_eq!(state.settings_hit(10., 10.), -1);
+
+        // Background Settings subpage (settings_subpage == 1)
+        let mut bg_state = state;
+        bg_state.settings_subpage = 1;
+
+        // Header back button
+        assert_eq!(bg_state.settings_hit(50., 20.), 5260);
+
+        // Style pills (y = 64..88)
+        assert_eq!(bg_state.settings_hit(60., 75.), 5300); // Frost
+        assert_eq!(bg_state.settings_hit(130., 75.), 5301); // Aura
+        assert_eq!(bg_state.settings_hit(210., 75.), 5302); // Slate
+        assert_eq!(bg_state.settings_hit(280., 75.), 5303); // OLED
+        assert_eq!(bg_state.settings_hit(360., 75.), 5304); // Image
+
+        // Image button (y = 124..148)
+        assert_eq!(bg_state.settings_hit(80., 135.), 5320); // Import / Change Image
+        assert_eq!(bg_state.settings_hit(200., 135.), -1); // Reset is hidden when no image
+
+        // Position pills (y = 156..178)
+        assert_eq!(bg_state.settings_hit(140., 165.), 5330); // Top (pos 1)
+        assert_eq!(bg_state.settings_hit(210., 165.), 5331); // Center (pos 0)
+        assert_eq!(bg_state.settings_hit(280., 165.), 5332); // Bottom (pos 2)
+
+        // Blur slider line (y = 208..234, x = 76..364)
+        assert_eq!(bg_state.settings_hit(120., 220.), 5340);
+        assert_eq!(bg_state.settings_hit(219., 220.), 5340);
+        assert_eq!(bg_state.settings_hit(350., 220.), 5340);
+
+        // Test slider drag setting
+        bg_state.set_blur_x(86.);
+        assert_eq!(bg_state.settings.bg_blur, 0);
+        bg_state.set_blur_x(352.);
+        assert_eq!(bg_state.settings.bg_blur, 30);
+        bg_state.set_blur_x(219.);
+        assert_eq!(bg_state.settings.bg_blur, 15);
+
+        // Opacity pills (y = 242..264)
+        assert_eq!(bg_state.settings_hit(120., 250.), 5310); // 70%
+        assert_eq!(bg_state.settings_hit(190., 250.), 5311); // 80%
+        assert_eq!(bg_state.settings_hit(260., 250.), 5312); // 90%
+        assert_eq!(bg_state.settings_hit(330., 250.), 5313); // 100%
+
+        // Outside hits return -1
+        assert_eq!(bg_state.settings_hit(10., 10.), -1);
+    }
+
+    #[test]
+    fn test_custom_bg_preparation() {
+        let temp_dir = std::env::temp_dir();
+        let test_img_path = temp_dir.join("wisp_test_bg.png");
+        let img = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, 128])
+        });
+        img.save(&test_img_path).expect("failed to save test image");
+
+        // Test with medium blur (2) and center position (0)
+        let prepared = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 2, 0);
+        assert!(prepared.is_some());
+        let (w, h, pixels) = prepared.unwrap();
+        assert_eq!(w, 200);
+        assert_eq!(h, 100);
+        assert_eq!(pixels.len(), 200 * 100);
+
+        for p in &pixels {
+            let r = (p >> 16) & 255;
+            let g = (p >> 8) & 255;
+            let b = p & 255;
+            assert!(r <= 120);
+            assert!(g <= 120);
+            assert!(b <= 150);
+        }
+
+        // Test with no blur (0) and top position (1)
+        let prepared_top = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 0, 1);
+        assert!(prepared_top.is_some());
+
+        // Test with heavy blur (3) and bottom position (2)
+        let prepared_bot = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 3, 2);
+        assert!(prepared_bot.is_some());
+
+        let _ = std::fs::remove_file(test_img_path);
     }
 }

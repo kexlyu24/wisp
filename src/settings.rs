@@ -23,6 +23,14 @@ pub struct Settings {
     pub minimal_when_covering: bool,
     /// Pomodoro lengths in minutes: focus, short break, long break.
     pub pomo_minutes: [u32; 3],
+    /// Background style: 0 = Frost (blurred translucent), 1 = Aura (ambient tint), 2 = Slate (charcoal), 3 = OLED (solid black), 4 = Image (custom image).
+    pub bg_style: u32,
+    /// Background opacity percentage: 50..=100 (default 80).
+    pub bg_opacity: u32,
+    /// Background blur level: 0 = None, 1..=30 = blur radius in pixels (default 16).
+    pub bg_blur: u32,
+    /// Background image framing position: 0 = Center, 1 = Top, 2 = Bottom.
+    pub bg_pos: u32,
 }
 
 impl Default for Settings {
@@ -35,6 +43,10 @@ impl Default for Settings {
             follow_windows_animations: false,
             minimal_when_covering: true,
             pomo_minutes: [25, 5, 15],
+            bg_style: 0,
+            bg_opacity: 80,
+            bg_blur: 16,
+            bg_pos: 0,
         }
     }
 }
@@ -79,6 +91,38 @@ impl Settings {
                 // Obsolete manual player setting ignored safely on migration
                 continue;
             }
+            if key.trim() == "bg_style" {
+                if let Ok(v) = value.trim().parse::<u32>() {
+                    if v <= 4 {
+                        settings.bg_style = v;
+                    }
+                }
+                continue;
+            }
+            if key.trim() == "bg_opacity" {
+                if let Ok(v) = value.trim().parse::<u32>() {
+                    if (50..=100).contains(&v) {
+                        settings.bg_opacity = v;
+                    }
+                }
+                continue;
+            }
+            if key.trim() == "bg_blur" {
+                if let Ok(v) = value.trim().parse::<u32>() {
+                    if v <= 30 {
+                        settings.bg_blur = v;
+                    }
+                }
+                continue;
+            }
+            if key.trim() == "bg_pos" {
+                if let Ok(v) = value.trim().parse::<u32>() {
+                    if v <= 2 {
+                        settings.bg_pos = v;
+                    }
+                }
+                continue;
+            }
             if let Some(i) = KEYS.iter().position(|k| *k == key.trim()) {
                 match value.trim() {
                     "1" => *settings.fields()[i] = true,
@@ -96,8 +140,14 @@ impl Settings {
             .map(|(k, v)| format!("{k}={}\n", v as u8))
             .collect::<String>()
             + &format!(
-                "focus_minutes={}\nshort_minutes={}\nlong_minutes={}\n",
-                self.pomo_minutes[0], self.pomo_minutes[1], self.pomo_minutes[2]
+                "focus_minutes={}\nshort_minutes={}\nlong_minutes={}\nbg_style={}\nbg_opacity={}\nbg_blur={}\nbg_pos={}\n",
+                self.pomo_minutes[0],
+                self.pomo_minutes[1],
+                self.pomo_minutes[2],
+                self.bg_style,
+                self.bg_opacity,
+                self.bg_blur,
+                self.bg_pos
             )
     }
     pub fn load() -> Self {
@@ -198,12 +248,24 @@ mod tests {
             follow_windows_animations: true,
             minimal_when_covering: false,
             pomo_minutes: [50, 10, 20],
+            bg_style: 1,
+            bg_opacity: 70,
+            bg_blur: 20,
+            bg_pos: 1,
         };
         assert_eq!(Settings::parse(&custom.format()), custom);
         assert_eq!(Settings::parse(""), Settings::default());
-        let partial = Settings::parse("open_on_hover=0\nbogus=1\nclock_24h=maybe\n");
+        let partial = Settings::parse(
+            "open_on_hover=0\nbogus=1\nclock_24h=maybe\nbg_style=2\nbg_opacity=90\nbg_blur=12\nbg_pos=2\n",
+        );
         assert!(!partial.open_on_hover && partial.notifications && partial.clock_24h);
         assert!(!partial.follow_windows_animations);
+        assert_eq!(partial.bg_style, 2);
+        assert_eq!(partial.bg_opacity, 90);
+        assert_eq!(partial.bg_blur, 12);
+        assert_eq!(partial.bg_pos, 2);
+        let img_style = Settings::parse("bg_style=4\n");
+        assert_eq!(img_style.bg_style, 4);
         // Verify obsolete player setting from earlier versions is ignored safely
         let migrated = Settings::parse("player=spotifast\nnotifications=0\n");
         assert!(!migrated.notifications);
