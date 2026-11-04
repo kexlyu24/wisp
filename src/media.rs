@@ -18,7 +18,7 @@ pub struct Media {
     /// Position in seconds at the moment of sampling, extrapolated from the session's last update.
     pub pos_secs: f64,
     pub duration: i64,
-    /// Which player the session belongs to: "spotify", "applemusic" or "spotifast" (empty when idle).
+    /// Which player the session belongs to: "spotify", "applemusic", "spotifast", "soundcloud", "chrome" or "msedge" (empty when idle).
     pub app: String,
 }
 
@@ -34,6 +34,8 @@ pub fn app_key(id: &str) -> Option<&'static str> {
         Some("spotify")
     } else if id.contains("applemusic") {
         Some("applemusic")
+    } else if id.contains("soundcloud") {
+        Some("soundcloud")
     } else if id.contains("chrome") {
         Some("chrome")
     } else if id.contains("msedge") || id.contains("microsoft.edge") || id.contains("edge.exe") {
@@ -65,7 +67,7 @@ static FOLLOWED: Mutex<String> = Mutex::new(String::new());
 /// Helper to classify desktop players vs browser sessions.
 fn is_desktop(c: &Candidate) -> bool {
     app_key(&c.app_id).map_or(false, |k| {
-        k == "spotify" || k == "spotifast" || k == "applemusic"
+        k == "spotify" || k == "spotifast" || k == "applemusic" || k == "soundcloud"
     })
 }
 
@@ -417,6 +419,11 @@ mod tests {
         assert_eq!(app_key("Spotifast.exe"), Some("spotifast"));
         assert_eq!(app_key("applemusic"), Some("applemusic"));
         assert_eq!(app_key("AppleMusic.exe"), Some("applemusic"));
+        assert_eq!(app_key("SoundCloud.exe"), Some("soundcloud"));
+        assert_eq!(
+            app_key("SoundCloud.SoundCloud_xxxxxxxxxxxxx!App"),
+            Some("soundcloud")
+        );
         assert_eq!(app_key("chrome.exe"), Some("chrome"));
         assert_eq!(app_key("Google.Chrome"), Some("chrome"));
         assert_eq!(app_key("msedge.exe"), Some("msedge"));
@@ -667,6 +674,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn soundcloud_counts_as_a_desktop_player() {
+        let soundcloud = "SoundCloud.exe";
+        let chrome = "chrome.exe";
+        // Paused everywhere: the desktop app wins over a browser tab Windows calls current.
+        assert_eq!(
+            choose(&[c(chrome, false, true), c(soundcloud, false, false)], "", ""),
+            Some(1)
+        );
+        // Playing beats paused, and Windows' current session beats the rest.
+        assert_eq!(
+            choose(&[c(chrome, true, false), c(soundcloud, true, true)], "", ""),
+            Some(1)
+        );
     }
 
     #[test]
