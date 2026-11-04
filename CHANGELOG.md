@@ -2,6 +2,15 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
+## [0.1.9] - 2026-11-04
+
+### Added
+- **SoundCloud desktop app**: sessions whose app id contains "soundcloud" count as a desktop player, with Now Playing, transport controls and a volume slider that sets the `soundcloud.exe` level in the Windows Volume Mixer.
+
+### Known limitations
+- Apple Music's volume adapter only detects the app; it does not change the volume yet.
+- SoundCloud in Chrome or Edge stays a browser session.
+
 ## [0.1.8hf] - 2026-11-02
 
 Hotfix for 0.1.8.
