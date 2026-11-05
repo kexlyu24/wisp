@@ -881,6 +881,20 @@ impl State {
         let shelf_items = if smoke { Vec::new() } else { load_shelf() };
         let shelf_saved = serialize_shelf(&shelf_items);
         let (vol_level, vol_muted) = volume.get().unwrap_or((-1., false));
+        let (notif_history, max_order) = if smoke {
+            (Vec::new(), 0)
+        } else {
+            notify::load_recent_with_order(30)
+        };
+        let notify_rx = if smoke {
+            None
+        } else {
+            Some(notify::start(if max_order > 0 {
+                Some(max_order)
+            } else {
+                None
+            }))
+        };
         Self {
             expanded: false,
             progress: 0.,
@@ -1008,14 +1022,14 @@ impl State {
             is_dragging: false,
             drag_target: None,
             ole_drag_target: None,
-            notify_rx: if smoke { None } else { Some(notify::start()) },
+            notify_rx,
             notices: std::collections::VecDeque::new(),
             notice: None,
             notice_until: None,
             notice_t: 0.,
             notice_v: 0.,
             notice_hover: false,
-            notif_history: if smoke { Vec::new() } else { notify::load_recent(30) },
+            notif_history,
             notif_scroll: 0,
             notif_unread: false,
             autostart: !smoke && settings::starts_with_windows(),
@@ -2023,10 +2037,12 @@ impl State {
     /// Pulls new notifications, starts the next one when the notch is free, and retires finished ones.
     unsafe fn update_notices(&mut self, hwnd: Hwnd, now: std::time::Instant) {
         if let Some(rx) = &self.notify_rx {
+            let mut received = false;
             for notice in rx.try_iter() {
                 if !self.settings.notifications {
                     continue;
                 }
+                received = true;
                 self.notif_history.insert(0, notice.clone());
                 if self.notif_history.len() > 50 {
                     self.notif_history.pop();
@@ -2039,6 +2055,9 @@ impl State {
                     self.notices.pop_front();
                 }
             }
+            if received {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
         }
         if let Some(until) = self.notice_until {
             if self.expanded || (now >= until && !self.notice_hover) {
@@ -2048,8 +2067,8 @@ impl State {
         }
         if self.notice.is_some()
             && self.notice_until.is_none()
-            && self.notice_t.abs() < 0.01
-            && self.notice_v.abs() < 0.05
+            && self.notice_t.abs() < 0.02
+            && self.notice_v.abs() < 0.1
         {
             self.notice = None;
             self.notice_t = 0.;
@@ -2059,7 +2078,7 @@ impl State {
             }
             self.layout(hwnd);
         }
-        if self.notice.is_none() && !self.expanded && self.progress == 0. {
+        if self.notice.is_none() && !self.expanded && self.progress < 0.01 {
             if let Some(notice) = self.notices.pop_front() {
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_icon(notice.icon.as_deref());
@@ -2189,15 +2208,17 @@ impl State {
                 let notice = self.notif_history.remove(i);
                 self.clamp_notif_scroll();
                 self.hover = -1;
-                let target = format!("shell:AppsFolder\\{}", notice.aumid);
-                ShellExecuteW(
-                    hwnd,
-                    wide("open").as_ptr(),
-                    wide("explorer.exe").as_ptr(),
-                    wide(&target).as_ptr(),
-                    std::ptr::null(),
-                    1,
-                );
+                if !notice.aumid.is_empty() {
+                    let target = format!("shell:AppsFolder\\{}", notice.aumid);
+                    ShellExecuteW(
+                        hwnd,
+                        wide("open").as_ptr(),
+                        wide("explorer.exe").as_ptr(),
+                        wide(&target).as_ptr(),
+                        std::ptr::null(),
+                        1,
+                    );
+                }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
         }
@@ -2211,15 +2232,17 @@ impl State {
     /// Opens the app that sent the notification on screen, then dismisses it.
     unsafe fn open_notice(&mut self, hwnd: Hwnd) {
         if let Some(notice) = &self.notice {
-            let target = format!("shell:AppsFolder\\{}", notice.aumid);
-            ShellExecuteW(
-                hwnd,
-                wide("open").as_ptr(),
-                wide("explorer.exe").as_ptr(),
-                wide(&target).as_ptr(),
-                std::ptr::null(),
-                1,
-            );
+            if !notice.aumid.is_empty() {
+                let target = format!("shell:AppsFolder\\{}", notice.aumid);
+                ShellExecuteW(
+                    hwnd,
+                    wide("open").as_ptr(),
+                    wide("explorer.exe").as_ptr(),
+                    wide(&target).as_ptr(),
+                    std::ptr::null(),
+                    1,
+                );
+            }
         }
         self.notice_until = None;
         self.notice_hover = false;
@@ -6910,6 +6933,12 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x205 => {
+                if s.notice_shown() {
+                    s.notice_until = None;
+                    s.notice_hover = false;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
                 if s.usable() && s.active_tab == TAB_SHELF && y >= 50. {
