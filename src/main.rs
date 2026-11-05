@@ -571,11 +571,19 @@ const TAB_CAL: usize = 1;
 const TAB_TODO: usize = 2;
 const TAB_POMO: usize = 3;
 const TAB_SHELF: usize = 4;
-const TAB_SETTINGS: usize = 5;
-const TAB_COUNT: usize = 6;
+const TAB_NOTIF: usize = 5;
+const TAB_SETTINGS: usize = 6;
+const TAB_COUNT: usize = 7;
 fn page_w(tab: usize) -> f64 {
-    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, SET_W][tab.min(TAB_COUNT - 1)]
+    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, NOTIF_W, SET_W][tab.min(TAB_COUNT - 1)]
 }
+/// Notification Center page geometry: 3 cards visible at a time.
+const NOTIF_W: f64 = 440.;
+const NOTIF_H: f64 = 246.;
+const NOTIF_ROWS: usize = 3;
+const NOTIF_Y0: f64 = 46.;
+const NOTIF_CARD_H: f64 = 58.;
+const NOTIF_CARD_GAP: f64 = 6.;
 /// Settings page: two inset grouped cards of switches, the music-player segmented control, a footer.
 const SET_W: f64 = 440.;
 const SET_H: f64 = 246.;
@@ -632,12 +640,12 @@ const RED: u32 = rgb(255, 69, 58);
 const BLUE: u32 = rgb(10, 132, 255);
 const ORANGE: u32 = rgb(255, 159, 10);
 const GREEN: u32 = rgb(48, 209, 88);
-/// Clear / Clear Done sit just left of the Settings tab at the header's right edge.
+/// Clear / Clear Done sit just left of the Notification Center / Settings tabs at the header's right edge.
 fn clear_rect(panel_w: f64, tab: usize) -> (f64, f64) {
     if tab == TAB_TODO {
-        (panel_w - 154., 90.)
+        (panel_w - 192., 90.)
     } else {
-        (panel_w - 124., 60.)
+        (panel_w - 162., 60.)
     }
 }
 fn in_drop_zone(x: f64, y: f64) -> bool {
@@ -667,6 +675,14 @@ enum FileKind {
     Document,
     Generic,
 }
+#[derive(Clone)]
+struct DismissingNotice {
+    notice: notify::Notice,
+    y: f64,
+    progress: f64,
+    velocity: f64,
+}
+
 struct State {
     expanded: bool,
     progress: f64,
@@ -784,6 +800,21 @@ struct State {
     notice_t: f64,
     notice_v: f64,
     notice_hover: bool,
+    notif_history: Vec<notify::Notice>,
+    notif_scroll: usize,
+    notif_scroll_pos: f64,
+    notif_scroll_vel: f64,
+    notif_unread: bool,
+    notif_enter_t: f64,
+    notif_enter_v: f64,
+    notif_shift_y: f64,
+    notif_shift_v: f64,
+    notif_shift_idx: usize,
+    dismissing_notifs: Vec<DismissingNotice>,
+    notif_bell_bounce: f64,
+    notif_bell_bounce_v: f64,
+    notif_badge_t: f64,
+    notif_badge_v: f64,
     settings: settings::Settings,
     autostart: bool,
     switch_t: [f64; 7],
@@ -870,6 +901,20 @@ impl State {
         let shelf_items = if smoke { Vec::new() } else { load_shelf() };
         let shelf_saved = serialize_shelf(&shelf_items);
         let (vol_level, vol_muted) = volume.get().unwrap_or((-1., false));
+        let (notif_history, max_order) = if smoke {
+            (Vec::new(), 0)
+        } else {
+            notify::load_recent_with_order(30)
+        };
+        let notify_rx = if smoke {
+            None
+        } else {
+            Some(notify::start(if max_order > 0 {
+                Some(max_order)
+            } else {
+                None
+            }))
+        };
         Self {
             expanded: false,
             progress: 0.,
@@ -997,13 +1042,28 @@ impl State {
             is_dragging: false,
             drag_target: None,
             ole_drag_target: None,
-            notify_rx: if smoke { None } else { Some(notify::start()) },
+            notify_rx,
             notices: std::collections::VecDeque::new(),
             notice: None,
             notice_until: None,
             notice_t: 0.,
             notice_v: 0.,
             notice_hover: false,
+            notif_history,
+            notif_scroll: 0,
+            notif_scroll_pos: 0.,
+            notif_scroll_vel: 0.,
+            notif_unread: false,
+            notif_enter_t: 0.,
+            notif_enter_v: 0.,
+            notif_shift_y: 0.,
+            notif_shift_v: 0.,
+            notif_shift_idx: 0,
+            dismissing_notifs: Vec::new(),
+            notif_bell_bounce: 0.,
+            notif_bell_bounce_v: 0.,
+            notif_badge_t: 0.,
+            notif_badge_v: 0.,
             autostart: !smoke && settings::starts_with_windows(),
             switch_t: [0.; 7],
             switch_v: [0.; 7],
@@ -1048,6 +1108,8 @@ impl State {
     fn page_h(&self, tab: usize) -> f64 {
         if tab == TAB_MUSIC && self.lyrics_on {
             NP_LYRICS_H
+        } else if tab == TAB_NOTIF {
+            NOTIF_H
         } else if tab == TAB_SETTINGS {
             SET_H
         } else if tab == TAB_CAL {
@@ -1371,12 +1433,14 @@ impl State {
             52.
         }
     }
-    /// Header tab positions: the five pages from the left, Settings alone at the right edge.
+    /// Header tab positions: the five pages from the left, Notification Center and Settings at the right edge.
     fn tab_x(&self, tab: usize) -> (f64, f64) {
         if tab < TAB_SHELF {
             (26. + 38. * tab as f64, 34.)
         } else if tab == TAB_SHELF {
             (178., self.shelf_tab_w())
+        } else if tab == TAB_NOTIF {
+            (self.panel_w_now() - 26. - 34. - 38., 34.)
         } else {
             (self.panel_w_now() - 26. - 34., 34.)
         }
@@ -1393,6 +1457,7 @@ impl State {
         match tab {
             TAB_SHELF => self.total_items() > 0,
             TAB_TODO => self.todos.iter().any(|t| t.done),
+            TAB_NOTIF => !self.notif_history.is_empty(),
             _ => false,
         }
     }
@@ -1769,6 +1834,10 @@ impl State {
                 self.tab_vel = 0.;
             }
             self.tab_to = self.active_tab;
+            if self.active_tab == TAB_NOTIF {
+                self.notif_enter_t = 0.;
+                self.notif_enter_v = 0.;
+            }
         }
         let hidden = !self.expanded && self.progress == 0.;
         let tab_animating = if self.reduced_motion || hidden {
@@ -1987,6 +2056,110 @@ impl State {
                 dt,
             )
         };
+        // Notification Center card entrance, smooth scrolling, dismiss cascade, and bell badge animations.
+        let notif_enter_target = if self.expanded && self.active_tab == TAB_NOTIF {
+            1.
+        } else {
+            0.
+        };
+        let notif_enter_animating = if self.reduced_motion {
+            let moving = self.notif_enter_t != notif_enter_target || self.notif_enter_v != 0.;
+            self.notif_enter_t = notif_enter_target;
+            self.notif_enter_v = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.notif_enter_t,
+                &mut self.notif_enter_v,
+                notif_enter_target,
+                20.,
+                0.82,
+                dt,
+            )
+        };
+        let notif_scroll_animating = if self.reduced_motion {
+            let moving =
+                self.notif_scroll_pos != self.notif_scroll as f64 || self.notif_scroll_vel != 0.;
+            self.notif_scroll_pos = self.notif_scroll as f64;
+            self.notif_scroll_vel = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.notif_scroll_pos,
+                &mut self.notif_scroll_vel,
+                self.notif_scroll as f64,
+                22.,
+                0.86,
+                dt,
+            )
+        };
+        let notif_shift_animating = if self.reduced_motion {
+            let moving = self.notif_shift_y != 0. || self.notif_shift_v != 0.;
+            self.notif_shift_y = 0.;
+            self.notif_shift_v = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.notif_shift_y,
+                &mut self.notif_shift_v,
+                0.,
+                22.,
+                0.85,
+                dt,
+            )
+        };
+        let mut dismissing_animating = false;
+        for d in &mut self.dismissing_notifs {
+            if self.reduced_motion {
+                d.progress = 1.0;
+                dismissing_animating = true;
+            } else {
+                dismissing_animating |= spring(
+                    &mut d.progress,
+                    &mut d.velocity,
+                    1.0,
+                    22.,
+                    0.82,
+                    dt,
+                );
+            }
+        }
+        self.dismissing_notifs.retain(|d| d.progress < 0.98);
+        let notif_bell_animating = if self.reduced_motion {
+            let moving = self.notif_bell_bounce != 0. || self.notif_bell_bounce_v != 0.;
+            self.notif_bell_bounce = 0.;
+            self.notif_bell_bounce_v = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.notif_bell_bounce,
+                &mut self.notif_bell_bounce_v,
+                0.,
+                18.,
+                0.72,
+                dt,
+            )
+        };
+        let badge_target = if self.notif_unread && !self.notif_history.is_empty() {
+            1.
+        } else {
+            0.
+        };
+        let notif_badge_animating = if self.reduced_motion {
+            let moving = self.notif_badge_t != badge_target || self.notif_badge_v != 0.;
+            self.notif_badge_t = badge_target;
+            self.notif_badge_v = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.notif_badge_t,
+                &mut self.notif_badge_v,
+                badge_target,
+                22.,
+                0.75,
+                dt,
+            )
+        };
         geom_animating
             || play_animating
             || tab_animating
@@ -2000,18 +2173,41 @@ impl State {
             || mini_animating
             || settings_animating
             || agenda_animating
+            || notif_enter_animating
+            || notif_scroll_animating
+            || notif_shift_animating
+            || dismissing_animating
+            || notif_bell_animating
+            || notif_badge_animating
     }
     /// Pulls new notifications, starts the next one when the notch is free, and retires finished ones.
     unsafe fn update_notices(&mut self, hwnd: Hwnd, now: std::time::Instant) {
         if let Some(rx) = &self.notify_rx {
+            let mut received = false;
             for notice in rx.try_iter() {
                 if !self.settings.notifications {
                     continue;
+                }
+                received = true;
+                self.notif_history.insert(0, notice.clone());
+                if self.notif_history.len() > 50 {
+                    self.notif_history.pop();
+                }
+                if self.active_tab != TAB_NOTIF {
+                    self.notif_unread = true;
+                    self.notif_bell_bounce = 1.0;
+                } else {
+                    self.notif_shift_y = -(NOTIF_CARD_H + NOTIF_CARD_GAP);
+                    self.notif_shift_v = 0.0;
+                    self.notif_shift_idx = 1;
                 }
                 self.notices.push_back(notice);
                 if self.notices.len() > 4 {
                     self.notices.pop_front();
                 }
+            }
+            if received {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
             }
         }
         if let Some(until) = self.notice_until {
@@ -2022,8 +2218,8 @@ impl State {
         }
         if self.notice.is_some()
             && self.notice_until.is_none()
-            && self.notice_t.abs() < 0.01
-            && self.notice_v.abs() < 0.05
+            && self.notice_t.abs() < 0.02
+            && self.notice_v.abs() < 0.1
         {
             self.notice = None;
             self.notice_t = 0.;
@@ -2033,7 +2229,7 @@ impl State {
             }
             self.layout(hwnd);
         }
-        if self.notice.is_none() && !self.expanded && self.progress == 0. {
+        if self.notice.is_none() && !self.expanded && self.progress < 0.01 {
             if let Some(notice) = self.notices.pop_front() {
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_icon(notice.icon.as_deref());
@@ -2091,6 +2287,7 @@ impl State {
         if !self.settings.notifications {
             self.notices.clear();
             self.notice_until = None;
+            self.notif_history.clear();
         }
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
@@ -2116,6 +2313,90 @@ impl State {
             _ => {}
         }
     }
+    fn clamp_notif_scroll(&mut self) {
+        self.notif_scroll = self
+            .notif_scroll
+            .min(self.notif_history.len().saturating_sub(NOTIF_ROWS));
+    }
+    /// Notification Center targets: 6000+i open app card, 7000+i dismiss card, -1 none.
+    fn notif_hit(&self, x: f64, y: f64) -> i32 {
+        if self.notif_history.is_empty() {
+            return -1;
+        }
+        let n = self.notif_history.len();
+        for k in 0..NOTIF_ROWS {
+            let i = self.notif_scroll + k;
+            if i >= n {
+                break;
+            }
+            let card_y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+            if !(card_y..card_y + NOTIF_CARD_H).contains(&y) {
+                continue;
+            }
+            if !(20. ..420.).contains(&x) {
+                continue;
+            }
+            let (cx, cy) = (402., card_y + 16.);
+            if (x - cx).hypot(y - cy) <= 12. {
+                return 7000 + i as i32;
+            }
+            return 6000 + i as i32;
+        }
+        -1
+    }
+    unsafe fn notif_click(&mut self, hwnd: Hwnd, hit: i32) {
+        if (7000..8000).contains(&hit) {
+            let i = (hit - 7000) as usize;
+            if i < self.notif_history.len() {
+                let notice = self.notif_history.remove(i);
+                self.clamp_notif_scroll();
+                self.hover = -1;
+                let k = i.saturating_sub(self.notif_scroll);
+                let y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+                self.dismissing_notifs.push(DismissingNotice {
+                    notice,
+                    y,
+                    progress: 0.0,
+                    velocity: 0.0,
+                });
+                self.notif_shift_y = NOTIF_CARD_H + NOTIF_CARD_GAP;
+                self.notif_shift_v = 0.0;
+                self.notif_shift_idx = i;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+        } else if (6000..7000).contains(&hit) {
+            let i = (hit - 6000) as usize;
+            if i < self.notif_history.len() {
+                let notice = self.notif_history.remove(i);
+                self.clamp_notif_scroll();
+                self.hover = -1;
+                let k = i.saturating_sub(self.notif_scroll);
+                let y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+                let aumid = notice.aumid.clone();
+                self.dismissing_notifs.push(DismissingNotice {
+                    notice,
+                    y,
+                    progress: 0.0,
+                    velocity: 0.0,
+                });
+                self.notif_shift_y = NOTIF_CARD_H + NOTIF_CARD_GAP;
+                self.notif_shift_v = 0.0;
+                self.notif_shift_idx = i;
+                if !aumid.is_empty() {
+                    let target = format!("shell:AppsFolder\\{}", aumid);
+                    ShellExecuteW(
+                        hwnd,
+                        wide("open").as_ptr(),
+                        wide("explorer.exe").as_ptr(),
+                        wide(&target).as_ptr(),
+                        std::ptr::null(),
+                        1,
+                    );
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+        }
+    }
     /// Settings that take effect outside the drawing code: motion and animations.
     fn apply_settings(&mut self) {
         self.reduced_motion =
@@ -2125,15 +2406,17 @@ impl State {
     /// Opens the app that sent the notification on screen, then dismisses it.
     unsafe fn open_notice(&mut self, hwnd: Hwnd) {
         if let Some(notice) = &self.notice {
-            let target = format!("shell:AppsFolder\\{}", notice.aumid);
-            ShellExecuteW(
-                hwnd,
-                wide("open").as_ptr(),
-                wide("explorer.exe").as_ptr(),
-                wide(&target).as_ptr(),
-                std::ptr::null(),
-                1,
-            );
+            if !notice.aumid.is_empty() {
+                let target = format!("shell:AppsFolder\\{}", notice.aumid);
+                ShellExecuteW(
+                    hwnd,
+                    wide("open").as_ptr(),
+                    wide("explorer.exe").as_ptr(),
+                    wide(&target).as_ptr(),
+                    std::ptr::null(),
+                    1,
+                );
+            }
         }
         self.notice_until = None;
         self.notice_hover = false;
@@ -4217,7 +4500,7 @@ unsafe fn shelf_page(dc: Handle, s: &State, dx: f64, o: f64) {
     if let Some(folder_idx) = s.active_folder {
         if folder_idx < s.shelf_items.len() && s.shelf_items[folder_idx].is_group() {
             let bx = s.breadcrumb_x();
-            let bc_bg = if s.pressed == 105 {
+            let bc_bg = if s.pressed == 120 {
                 Some(rgb(40, 40, 43))
             } else if s.breadcrumb_hover {
                 Some(rgb(28, 28, 30))
@@ -4855,6 +5138,294 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
     pill_opt(s, qx, 208., qw, 26., quit_bg, o, dx);
     text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 208., qw, 26., true, o, dx);
 }
+/// Helper to draw a single notification card (supports normal cards and animated dismissing cards).
+unsafe fn draw_notif_card(
+    dc: Handle,
+    s: &State,
+    notice: &notify::Notice,
+    card_x: f64,
+    card_y: f64,
+    card_w: f64,
+    card_h: f64,
+    card_opacity: f64,
+    extra_dx: f64,
+    hot: bool,
+    pressed: bool,
+    del_hover: bool,
+    show_close: bool,
+) {
+    if card_opacity <= 0.001 {
+        return;
+    }
+    let card_bg = if pressed {
+        rgb(44, 44, 48)
+    } else if hot {
+        rgb(34, 34, 38)
+    } else {
+        rgb(26, 26, 28)
+    };
+    round_opt(s, card_x, card_y, card_w, card_h, 10., card_bg, card_opacity, extra_dx);
+
+    // Icon
+    let icon_size = 32.;
+    let icon_x = card_x + 12.;
+    let icon_y = card_y + (card_h - icon_size) / 2.;
+    let radius = if !notice.picture {
+        6.
+    } else if notice.circle {
+        icon_size / 2.
+    } else {
+        8.
+    };
+
+    let mut drawn = false;
+    if let Some(pixels) = notice.icon.as_deref() {
+        if let Some(r) = s.renderer.as_ref() {
+            let (ox, oy) = s.offset();
+            drawn = r.draw_icon_slice(pixels, icon_x + ox + extra_dx, icon_y + oy, icon_size, radius, card_opacity);
+        }
+    }
+    if !drawn {
+        round_opt(
+            s,
+            icon_x,
+            icon_y,
+            icon_size,
+            icon_size,
+            8.,
+            rgb(44, 44, 48),
+            card_opacity,
+            extra_dx,
+        );
+        let initial = notice
+            .app
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default();
+        text_opt(
+            dc,
+            s,
+            0,
+            &initial,
+            WHITE,
+            icon_x,
+            icon_y + 6.,
+            icon_size,
+            icon_size - 6.,
+            true,
+            card_opacity,
+            extra_dx,
+        );
+    }
+
+    // Close / dismiss button (x)
+    let close_cx = card_x + card_w - 18.;
+    let close_cy = card_y + 16.;
+    if show_close {
+        draw_close_button_opt(s, close_cx, close_cy, del_hover, card_opacity, extra_dx);
+    }
+
+    // Relative time
+    let time_str = notify::relative_time(notice.arrival);
+    let time_w = text_width(dc, s, 2, &time_str);
+    let time_x = close_cx - 16. - time_w;
+    text_align_opt(
+        dc,
+        s,
+        2,
+        &time_str,
+        TERTIARY,
+        time_x,
+        card_y + 8.,
+        time_w,
+        16.,
+        2,
+        card_opacity,
+        extra_dx,
+    );
+
+    // App Name
+    let cx = icon_x + icon_size + 10.;
+    let app_w = (time_x - 8. - cx).max(10.);
+    text_align_opt(
+        dc,
+        s,
+        3,
+        &notice.app,
+        TERTIARY,
+        cx,
+        card_y + 8.,
+        app_w,
+        16.,
+        0,
+        card_opacity,
+        extra_dx,
+    );
+
+    // Title
+    let text_w = (close_cx - 14. - cx).max(10.);
+    text_align_opt(
+        dc,
+        s,
+        0,
+        &notice.title,
+        WHITE,
+        cx,
+        card_y + 23.,
+        text_w,
+        18.,
+        0,
+        card_opacity,
+        extra_dx,
+    );
+
+    // Body
+    if !notice.body.is_empty() {
+        text_align_opt(
+            dc,
+            s,
+            2,
+            &notice.body,
+            SECONDARY,
+            cx,
+            card_y + 39.,
+            text_w,
+            16.,
+            0,
+            card_opacity,
+            extra_dx,
+        );
+    }
+}
+
+/// Notification Center page: recent notifications with app icon, relative arrival time, card dismissal, and app launch.
+unsafe fn notif_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    let n = s.notif_history.len();
+    if n == 0 && s.dismissing_notifs.is_empty() {
+        text_opt(
+            dc,
+            s,
+            2,
+            "No Notifications",
+            TERTIARY,
+            0.,
+            110.,
+            NOTIF_W,
+            20.,
+            true,
+            o,
+            dx,
+        );
+        return;
+    }
+
+    let card_x = 20.;
+    let card_w = NOTIF_W - 40.;
+    let card_h = NOTIF_CARD_H;
+
+    // Render dismissing cards with smooth slide-out to right & fade
+    for d in &s.dismissing_notifs {
+        let p = d.progress.clamp(0.0, 1.0);
+        let dismiss_dx = p * 120.0;
+        let dismiss_o = (1.0 - p) * o;
+        if dismiss_o > 0.001 {
+            draw_notif_card(
+                dc,
+                s,
+                &d.notice,
+                card_x,
+                d.y,
+                card_w,
+                card_h,
+                dismiss_o,
+                dx + dismiss_dx,
+                false,
+                false,
+                false,
+                false,
+            );
+        }
+    }
+
+    if n == 0 {
+        return;
+    }
+
+    // Continuous scroll offset based on spring solver
+    let scroll_offset = (s.notif_scroll as f64 - s.notif_scroll_pos) * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+
+    for k in 0..NOTIF_ROWS {
+        let i = s.notif_scroll + k;
+        if i >= n {
+            break;
+        }
+        let notice = &s.notif_history[i];
+        let base_y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+
+        // Staggered entrance animation: cards slide up slightly and fade in sequentially
+        let (enter_dy, enter_o) = if s.reduced_motion {
+            (0., 1.)
+        } else {
+            let delay = k as f64 * 0.12;
+            let t = ((s.notif_enter_t - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+            let smooth_t = t * t * (3.0 - 2.0 * t);
+            ((1.0 - smooth_t) * 16.0, smooth_t)
+        };
+
+        // Smooth shift animation when a card is removed or inserted
+        let shift_y = if i >= s.notif_shift_idx {
+            s.notif_shift_y
+        } else {
+            0.
+        };
+
+        let card_y = base_y + scroll_offset + enter_dy + shift_y;
+
+        // Edge fade during smooth scrolling near top and bottom limits
+        let edge_fade = if card_y < NOTIF_Y0 - 10. {
+            ((card_y - (NOTIF_Y0 - 24.)) / 14.).clamp(0., 1.)
+        } else if card_y + card_h > NOTIF_H - 4. {
+            ((NOTIF_H - card_y) / (card_h + 4.)).clamp(0., 1.)
+        } else {
+            1.0
+        };
+
+        let card_opacity = o * enter_o * edge_fade;
+        if card_opacity <= 0.001 {
+            continue;
+        }
+
+        let hot = s.hover == 6000 + i as i32;
+        let pressed = s.pressed == 6000 + i as i32;
+        let del_hover = s.hover == 7000 + i as i32 || s.pressed == 7000 + i as i32;
+
+        draw_notif_card(
+            dc,
+            s,
+            notice,
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            card_opacity,
+            dx,
+            hot,
+            pressed,
+            del_hover,
+            true,
+        );
+    }
+
+    // Scrollbar with smooth continuous positioning
+    if n > NOTIF_ROWS {
+        let track = (NOTIF_CARD_H + NOTIF_CARD_GAP) * NOTIF_ROWS as f64 - NOTIF_CARD_GAP;
+        let h = (track * NOTIF_ROWS as f64 / n as f64).max(14.);
+        let scroll_ratio = (s.notif_scroll_pos / (n - NOTIF_ROWS) as f64).clamp(0., 1.);
+        let y = NOTIF_Y0 + (track - h) * scroll_ratio;
+        pill_opt(s, NOTIF_W - 12., y, 3., h, rgb(72, 72, 76), o, dx);
+    }
+}
 unsafe fn pomo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     let now = std::time::Instant::now();
     let p = &s.pomo;
@@ -5127,6 +5698,30 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
             pill_opt(s, 165., 25., 5., 5., phase_color(s.pomo.phase), rv, 0.);
         }
         icon_opt(s, 3, 186., 12.5, lit(TAB_SHELF), rv, 0.);
+        let bell_hop = s.notif_bell_bounce * 2.5;
+        icon_opt(
+            s,
+            11,
+            s.tab_x(TAB_NOTIF).0 + 8.,
+            13. - bell_hop,
+            lit(TAB_NOTIF),
+            rv,
+            0.,
+        );
+        if s.notif_badge_t > 0.001 {
+            let bsize = 5. * s.notif_badge_t;
+            let bpos = (5. - bsize) / 2.;
+            pill_opt(
+                s,
+                s.tab_x(TAB_NOTIF).0 + 22. + bpos,
+                12. + bpos,
+                bsize,
+                bsize,
+                RED,
+                rv * s.notif_badge_t,
+                0.,
+            );
+        }
         icon_opt(
             s,
             10,
@@ -5155,7 +5750,7 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 0.,
             );
         }
-        for (tab, label) in [(TAB_SHELF, "Clear"), (TAB_TODO, "Clear Done")] {
+        for (tab, label) in [(TAB_SHELF, "Clear"), (TAB_TODO, "Clear Done"), (TAB_NOTIF, "Clear")] {
             let o = mix[tab].0 * rv;
             if o <= 0. || !s.has_clear(tab) {
                 continue;
@@ -5192,8 +5787,10 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 TAB_CAL => calendar_page(dc, s, dx, o),
                 TAB_TODO => todo_page(dc, s, dx, o),
                 TAB_POMO => pomo_page(dc, s, dx, o),
+                TAB_SHELF => shelf_page(dc, s, dx, o),
+                TAB_NOTIF => notif_page(dc, s, dx, o),
                 TAB_SETTINGS => settings_page(dc, s, dx, o),
-                _ => shelf_page(dc, s, dx, o),
+                _ => {}
             }
         }
     }
@@ -5682,6 +6279,14 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
             r.stroke(&[p(14.4, 4.8), p(15.6, 3.6)], false, w, color);
             r.stroke(&[p(9., 10.4), p(9., 6.8)], false, w, color);
         }
+        11 => {
+            // bell: top dome and flared sides, bottom rim, and clapper.
+            r.stroke_bezier([p(9., 3.8), p(5.8, 5.5), p(5.2, 10.5), p(3.5, 13.0)], w, color);
+            r.stroke_bezier([p(9., 3.8), p(12.2, 5.5), p(12.8, 10.5), p(14.5, 13.0)], w, color);
+            r.stroke(&[p(2.8, 13.0), p(15.2, 13.0)], false, w, color);
+            r.ellipse(x + 9., y + 2.5, 1.2, 1.2, color);
+            r.stroke_bezier([p(7.6, 13.6), p(7.6, 15.6), p(10.4, 15.6), p(10.4, 13.6)], w, color);
+        }
         _ => {}
     }
 }
@@ -6063,12 +6668,14 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     } else if s.active_tab == TAB_CAL
                         || s.active_tab == TAB_TODO
                         || s.active_tab == TAB_POMO
+                        || s.active_tab == TAB_NOTIF
                         || s.active_tab == TAB_SETTINGS
                     {
                         let hover = match s.active_tab {
                             TAB_CAL => s.cal_hit(x, y),
                             TAB_TODO => s.todo_hit(x, y),
                             TAB_POMO => pomo_hit(x, y),
+                            TAB_NOTIF => s.notif_hit(x, y),
                             _ => s.settings_hit(x, y),
                         };
                         if s.hover != hover {
@@ -6241,7 +6848,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 if s.usable() {
                     let pressed = if y < HEADER_H {
                         match s.header_hit(x, y) {
-                            12 => 105,
+                            12 => 120,
                             10 => 110,
                             t if t >= 0 => 100 + t,
                             _ => -1,
@@ -6254,6 +6861,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         s.todo_hit(x, y)
                     } else if s.active_tab == TAB_POMO {
                         pomo_hit(x, y)
+                    } else if s.active_tab == TAB_NOTIF {
+                        s.notif_hit(x, y)
                     } else if s.active_tab == TAB_SETTINGS {
                         s.settings_hit(x, y)
                     } else if s.active_tab != TAB_SHELF {
@@ -6451,6 +7060,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             }
                             t if (0..TAB_COUNT as i32).contains(&t) => {
                                 s.active_tab = t as usize;
+                                if s.active_tab == TAB_NOTIF {
+                                    s.notif_unread = false;
+                                }
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                                 return 0;
                             }
@@ -6459,6 +7071,27 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                     s.todos.retain(|t| !t.done);
                                     s.clamp_todo_scroll();
                                     s.save_todos();
+                                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                                    return 0;
+                                }
+                                if s.active_tab == TAB_NOTIF {
+                                    let n = s.notif_history.len();
+                                    for k in 0..NOTIF_ROWS {
+                                        let i = s.notif_scroll + k;
+                                        if i < n {
+                                            let y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+                                            s.dismissing_notifs.push(DismissingNotice {
+                                                notice: s.notif_history[i].clone(),
+                                                y,
+                                                progress: -(k as f64 * 0.08),
+                                                velocity: 0.0,
+                                            });
+                                        }
+                                    }
+                                    s.notif_history.clear();
+                                    s.notif_scroll = 0;
+                                    s.notif_scroll_pos = 0.;
+                                    s.hover = -1;
                                     InvalidateRect(hwnd, std::ptr::null(), 0);
                                     return 0;
                                 }
@@ -6493,6 +7126,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else if s.active_tab == TAB_POMO {
                         s.pomo_click(pomo_hit(x, y));
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    } else if s.active_tab == TAB_NOTIF {
+                        let hit = s.notif_hit(x, y);
+                        s.notif_click(hwnd, hit);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else if s.active_tab == TAB_SETTINGS {
                         let hit = s.settings_hit(x, y);
@@ -6604,6 +7241,12 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x205 => {
+                if s.notice_shown() {
+                    s.notice_until = None;
+                    s.notice_hover = false;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
                 if s.usable() && s.active_tab == TAB_SHELF && y >= 50. {
@@ -6719,6 +7362,21 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 if msg == 0x020a
                     && s.usable()
+                    && s.active_tab == TAB_NOTIF
+                    && s.notif_history.len() > NOTIF_ROWS
+                    && y >= NOTIF_Y0
+                {
+                    s.notif_scroll = if delta < 0. {
+                        s.notif_scroll + 1
+                    } else {
+                        s.notif_scroll.saturating_sub(1)
+                    };
+                    s.clamp_notif_scroll();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if msg == 0x020a
+                    && s.usable()
                     && s.active_tab == TAB_SHELF
                     && count > 4
                     && y >= CARD_Y
@@ -6748,6 +7406,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             s.wheel_acc = 0.;
                             if next != s.active_tab {
                                 s.active_tab = next;
+                                if s.active_tab == TAB_NOTIF {
+                                    s.notif_unread = false;
+                                }
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                             }
                         }
@@ -7580,14 +8241,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_folder_grouping_and_ungrouping() {
-        let f1 = create_shelf_item("test_a.txt");
-        let f2 = create_shelf_item("test_b.png");
-        let f3 = create_shelf_item("test_c.rs");
-
-        let items = vec![f1, f2, f3];
-        let mut state = State {
+    fn create_test_state() -> State {
+        State {
             expanded: true,
             progress: 1.,
             velocity: 0.,
@@ -7621,7 +8276,7 @@ mod tests {
             pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
             menu_active: false,
             last_minute: 0,
-            shelf_items: items,
+            shelf_items: Vec::new(),
             active_tab: TAB_SHELF,
             tab_from: TAB_SHELF,
             tab_to: TAB_SHELF,
@@ -7700,6 +8355,21 @@ mod tests {
             notice_t: 0.,
             notice_v: 0.,
             notice_hover: false,
+            notif_history: Vec::new(),
+            notif_scroll: 0,
+            notif_scroll_pos: 0.,
+            notif_scroll_vel: 0.,
+            notif_unread: false,
+            notif_enter_t: 0.,
+            notif_enter_v: 0.,
+            notif_shift_y: 0.,
+            notif_shift_v: 0.,
+            notif_shift_idx: 0,
+            dismissing_notifs: Vec::new(),
+            notif_bell_bounce: 0.,
+            notif_bell_bounce_v: 0.,
+            notif_badge_t: 0.,
+            notif_badge_v: 0.,
             autostart: false,
             switch_t: [0.; 7],
             switch_v: [0.; 7],
@@ -7713,7 +8383,18 @@ mod tests {
             cover_w: 0.,
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_folder_grouping_and_ungrouping() {
+        let f1 = create_shelf_item("test_a.txt");
+        let f2 = create_shelf_item("test_b.png");
+        let f3 = create_shelf_item("test_c.rs");
+
+        let items = vec![f1, f2, f3];
+        let mut state = create_test_state();
+        state.shelf_items = items;
 
         // Merge file 1 into file 0 -> creates folder with 2 items
         state.merge_items(1, 0);
@@ -7752,5 +8433,126 @@ mod tests {
         // Remove final item
         state.shelf_items.clear();
         assert_eq!(state.total_items(), 0);
+    }
+
+    #[test]
+    fn test_notification_tab_geometry_and_layout() {
+        assert_eq!(TAB_MUSIC, 0);
+        assert_eq!(TAB_CAL, 1);
+        assert_eq!(TAB_TODO, 2);
+        assert_eq!(TAB_POMO, 3);
+        assert_eq!(TAB_SHELF, 4);
+        assert_eq!(TAB_NOTIF, 5);
+        assert_eq!(TAB_SETTINGS, 6);
+        assert_eq!(TAB_COUNT, 7);
+
+        assert_eq!(page_w(TAB_NOTIF), NOTIF_W);
+        assert_eq!(page_w(TAB_SETTINGS), SET_W);
+
+        let state = create_test_state();
+        assert_eq!(state.page_h(TAB_NOTIF), NOTIF_H);
+        assert_eq!(state.page_h(TAB_SETTINGS), SET_H);
+
+        let notif_tab = state.tab_x(TAB_NOTIF);
+        let settings_tab = state.tab_x(TAB_SETTINGS);
+        assert_eq!(notif_tab.1, 34.);
+        assert_eq!(settings_tab.1, 34.);
+        // Tab width is 34, plus 4px gap = 38px spacing between Notification Center and Settings
+        assert_eq!(notif_tab.0 + 34. + 4., settings_tab.0);
+    }
+
+    #[test]
+    fn test_notification_center_history_and_clear() {
+        let mut state = create_test_state();
+        assert!(!state.has_clear(TAB_NOTIF));
+
+        state.notif_history.push(notify::Notice {
+            aumid: "com.example.app".to_string(),
+            app: "Example".to_string(),
+            title: "Hello".to_string(),
+            body: "World".to_string(),
+            icon: None,
+            picture: false,
+            circle: false,
+            arrival: 134383028845235997,
+        });
+
+        assert!(state.has_clear(TAB_NOTIF));
+        assert_eq!(state.notif_history.len(), 1);
+
+        // Hit card 0: inside card bounds -> 6000
+        assert_eq!(state.notif_hit(200., NOTIF_Y0 + 20.), 6000);
+        // Hit dismiss "x" of card 0: at (402., NOTIF_Y0 + 16.) -> 7000
+        assert_eq!(state.notif_hit(402., NOTIF_Y0 + 16.), 7000);
+
+        // Outside cards -> -1
+        assert_eq!(state.notif_hit(10., NOTIF_Y0 + 20.), -1);
+        assert_eq!(state.notif_hit(200., 10.), -1);
+
+        // Clamping scroll
+        state.notif_scroll = 10;
+        state.clamp_notif_scroll();
+        assert_eq!(state.notif_scroll, 0);
+
+        // Clearing history
+        state.notif_history.clear();
+        assert!(!state.has_clear(TAB_NOTIF));
+        assert_eq!(state.notif_hit(200., NOTIF_Y0 + 20.), -1);
+    }
+
+    #[test]
+    fn test_notification_center_animations() {
+        let mut state = create_test_state();
+        state.active_tab = TAB_NOTIF;
+        state.expanded = true;
+        state.notif_enter_t = 0.;
+        state.notif_enter_v = 0.;
+
+        // 1. Advance should spring notif_enter_t towards 1.0
+        let dt = 1.0 / 60.0;
+        let animating = state.advance(dt);
+        assert!(animating);
+        assert!(state.notif_enter_t > 0.0);
+
+        // 2. Smooth scrolling spring
+        state.notif_scroll = 2;
+        state.notif_scroll_pos = 0.;
+        state.advance(dt);
+        assert!(state.notif_scroll_pos > 0.0);
+
+        // 3. Dismissing cards spring progress and retain condition
+        let dummy_notice = notify::Notice {
+            aumid: "test.app".to_string(),
+            app: "Test".to_string(),
+            title: "T".to_string(),
+            body: "B".to_string(),
+            icon: None,
+            picture: false,
+            circle: false,
+            arrival: 0,
+        };
+        state.dismissing_notifs.push(DismissingNotice {
+            notice: dummy_notice.clone(),
+            y: NOTIF_Y0,
+            progress: 0.0,
+            velocity: 0.0,
+        });
+        state.advance(dt);
+        assert!(state.dismissing_notifs[0].progress > 0.0);
+
+        // Fast-forward dismissing progress past 0.98 -> should be pruned
+        state.dismissing_notifs[0].progress = 0.99;
+        state.advance(dt);
+        assert!(state.dismissing_notifs.is_empty());
+
+        // 4. Bell bounce and badge pop springs
+        state.notif_bell_bounce = 1.0;
+        state.notif_bell_bounce_v = 0.0;
+        state.notif_unread = true;
+        state.notif_history.push(dummy_notice);
+        state.advance(dt);
+        // Bell bounce moves toward 0.0, badge_t moves toward 1.0
+        assert!(state.notif_bell_bounce < 1.0);
+        assert!(state.notif_badge_t > 0.0);
     }
 }
