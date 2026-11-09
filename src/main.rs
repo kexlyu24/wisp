@@ -901,6 +901,7 @@ impl State {
                             h,
                             loaded_settings.bg_blur,
                             loaded_settings.bg_pos,
+                            loaded_settings.bg_opacity,
                         );
                     }
                 }
@@ -1343,8 +1344,8 @@ impl State {
         let frac = ((x - TRACK_X0) / (TRACK_X1 - TRACK_X0)).clamp(0., 1.);
         let new_blur = (frac * MAX_BLUR as f64).round() as u32;
         if new_blur != self.settings.bg_blur {
+            // The image is re-blurred once when the slider is released, not on every step.
             self.settings.bg_blur = new_blur;
-            self.reload_custom_bg();
             self.apply_settings();
         }
     }
@@ -2440,6 +2441,9 @@ impl State {
             5310..=5313 => {
                 let opacities = [70, 80, 90, 100];
                 self.settings.bg_opacity = opacities[(hit - 5310) as usize];
+                if self.bg_custom_pixels.is_some() {
+                    self.reload_custom_bg();
+                }
                 self.apply_settings();
                 if !self.smoke {
                     self.settings.save();
@@ -2484,6 +2488,7 @@ impl State {
                 h,
                 self.settings.bg_blur,
                 self.settings.bg_pos,
+                self.settings.bg_opacity,
             ) {
                 if let Some(dest) = tasks::data_path("background.png") {
                     let _ = std::fs::copy(&file_path, dest);
@@ -2523,6 +2528,7 @@ impl State {
                         h,
                         self.settings.bg_blur,
                         self.settings.bg_pos,
+                        self.settings.bg_opacity,
                     );
                 }
             }
@@ -3197,6 +3203,7 @@ fn prepare_custom_bg(
     target_h: usize,
     blur_level: u32,
     pos: u32,
+    opacity: u32,
 ) -> Option<(usize, usize, Vec<u32>)> {
     let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
@@ -3231,10 +3238,17 @@ fn prepare_custom_bg(
 
     let sigma = blur_level as f32;
     let processed = if sigma > 0.5 {
-        image::imageops::blur(&resized.to_rgba8(), sigma)
+        // Blurring a quarter-size copy looks the same and is ~16x cheaper than full size.
+        let (sw, sh) = ((target_w / 4).max(1), (target_h / 4).max(1));
+        let filter = image::imageops::FilterType::Triangle;
+        let small = image::imageops::resize(&resized.to_rgba8(), sw, sh, filter);
+        let blurred = image::imageops::blur(&small, sigma / 4.);
+        image::imageops::resize(&blurred, target_w, target_h, filter)
     } else {
         resized.to_rgba8()
     };
+    // Premultiplied BGRA at the chosen opacity, so drawing a frame is a plain row copy.
+    let a = opacity.clamp(50, 100) * 255 / 100;
 
     let pixels: Vec<u32> = processed
         .pixels()
@@ -3242,7 +3256,7 @@ fn prepare_custom_bg(
             let r = ((p[0] as u32 * 40 + 14 * 60) / 100).min(255);
             let g = ((p[1] as u32 * 40 + 15 * 60) / 100).min(255);
             let b = ((p[2] as u32 * 40 + 18 * 60) / 100).min(255);
-            (r << 16) | (g << 8) | b
+            (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255)
         })
         .collect();
     Some((target_w as usize, target_h as usize, pixels))
@@ -6721,18 +6735,9 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 let row =
                     std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize);
                 let src_y = y.min(bh.saturating_sub(1));
-                let src_offset = src_y * bw;
-                for x in 0..r.right as usize {
-                    let src_x = x.min(bw.saturating_sub(1));
-                    let src_pixel = custom[src_offset + src_x];
-                    let r = (src_pixel >> 16) & 255;
-                    let g = (src_pixel >> 8) & 255;
-                    let b = src_pixel & 255;
-                    let r_pm = r * bg_alpha / 255;
-                    let g_pm = g * bg_alpha / 255;
-                    let b_pm = b * bg_alpha / 255;
-                    row[x] = (bg_alpha << 24) | (r_pm << 16) | (g_pm << 8) | b_pm;
-                }
+                let n = row.len().min(bw);
+                row[..n].copy_from_slice(&custom[src_y * bw..src_y * bw + n]);
+                row[n..].fill(base_pixel);
             }
         } else {
             for y in 0..r.bottom as usize {
@@ -8131,6 +8136,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 if s.blur_drag {
                     s.blur_drag = false;
                     ReleaseCapture();
+                    if s.bg_custom_pixels.is_some() {
+                        s.reload_custom_bg();
+                    }
                     if !s.smoke {
                         s.settings.save();
                     }
@@ -9855,7 +9863,7 @@ mod tests {
         img.save(&test_img_path).expect("failed to save test image");
 
         // Test with medium blur (2) and center position (0)
-        let prepared = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 2, 0);
+        let prepared = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 2, 0, 100);
         assert!(prepared.is_some());
         let (w, h, pixels) = prepared.unwrap();
         assert_eq!(w, 200);
@@ -9872,11 +9880,16 @@ mod tests {
         }
 
         // Test with no blur (0) and top position (1)
-        let prepared_top = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 0, 1);
+        let prepared_top = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 0, 1, 50);
         assert!(prepared_top.is_some());
+        // Half opacity: alpha 127 and colour channels premultiplied to at most alpha.
+        for p in &prepared_top.unwrap().2 {
+            assert_eq!(p >> 24, 127);
+            assert!((p >> 16) & 255 <= 127 && (p >> 8) & 255 <= 127 && p & 255 <= 127);
+        }
 
         // Test with heavy blur (3) and bottom position (2)
-        let prepared_bot = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 3, 2);
+        let prepared_bot = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 30, 2, 100);
         assert!(prepared_bot.is_some());
 
         let _ = std::fs::remove_file(test_img_path);

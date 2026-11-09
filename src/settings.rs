@@ -43,8 +43,8 @@ impl Default for Settings {
             follow_windows_animations: false,
             minimal_when_covering: true,
             pomo_minutes: [25, 5, 15],
-            bg_style: 0,
-            bg_opacity: 80,
+            bg_style: 3,
+            bg_opacity: 100,
             bg_blur: 16,
             bg_pos: 0,
         }
