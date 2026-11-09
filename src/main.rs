@@ -830,6 +830,11 @@ struct State {
     settings: settings::Settings,
     settings_subpage: usize,
     bg_custom_pixels: Option<(usize, usize, Vec<u32>)>,
+    /// Frosted glass: the blurred, tinted capture of what is behind the panel (DIB-sized, opaque),
+    /// made on a short-lived thread so the ~20 ms capture and blur never stall a frame.
+    backdrop: std::sync::Arc<std::sync::Mutex<Option<Vec<u32>>>>,
+    backdrop_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    backdrop_at: Option<std::time::Instant>,
     autostart: bool,
     switch_t: [f64; 7],
     switch_v: [f64; 7],
@@ -1129,6 +1134,9 @@ impl State {
             settings: loaded_settings,
             settings_subpage: 0,
             bg_custom_pixels,
+            backdrop: Default::default(),
+            backdrop_busy: Default::default(),
+            backdrop_at: None,
         }
     }
     fn px(&self, n: f64) -> i32 {
@@ -2545,7 +2553,7 @@ impl State {
     fn settings_hit(&self, x: f64, y: f64) -> i32 {
         if self.settings_subpage == 1 {
             // Back button (< Settings)
-            if (10. ..34.).contains(&y) && (24. ..116.).contains(&x) {
+            if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
                 return 5260;
             }
             // Style pills (Frost, Aura, Slate, OLED, Image)
@@ -2799,6 +2807,51 @@ impl State {
         }
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    /// Frosted glass: while the panel shows with a see-through style, capture what is behind it a
+    /// few times a second and blur it. Wisp's own window is not in the capture: a screen BitBlt
+    /// without CAPTUREBLT skips layered windows.
+    unsafe fn update_backdrop(&mut self) {
+        let style = self.settings.bg_style;
+        let wanted =
+            !self.smoke && self.progress > 0.001 && style <= 2 && self.settings.bg_opacity < 100;
+        use std::sync::atomic::Ordering;
+        if !wanted {
+            if let Ok(mut b) = self.backdrop.lock() {
+                *b = None;
+            }
+            self.backdrop_at = None;
+            return;
+        }
+        let recent = self
+            .backdrop_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250));
+        if recent || self.backdrop_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.backdrop_at = Some(std::time::Instant::now());
+        let (w, h) = (self.stride, (DIB_H * self.scale).ceil() as usize);
+        let x0 = (GetSystemMetrics(0) - w as i32) / 2;
+        let tint = self.renderer.as_ref().and_then(|r| r.tint()).unwrap_or(rgb(210, 210, 215));
+        let (color, blur) = (style_rgb(style, tint), self.settings.bg_blur);
+        let alpha = self.settings.bg_opacity.clamp(50, 100) * 255 / 100;
+        let (out, busy) = (self.backdrop.clone(), self.backdrop_busy.clone());
+        std::thread::spawn(move || {
+            let area = Rect {
+                left: x0,
+                top: 0,
+                right: x0 + w as i32,
+                bottom: h as i32,
+            };
+            let shot = unsafe { grab_screen(&area) };
+            if shot.len() == w * h {
+                let glass = frost(&shot, w, h, blur, color, alpha);
+                if let Ok(mut b) = out.lock() {
+                    *b = Some(glass);
+                }
+            }
+            busy.store(false, Ordering::Release);
+        });
+    }
     fn reload_custom_bg(&mut self) {
         if let Some(dest) = tasks::data_path("background.png") {
             if dest.exists() {
@@ -2818,6 +2871,7 @@ impl State {
     }
     /// Settings that take effect outside the drawing code: motion and animations.
     fn apply_settings(&mut self) {
+        self.backdrop_at = None;
         self.reduced_motion =
             self.settings.follow_windows_animations && unsafe { reduced_motion() };
         self.pomo.set_minutes(self.settings.pomo_minutes);
@@ -3481,6 +3535,91 @@ unsafe fn open_image_dialog(hwnd: Hwnd) -> Option<String> {
     }
     None
 }
+/// Background colour of a style: Frost dark glass, Aura tinted by the artwork, Slate charcoal,
+/// OLED black (also the fallback for Image).
+fn style_rgb(style: u32, tint: u32) -> (u32, u32, u32) {
+    match style {
+        1 => {
+            let mix = |t: u32, base: u32| (t * 22 + base * 78) / 100;
+            (mix((tint >> 16) & 255, 14), mix((tint >> 8) & 255, 15), mix(tint & 255, 18))
+        }
+        0 => (14, 15, 18),
+        2 => (26, 27, 30),
+        _ => (0, 0, 0),
+    }
+}
+/// Frosted glass from a screen capture `src` (w×h): blurred by `blur` px, on a quarter-size copy
+/// that looks the same at ~1/16 the cost, with the style colour laid over at `alpha` (0..=255).
+/// Returns opaque pixels.
+fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alpha: u32) -> Vec<u32> {
+    let mix = |c: f32, t: u32| ((c * (255 - alpha) as f32 + (t * alpha) as f32) / 255.) as u32;
+    let compose = |c: [f32; 3]| 0xff00_0000 | mix(c[0], tint.0) << 16 | mix(c[1], tint.1) << 8 | mix(c[2], tint.2);
+    let channels = |p: u32| [((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32];
+    if blur == 0 || w < 8 || h < 8 {
+        return src.iter().map(|&p| compose(channels(p))).collect();
+    }
+    let (sw, sh) = (w / 4, h / 4);
+    let mut small = vec![[0f32; 3]; sw * sh];
+    for y in 0..sh {
+        for x in 0..sw {
+            let mut acc = [0f32; 3];
+            for dy in 0..4 {
+                for &p in &src[(y * 4 + dy) * w + x * 4..][..4] {
+                    let c = channels(p);
+                    (0..3).for_each(|i| acc[i] += c[i]);
+                }
+            }
+            small[y * sw + x] = acc.map(|v| v / 16.);
+        }
+    }
+    // Three box passes approximate a gaussian.
+    let r = ((blur as f32 / 4.).round() as usize).max(1);
+    for _ in 0..3 {
+        box_blur(&mut small, sw, sh, r);
+    }
+    let mut out = vec![0u32; w * h];
+    let axis = |v: usize, n: usize| {
+        let f = ((v as f32 + 0.5) / 4. - 0.5).clamp(0., (n - 1) as f32);
+        let i = f as usize;
+        (i, (i + 1).min(n - 1), f - i as f32)
+    };
+    for y in 0..h {
+        let (y0, y1, ty) = axis(y, sh);
+        for x in 0..w {
+            let (x0, x1, tx) = axis(x, sw);
+            let (a, b, c, d) = (small[y0 * sw + x0], small[y0 * sw + x1], small[y1 * sw + x0], small[y1 * sw + x1]);
+            let px: [f32; 3] = std::array::from_fn(|i| {
+                let top = a[i] + (b[i] - a[i]) * tx;
+                top + (c[i] + (d[i] - c[i]) * tx - top) * ty
+            });
+            out[y * w + x] = compose(px);
+        }
+    }
+    out
+}
+/// One horizontal and one vertical box blur of radius `r`, clamping at the edges.
+fn box_blur(buf: &mut [[f32; 3]], w: usize, h: usize, r: usize) {
+    let pass = |buf: &mut [[f32; 3]], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+        let mut line = vec![[0f32; 3]; len];
+        let n = (2 * r + 1) as f32;
+        for l in 0..lines {
+            (0..len).for_each(|i| line[i] = buf[at(l, i)]);
+            let mut sum = [0f32; 3];
+            for j in 0..=2 * r {
+                let c = line[j.saturating_sub(r).min(len - 1)];
+                (0..3).for_each(|k| sum[k] += c[k]);
+            }
+            for i in 0..len {
+                buf[at(l, i)] = sum.map(|v| v / n);
+                let add = line[(i + r + 1).min(len - 1)];
+                let sub = line[i.saturating_sub(r)];
+                (0..3).for_each(|k| sum[k] += add[k] - sub[k]);
+            }
+        }
+    };
+    pass(buf, w, h, &|l, i| l * w + i);
+    pass(buf, h, w, &|l, i| i * w + l);
+}
 fn prepare_custom_bg(
     path: &str,
     target_w: usize,
@@ -3531,7 +3670,7 @@ fn prepare_custom_bg(
     } else {
         resized.to_rgba8()
     };
-    // Premultiplied BGRA at the chosen opacity, so drawing a frame is a plain row copy.
+    // Opaque and dimmed by the opacity, so drawing a frame is a plain row copy.
     let a = opacity.clamp(50, 100) * 255 / 100;
 
     let pixels: Vec<u32> = processed
@@ -3540,7 +3679,7 @@ fn prepare_custom_bg(
             let r = ((p[0] as u32 * 40 + 14 * 60) / 100).min(255);
             let g = ((p[1] as u32 * 40 + 15 * 60) / 100).min(255);
             let b = ((p[2] as u32 * 40 + 18 * 60) / 100).min(255);
-            (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255)
+            0xff00_0000 | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255)
         })
         .collect();
     Some((target_w as usize, target_h as usize, pixels))
@@ -6448,7 +6587,7 @@ unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
         rgb(30, 28, 28)
     };
     let b_fg = if b_hot || b_pressed { WHITE } else { SECONDARY };
-    pill_opt(s, 24., 10., 92., 24., b_bg, o, dx);
+    pill_opt(s, 24., 284., 92., 24., b_bg, o, dx);
     text_opt(
         dc,
         s,
@@ -6456,7 +6595,7 @@ unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
         "‹ Settings",
         b_fg,
         24.,
-        10.,
+        284.,
         92.,
         24.,
         true,
@@ -6746,11 +6885,11 @@ unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
         dc,
         s,
         3,
-        "Live preview active • Changes save automatically.",
+        "Changes save automatically.",
         SECONDARY,
-        24.,
+        124.,
         286.,
-        392.,
+        292.,
         20.,
         true,
         o,
@@ -7277,67 +7416,42 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
         .and_then(|r| r.tint())
         .unwrap_or(rgb(210, 210, 215));
     let bg_style = s.settings.bg_style;
-    let bg_opacity = s.settings.bg_opacity.clamp(50, 100);
-    let bg_alpha = (bg_opacity * 255 / 100) as u32;
-
-    let (bg_r, bg_g, bg_b) = match bg_style {
-        0 => (14, 15, 18),
-        1 => {
-            let tr = (tint >> 16) & 255;
-            let tg = (tint >> 8) & 255;
-            let tb = tint & 255;
-            let r = (tr * 22 + 14 * 78) / 100;
-            let g = (tg * 22 + 15 * 78) / 100;
-            let b = (tb * 22 + 18 * 78) / 100;
-            (r, g, b)
+    let (bg_r, bg_g, bg_b) = style_rgb(bg_style, tint);
+    // The closed notch stays black like the hardware notch; the theme fades in as it opens.
+    let k = (s.progress.clamp(0., 1.) * 256.) as u32;
+    let dim = |c: u32| -> u32 {
+        if k >= 256 {
+            return c;
         }
-        2 => (26, 27, 30),
-        3 => (0, 0, 0),
-        _ => (14, 15, 18),
+        let ch = |shift: u32| (((c >> shift) & 255) * k >> 8) << shift;
+        0xff00_0000 | ch(16) | ch(8) | ch(0)
     };
-
-    let r_pm = (bg_r * bg_alpha / 255) as u32;
-    let g_pm = (bg_g * bg_alpha / 255) as u32;
-    let b_pm = (bg_b * bg_alpha / 255) as u32;
-    let base_pixel = (bg_alpha << 24) | (r_pm << 16) | (g_pm << 8) | b_pm;
-
-    if bg_style == 4 {
-        if let Some((bw, bh, ref custom)) = s.bg_custom_pixels {
-            for y in 0..r.bottom as usize {
-                let row =
-                    std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize);
-                let src_y = y.min(bh.saturating_sub(1));
-                let n = row.len().min(bw);
-                row[..n].copy_from_slice(&custom[src_y * bw..src_y * bw + n]);
-                row[n..].fill(base_pixel);
-            }
-        } else {
-            for y in 0..r.bottom as usize {
-                std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize)
-                    .fill(base_pixel);
-            }
-        }
+    let solid = dim(0xff00_0000 | (bg_r << 16) | (bg_g << 8) | bg_b);
+    let (width, height) = (r.right as usize, r.bottom as usize);
+    let backdrop = s.backdrop.lock().ok();
+    let source = if bg_style == 4 {
+        s.bg_custom_pixels.as_ref().map(|(w, h, v)| (*w, *h, v))
     } else {
-        for y in 0..r.bottom as usize {
-            std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), r.right as usize)
-                .fill(base_pixel);
+        let dib_h = (DIB_H * s.scale).ceil() as usize;
+        backdrop.as_ref().and_then(|b| b.as_ref()).map(|v| (s.stride, dib_h, v))
+    };
+    match source {
+        Some((bw, bh, src)) if bw >= width && bh > 0 => {
+            // Both are captured for the full, centred DIB; the window is centred too.
+            let ox = (bw - width) / 2;
+            for y in 0..height {
+                let row = std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), width);
+                let start = y.min(bh - 1) * bw + ox;
+                row.copy_from_slice(&src[start..start + width]);
+                if k < 256 {
+                    row.iter_mut().for_each(|px| *px = dim(*px));
+                }
+            }
         }
-    }
-    if (bg_style == 0 || bg_style == 1 || bg_style == 4) && r.bottom > 1 && r.right > 0 {
-        let spec_a = ((bg_alpha as f64 * 0.16).round() as u32).min(255);
-        let spec_r = (255 * spec_a / 255) as u32;
-        let spec_g = (255 * spec_a / 255) as u32;
-        let spec_b = (255 * spec_a / 255) as u32;
-        let top_row = std::slice::from_raw_parts_mut(s.pixels, r.right as usize);
-        for x in 0..r.right as usize {
-            let p = top_row[x];
-            let cur_r = (p >> 16) & 255;
-            let cur_g = (p >> 8) & 255;
-            let cur_b = p & 255;
-            top_row[x] = (spec_a.max(bg_alpha) << 24)
-                | ((cur_r + spec_r).min(255) << 16)
-                | ((cur_g + spec_g).min(255) << 8)
-                | ((cur_b + spec_b).min(255));
+        _ => {
+            for y in 0..height {
+                std::slice::from_raw_parts_mut(s.pixels.add(y * s.stride), width).fill(solid);
+            }
         }
     }
     SetBkMode(dc, 1);
@@ -8182,6 +8296,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 s.update_notices(hwnd, now);
                 s.update_cover(hwnd, now);
+                s.update_backdrop();
                 let prev_p = s.progress;
                 let prev_w = s.panel_w;
                 let prev_play = s.play_progress;
@@ -9632,53 +9747,57 @@ extern "system" {
         rop: u32,
     ) -> i32;
 }
+/// Screen pixels of `a` (BGRX rows). Wisp's own window isn't included: a BitBlt without CAPTUREBLT
+/// skips layered windows.
+unsafe fn grab_screen(a: &Rect) -> Vec<u32> {
+    let (w, h) = (a.right - a.left, a.bottom - a.top);
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    let screen = GetDC(null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let info = BitmapInfo {
+        size: 40,
+        width: w,
+        height: -h,
+        planes: 1,
+        bits: 32,
+        compression: 0,
+        bytes: 0,
+        x: 0,
+        y: 0,
+        used: 0,
+        important: 0,
+    };
+    let mut bits = null_mut();
+    let bitmap = CreateDIBSection(dc, &info, 0, &mut bits, null_mut(), 0);
+    let mut pixels = Vec::new();
+    if !bitmap.is_null() && !bits.is_null() {
+        let old = SelectObject(dc, bitmap);
+        BitBlt(dc, 0, 0, w, h, screen, a.left, a.top, 0x00CC0020);
+        GdiFlush();
+        pixels.extend_from_slice(std::slice::from_raw_parts(bits as *const u32, (w * h) as usize));
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+    }
+    DeleteDC(dc);
+    ReleaseDC(null_mut(), screen);
+    pixels
+}
 /// True when the screen pixels in `areas` (screen pixels) are all one flat color, give or take
 /// antialiasing noise: nothing but an empty title bar or tab strip.
 unsafe fn screen_is_flat(areas: &[Rect]) -> bool {
     // Each area is judged on its own: pooling them would let a few letters in a small strip vanish
     // into a big empty area, so the notch would shrink while normal and grow back once shrunk.
-    let screen = GetDC(null_mut());
     let mut flat = true;
     for a in areas {
-        let mut pixels: Vec<u32> = Vec::new();
-        let (w, h) = (a.right - a.left, a.bottom - a.top);
-        if w <= 0 || h <= 0 {
-            continue;
-        }
-        let dc = CreateCompatibleDC(screen);
-        let info = BitmapInfo {
-            size: 40,
-            width: w,
-            height: -h,
-            planes: 1,
-            bits: 32,
-            compression: 0,
-            bytes: 0,
-            x: 0,
-            y: 0,
-            used: 0,
-            important: 0,
-        };
-        let mut bits = null_mut();
-        let bitmap = CreateDIBSection(dc, &info, 0, &mut bits, null_mut(), 0);
-        if !bitmap.is_null() && !bits.is_null() {
-            let old = SelectObject(dc, bitmap);
-            BitBlt(dc, 0, 0, w, h, screen, a.left, a.top, 0x00CC0020);
-            GdiFlush();
-            pixels.extend_from_slice(std::slice::from_raw_parts(
-                bits as *const u32,
-                (w * h) as usize,
-            ));
-            SelectObject(dc, old);
-            DeleteObject(bitmap);
-        }
-        DeleteDC(dc);
+        let pixels = grab_screen(a);
         if !is_flat(&pixels) {
             flat = false;
             break;
         }
     }
-    ReleaseDC(null_mut(), screen);
+
     flat
 }
 /// Minimal-mode decision from one observation. Shrinking needs content seen twice (~0.5 s); growing
@@ -10288,6 +10407,9 @@ mod tests {
             settings: settings::Settings::default(),
             settings_subpage: 0,
             bg_custom_pixels: None,
+            backdrop: Default::default(),
+            backdrop_busy: Default::default(),
+            backdrop_at: None,
         }
     }
 
@@ -10359,8 +10481,9 @@ mod tests {
         let mut bg_state = state;
         bg_state.settings_subpage = 1;
 
-        // Header back button
-        assert_eq!(bg_state.settings_hit(50., 20.), 5260);
+        // Back button, bottom left (it used to sit on top of the header tabs)
+        assert_eq!(bg_state.settings_hit(50., 296.), 5260);
+        assert_eq!(bg_state.settings_hit(50., 20.), -1);
 
         // Style pills (y = 64..88)
         assert_eq!(bg_state.settings_hit(60., 75.), 5300); // Frost
@@ -10402,6 +10525,24 @@ mod tests {
     }
 
     #[test]
+    fn test_frost_blurs_and_tints() {
+        let (w, h) = (64, 32);
+        // A white square in the middle of black.
+        let src: Vec<u32> = (0..w * h)
+            .map(|i| if (24..40).contains(&(i % w)) && (8..24).contains(&(i / w)) { 0xffffff } else { 0 })
+            .collect();
+        let sharp = frost(&src, w, h, 0, (0, 0, 0), 0);
+        let soft = frost(&src, w, h, 16, (0, 0, 0), 0);
+        assert!(soft.iter().all(|p| p >> 24 == 255));
+        // Blur spreads light into the black around the square and softens its inside.
+        assert_eq!(sharp[16 * w + 20] & 255, 0);
+        assert!(soft[16 * w + 20] & 255 > 20);
+        assert!(soft[16 * w + 32] & 255 < 255);
+        // Full tint covers the capture.
+        assert!(frost(&src, w, h, 16, (10, 20, 30), 255).iter().all(|&p| p == 0xff0a141e));
+    }
+
+    #[test]
     fn test_custom_bg_preparation() {
         let temp_dir = std::env::temp_dir();
         let test_img_path = temp_dir.join("wisp_test_bg.png");
@@ -10430,9 +10571,9 @@ mod tests {
         // Test with no blur (0) and top position (1)
         let prepared_top = prepare_custom_bg(test_img_path.to_str().unwrap(), 200, 100, 0, 1, 50);
         assert!(prepared_top.is_some());
-        // Half opacity: alpha 127 and colour channels premultiplied to at most alpha.
+        // Half opacity: opaque, colours dimmed to at most half.
         for p in &prepared_top.unwrap().2 {
-            assert_eq!(p >> 24, 127);
+            assert_eq!(p >> 24, 255);
             assert!((p >> 16) & 255 <= 127 && (p >> 8) & 255 <= 127 && p & 255 <= 127);
         }
 
