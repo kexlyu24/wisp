@@ -24,7 +24,8 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 - 📅 **Calendar** with your own events, ✅ **to-dos**, and a ⏱️ **Pomodoro** timer with adjustable lengths
 - 📥 **File shelf**: drop files on the notch, drag them back out, and group them into folders
 - 🪶 **Minimal mode**: shrinks to a sliver when it would hide something, like browser tabs
-- ⚙️ **Settings** right inside the notch, and every movement runs on springs
+- 🚀 **Quick Access**: search and launch apps, or add your own shortcuts
+- ⚙️ **Settings** right inside the notch, including the background (black by default, frosted glass, or your own image), and every movement runs on springs
 
 <table>
   <tr>
