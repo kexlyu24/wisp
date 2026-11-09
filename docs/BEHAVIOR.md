@@ -116,6 +116,8 @@ When a notification arrives and the notch is collapsed, `notice_t` springs the c
 
 It stays for 5 s, or 3 s when more are waiting; at most four are kept in the queue. Hovering holds it, and leaving gives it another 1.2 s. Clicking opens the app through `shell:AppsFolder` and dismisses the pill. While a notification shows, hovering does not expand the panel; notifications that arrive while the panel is open wait until it closes.
 
+The **Notification Center** tab (bell, left of the gear) lists recent notifications as cards, newest first: up to 30 from the Action Center when Wisp starts, then every new one, keeping the last 50. Three cards fit; scroll for more (the list glides on a spring). Click a card to open its app, its × to dismiss it (it slides away), or **Clear** to empty the list. A dot on the tab marks unread ones until you open it. Turning **Notifications** off in Settings empties it. The history lives only in memory. The reader checks the database whenever Windows changes it, and at least every 0.5 s.
+
 The database is undocumented, so every step fails quietly: if it is missing or its layout changes, the notch simply shows no notifications. Windows keeps showing its own banners; turning those off in Settings leaves notifications in the Action Center, where Wisp still reads them. Nothing is stored or sent anywhere.
 
 ## Verification
