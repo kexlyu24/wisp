@@ -76,6 +76,11 @@ Every behavior, size and timing is documented in **[docs/BEHAVIOR.md](docs/BEHAV
       <a href="https://github.com/overhaulpxl"><b>overhaulpxl</b></a><br>
       <sub>🔊 Volume · 📅 Calendar · ⚡ Performance</sub>
     </td>
+    <td align="center" width="230">
+      <a href="https://github.com/aoisaki01"><img src="https://avatars.githubusercontent.com/u/198209758?v=4&s=200" width="88" height="88" alt="aoisaki01"></a><br>
+      <a href="https://github.com/aoisaki01"><b>aoisaki01</b></a><br>
+      <sub>🧩 Quick Access · 🎨 Background themes</sub>
+    </td>
   </tr>
 </table>
 
