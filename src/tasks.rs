@@ -61,6 +61,118 @@ pub fn save_todos(items: &[Todo]) {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct QuickItem {
+    pub name: String,
+    pub command: String,
+}
+
+pub fn default_quick_items() -> Vec<QuickItem> {
+    vec![
+        QuickItem {
+            name: "Notepad".into(),
+            command: "notepad.exe".into(),
+        },
+        QuickItem {
+            name: "Calculator".into(),
+            command: "calc.exe".into(),
+        },
+        QuickItem {
+            name: "Terminal".into(),
+            command: "cmd.exe".into(),
+        },
+        QuickItem {
+            name: "Explorer".into(),
+            command: "explorer.exe".into(),
+        },
+        QuickItem {
+            name: "Task Manager".into(),
+            command: "taskmgr.exe".into(),
+        },
+        QuickItem {
+            name: "Settings".into(),
+            command: "ms-settings:".into(),
+        },
+        QuickItem {
+            name: "Snipping Tool".into(),
+            command: "snippingtool.exe".into(),
+        },
+        QuickItem {
+            name: "Paint".into(),
+            command: "mspaint.exe".into(),
+        },
+    ]
+}
+
+pub fn parse_quick_items(src: &str) -> Vec<QuickItem> {
+    src.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            if let Some((name, cmd)) = line.split_once('\t') {
+                let name = name.trim();
+                let cmd = cmd.trim();
+                if !cmd.is_empty() {
+                    return Some(QuickItem {
+                        name: if name.is_empty() {
+                            cmd.to_string()
+                        } else {
+                            name.to_string()
+                        },
+                        command: cmd.to_string(),
+                    });
+                }
+            } else {
+                return Some(QuickItem {
+                    name: line.to_string(),
+                    command: line.to_string(),
+                });
+            }
+            None
+        })
+        .collect()
+}
+
+pub fn format_quick_items(items: &[QuickItem]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{}\t{}\n", item.name, item.command))
+        .collect()
+}
+
+pub fn load_quick_items() -> Vec<QuickItem> {
+    data_path("quick_access.txt")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|src| {
+            let items = parse_quick_items(&src);
+            if items.is_empty() {
+                default_quick_items()
+            } else {
+                items
+            }
+        })
+        .unwrap_or_else(default_quick_items)
+}
+
+pub fn save_quick_items(items: &[QuickItem]) {
+    write_data("quick_access.txt", &format_quick_items(items));
+}
+
+pub fn filter_quick_items<'a>(items: &'a [QuickItem], query: &str) -> Vec<&'a QuickItem> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return items.iter().collect();
+    }
+    items
+        .iter()
+        .filter(|item| {
+            item.name.to_lowercase().contains(&q) || item.command.to_lowercase().contains(&q)
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Schedule {
     pub id: u64,
     pub date: String,        // "YYYY-MM-DD"
@@ -231,8 +343,7 @@ pub fn days_in_month(year: i32, month: u32) -> u32 {
 pub fn weekday_of(year: i32, month: u32, day: u32) -> u32 {
     let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let y = if month < 3 { year - 1 } else { year };
-    ((y + y / 4 - y / 100 + y / 400 + t[(month.clamp(1, 12) - 1) as usize] + day as i32) % 7)
-        as u32
+    ((y + y / 4 - y / 100 + y / 400 + t[(month.clamp(1, 12) - 1) as usize] + day as i32) % 7) as u32
 }
 
 pub fn first_weekday_of_month(year: i32, month: u32) -> u32 {
@@ -836,12 +947,18 @@ mod tests {
         assert_eq!(parse_time("930"), None);
         assert_eq!(parse_time("Lunch"), None);
         assert_eq!(format_time(570), "09:30");
-        assert_eq!(split_leading_time("9:30 Standup"), (Some(570), None, "Standup".into()));
+        assert_eq!(
+            split_leading_time("9:30 Standup"),
+            (Some(570), None, "Standup".into())
+        );
         assert_eq!(
             split_leading_time("9:30-10:15 Design review"),
             (Some(570), Some(615), "Design review".into())
         );
-        assert_eq!(split_leading_time("Lunch with the team"), (None, None, "Lunch with the team".into()));
+        assert_eq!(
+            split_leading_time("Lunch with the team"),
+            (None, None, "Lunch with the team".into())
+        );
         assert_eq!(split_leading_time("12:00"), (None, None, "12:00".into()));
         assert!(is_valid_time("23:59"));
         assert!(is_valid_time("")); // optional
@@ -878,5 +995,35 @@ mod tests {
         assert_eq!(parsed_malformed.len(), 1);
         assert_eq!(parsed_malformed[0].id, 12);
         assert_eq!(parsed_malformed[0].title, "Valid Event");
+    }
+
+    #[test]
+    fn test_quick_items() {
+        let defaults = default_quick_items();
+        assert!(!defaults.is_empty());
+        assert!(defaults.iter().any(|item| item.name == "Notepad"));
+        assert!(defaults.iter().any(|item| item.name == "Calculator"));
+
+        let formatted = format_quick_items(&defaults);
+        let parsed = parse_quick_items(&formatted);
+        assert_eq!(parsed, defaults);
+
+        // Test filtering
+        let filtered = filter_quick_items(&defaults, "note");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "Notepad");
+
+        let filtered_calc = filter_quick_items(&defaults, "calc");
+        assert_eq!(filtered_calc.len(), 1);
+        assert_eq!(filtered_calc[0].name, "Calculator");
+
+        let empty_filter = filter_quick_items(&defaults, "");
+        assert_eq!(empty_filter.len(), defaults.len());
+
+        // Single string fallback
+        let single = parse_quick_items("code.exe\n");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].name, "code.exe");
+        assert_eq!(single[0].command, "code.exe");
     }
 }

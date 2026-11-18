@@ -544,6 +544,74 @@ impl Renderer {
         GdipFlush(self.graphics, 1);
         true
     }
+    /// Draws an icon directly from a BGRA pixel slice, clipped to a rounded rectangle or circle.
+    pub unsafe fn draw_icon_slice(
+        &self,
+        pixels: &[u32],
+        x: f64,
+        y: f64,
+        size: f64,
+        radius: f64,
+        opacity: f64,
+    ) -> bool {
+        let n = crate::notify::ICON_PX;
+        if pixels.len() != n * n || self.attr.is_null() || opacity <= 0. {
+            return false;
+        }
+        let mut bitmap = null_mut();
+        if GdipCreateBitmapFromScan0(
+            n as i32,
+            n as i32,
+            n as i32 * 4,
+            0xE200B,
+            pixels.as_ptr() as *mut _,
+            &mut bitmap,
+        ) != 0
+            || bitmap.is_null()
+        {
+            return false;
+        }
+        let matrix: [f32; 25] = [
+            1., 0., 0., 0., 0.,
+            0., 1., 0., 0., 0.,
+            0., 0., 1., 0., 0.,
+            0., 0., 0., opacity.min(1.) as f32, 0.,
+            0., 0., 0., 0., 1.,
+        ];
+        GdipSetImageAttributesColorMatrix(self.attr, 0, 1, matrix.as_ptr(), null_mut(), 0);
+        if radius > 0. {
+            self.rounded(x, y, size, size, radius);
+            GdipSetClipPath(self.graphics, self.path, 0);
+        }
+        let nf = n as f32;
+        let (dx, dy, ds) = (
+            x as f32 * self.scale,
+            y as f32 * self.scale,
+            size as f32 * self.scale,
+        );
+        GdipDrawImageRectRect(
+            self.graphics,
+            bitmap,
+            dx,
+            dy,
+            ds,
+            ds,
+            0.,
+            0.,
+            nf,
+            nf,
+            2,
+            self.attr,
+            null_mut(),
+            null_mut(),
+        );
+        if radius > 0. {
+            GdipResetClip(self.graphics);
+        }
+        GdipDisposeImage(bitmap);
+        GdipFlush(self.graphics, 1);
+        true
+    }
     /// Fills the rounded artwork into its own small premultiplied bitmap at the given sub-pixel phase.
     unsafe fn render_art(
         &self,

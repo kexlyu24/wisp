@@ -126,7 +126,14 @@ fn run_spotifast(args: &[&str]) -> Option<String> {
 /// Spotifast's volume from `spotifast now-playing --raw`: tab-separated state, title, artist,
 /// album, position ms, duration ms, then the volume in percent (0 while muted).
 pub fn parse_spotifast_volume(raw: &str) -> Option<f32> {
-    let percent: f64 = raw.lines().next()?.split('\t').nth(6)?.trim().parse().ok()?;
+    let percent: f64 = raw
+        .lines()
+        .next()?
+        .split('\t')
+        .nth(6)?
+        .trim()
+        .parse()
+        .ok()?;
     Some(map_from_spotifast_range(percent))
 }
 
@@ -687,15 +694,9 @@ impl Volume {
             spotify: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new("spotify.exe"))),
             spotifast: Arc::new(Mutex::new(SpotifastVolumeAdapter::new())),
             apple_music: Arc::new(Mutex::new(AppleMusicVolumeAdapter::new())),
-            chrome: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
-                "chrome.exe",
-            ))),
-            edge: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
-                "msedge.exe",
-            ))),
-            soundcloud: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new(
-                "soundcloud.exe",
-            ))),
+            chrome: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new("chrome.exe"))),
+            edge: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new("msedge.exe"))),
+            soundcloud: Arc::new(Mutex::new(AudioSessionVolumeAdapter::new("soundcloud.exe"))),
         }
     }
 
@@ -965,8 +966,6 @@ mod tests {
 
     #[test]
     fn test_range_mapping() {
-
-
         assert!((map_to_spotifast_range(0.75) - 75.0).abs() < 1e-6);
         assert_eq!(map_to_spotifast_range(-0.1), 0.0);
         assert_eq!(map_to_spotifast_range(1.2), 100.0);
@@ -1085,7 +1084,9 @@ mod tests {
     fn live_spotify_session() {
         let mut vol = Volume::none();
         vol.refresh("spotify");
-        let (before, muted) = vol.get().expect("Spotify must be running with an audio session");
+        let (before, muted) = vol
+            .get()
+            .expect("Spotify must be running with an audio session");
         println!("before {before:.2} muted {muted}");
         vol.set_level(before / 2.);
         let sessions = find_app_audio_sessions("spotify.exe");
@@ -1280,5 +1281,4 @@ mod tests {
             }
         }
     }
-
 }

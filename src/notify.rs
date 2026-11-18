@@ -23,6 +23,7 @@ type Handle = *mut c_void;
 /// Icons are handed over as `ICON_PX`² premultiplied BGRA pixels.
 pub const ICON_PX: usize = 96;
 
+#[derive(Clone, Debug)]
 pub struct Notice {
     /// Application User Model ID; `shell:AppsFolder\<aumid>` opens the app.
     pub aumid: String,
@@ -34,6 +35,7 @@ pub struct Notice {
     pub picture: bool,
     /// The sender asked for a circular crop (`hint-crop="circle"`).
     pub circle: bool,
+    pub arrival: i64,
 }
 
 static MODULE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| unsafe {
@@ -63,10 +65,19 @@ sqlite! {
     fn sqlite3_column_text(stmt: Handle, column: i32) -> *const u8;
     fn sqlite3_column_bytes(stmt: Handle, column: i32) -> i32;
     fn sqlite3_finalize(stmt: Handle) -> i32;
+    fn sqlite3_close_v2(db: Handle) -> i32;
 }
 const ROW: i32 = 100;
+const DONE: i32 = 101;
 
 struct Db(Handle);
+impl Drop for Db {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { sqlite3_close_v2(self.0) };
+        }
+    }
+}
 impl Db {
     unsafe fn open() -> Option<Self> {
         let path = std::env::var("LOCALAPPDATA").ok()?
@@ -80,10 +91,11 @@ impl Db {
         if sqlite3_open_v2(name.as_ptr(), &mut db, 1, std::ptr::null())? != 0 || db.is_null() {
             return None;
         }
-        sqlite3_busy_timeout(db, 250);
+        sqlite3_busy_timeout(db, 1000);
         Some(Self(db))
     }
     /// Runs `sql` with `?1` bound to `arg`, calling `row` for each result row.
+    /// Returns true only if the query completes normally (reaches SQLITE_DONE).
     unsafe fn query(&self, sql: &str, arg: i64, mut row: impl FnMut(Handle)) -> bool {
         let sql = format!("{sql}\0");
         let mut stmt = null_mut();
@@ -93,11 +105,15 @@ impl Db {
             return false;
         }
         sqlite3_bind_int64(stmt, 1, arg);
-        while sqlite3_step(stmt) == Some(ROW) {
+        let mut status;
+        while {
+            status = sqlite3_step(stmt);
+            status == Some(ROW)
+        } {
             row(stmt);
         }
         sqlite3_finalize(stmt);
-        true
+        status == Some(DONE)
     }
 }
 
@@ -116,10 +132,10 @@ unsafe fn column_bytes(stmt: Handle, column: i32, blob: bool) -> Vec<u8> {
 }
 
 /// Worker that reports each new toast once. Notifications already in the database at start-up
-/// are skipped, as are ones that arrived more than 30 s before they were seen.
-pub fn start() -> Receiver<Notice> {
+/// are skipped. If `initial_last` is provided, it starts tracking from that Order baseline.
+pub fn start(initial_last: Option<i64>) -> Receiver<Notice> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || unsafe { run(tx) });
+    std::thread::spawn(move || unsafe { run(tx, initial_last) });
     rx
 }
 
@@ -140,15 +156,34 @@ const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
 const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
 const WAIT_OBJECT_0: u32 = 0;
 
-unsafe fn run(tx: Sender<Notice>) {
+unsafe fn run(tx: Sender<Notice>, initial_last: Option<i64>) {
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    let Some(db) = Db::open() else { return };
-    let mut last = 0i64;
-    db.query(
-        "select max([Order]) from Notification where ?1=?1",
-        0,
-        |stmt| last = sqlite3_column_int64(stmt, 0).unwrap_or(0),
-    );
+    let mut db = loop {
+        if let Some(db) = Db::open() {
+            break db;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    };
+    let mut last = match initial_last {
+        Some(l) => l,
+        None => {
+            let mut l = 0i64;
+            loop {
+                let mut initialized = false;
+                if db.query(
+                    "select max([Order]) from Notification where ?1=?1",
+                    0,
+                    |stmt| {
+                        l = sqlite3_column_int64(stmt, 0).unwrap_or(0);
+                        initialized = true;
+                    },
+                ) && initialized {
+                    break l;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
     let mut apps: HashMap<String, (String, Option<Vec<u32>>)> = HashMap::new();
 
     let notif_dir = std::env::var("LOCALAPPDATA").ok().map(|d| {
@@ -162,37 +197,33 @@ unsafe fn run(tx: Sender<Notice>) {
         .map(|p| {
             FindFirstChangeNotificationW(
                 p.as_ptr(),
-                0,
+                1,
                 FILE_NOTIFY_CHANGE_FILE_NAME
                     | FILE_NOTIFY_CHANGE_LAST_WRITE
                     | FILE_NOTIFY_CHANGE_SIZE,
             )
         })
         .unwrap_or(std::ptr::null_mut());
-    let valid_handle = !change_handle.is_null() && change_handle as isize != -1;
+    let mut valid_handle = !change_handle.is_null() && change_handle as isize != -1;
 
+    let mut consecutive_errors = 0;
     loop {
-        let mut woke_by_change = false;
         if valid_handle {
-            let res = WaitForSingleObject(change_handle, 2000);
+            let res = WaitForSingleObject(change_handle, 500);
             if res == WAIT_OBJECT_0 {
                 FindNextChangeNotification(change_handle);
-                woke_by_change = true;
+            } else if res != 0x102 {
+                valid_handle = false;
             }
         } else {
-            std::thread::sleep(Duration::from_millis(1500));
-            woke_by_change = true;
-        }
-
-        if !woke_by_change {
-            continue;
+            std::thread::sleep(Duration::from_millis(500));
         }
 
         let mut rows = Vec::new();
         let ok = db.query(
-            "select n.[Order], h.PrimaryId, n.Payload, n.ArrivalTime from Notification n \
-             join NotificationHandler h on h.RecordId = n.HandlerId \
-             where n.[Order] > ?1 and n.Type = 'toast' order by n.[Order]",
+            "select n.[Order], coalesce(h.PrimaryId, ''), n.Payload, n.ArrivalTime from Notification n \
+             left join NotificationHandler h on h.RecordId = n.HandlerId \
+             where n.[Order] > ?1 and lower(n.Type) = 'toast' order by n.[Order]",
             last,
             |stmt| {
                 rows.push((
@@ -204,13 +235,19 @@ unsafe fn run(tx: Sender<Notice>) {
             },
         );
         if !ok {
+            consecutive_errors += 1;
+            if consecutive_errors >= 5 {
+                if let Some(new_db) = Db::open() {
+                    db = new_db;
+                    consecutive_errors = 0;
+                }
+            }
             continue;
         }
+        consecutive_errors = 0;
+
         for (order, aumid, payload, arrival) in rows {
             last = last.max(order);
-            if filetime_now() - arrival > 30 * 10_000_000 {
-                continue;
-            }
             let Some(toast) = parse_toast(&payload) else {
                 continue;
             };
@@ -218,15 +255,25 @@ unsafe fn run(tx: Sender<Notice>) {
                 .entry(aumid.clone())
                 .or_insert_with(|| app_info(&aumid))
                 .clone();
+            let title = if toast.title.is_empty() {
+                if !app.is_empty() {
+                    app.clone()
+                } else {
+                    "Notification".to_string()
+                }
+            } else {
+                toast.title
+            };
             let picture = toast.image.as_deref().and_then(load_picture);
             let notice = Notice {
                 app,
-                title: toast.title,
+                title,
                 body: toast.body,
                 picture: picture.is_some(),
                 icon: picture.or(app_icon),
                 circle: toast.circle,
                 aumid,
+                arrival,
             };
             if tx.send(notice).is_err() {
                 if valid_handle {
@@ -235,6 +282,91 @@ unsafe fn run(tx: Sender<Notice>) {
                 return;
             }
         }
+    }
+}
+
+/// Loads the most recent toast notifications from Windows Action Center database,
+/// returning the notices and the highest [Order] encountered.
+pub fn load_recent_with_order(limit: usize) -> (Vec<Notice>, i64) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Some(db) = Db::open() else {
+            return (Vec::new(), 0);
+        };
+        let mut rows = Vec::new();
+        let mut max_order = 0i64;
+        db.query(
+            "select n.[Order], coalesce(h.PrimaryId, ''), n.Payload, n.ArrivalTime from Notification n \
+             left join NotificationHandler h on h.RecordId = n.HandlerId \
+             where lower(n.Type) = 'toast' order by n.[Order] desc limit ?1",
+            limit as i64,
+            |stmt| {
+                let order = sqlite3_column_int64(stmt, 0).unwrap_or(0);
+                max_order = max_order.max(order);
+                rows.push((
+                    String::from_utf8_lossy(&column_bytes(stmt, 1, false)).into_owned(),
+                    String::from_utf8_lossy(&column_bytes(stmt, 2, true)).into_owned(),
+                    sqlite3_column_int64(stmt, 3).unwrap_or(0),
+                ));
+            },
+        );
+        let mut apps: HashMap<String, (String, Option<Vec<u32>>)> = HashMap::new();
+        let mut notices = Vec::with_capacity(rows.len());
+        for (aumid, payload, arrival) in rows {
+            let Some(toast) = parse_toast(&payload) else {
+                continue;
+            };
+            let (app, app_icon) = apps
+                .entry(aumid.clone())
+                .or_insert_with(|| app_info(&aumid))
+                .clone();
+            let title = if toast.title.is_empty() {
+                if !app.is_empty() {
+                    app.clone()
+                } else {
+                    "Notification".to_string()
+                }
+            } else {
+                toast.title
+            };
+            let picture = toast.image.as_deref().and_then(load_picture);
+            notices.push(Notice {
+                app,
+                title,
+                body: toast.body,
+                picture: picture.is_some(),
+                icon: picture.or(app_icon),
+                circle: toast.circle,
+                aumid,
+                arrival,
+            });
+        }
+        (notices, max_order)
+    }
+}
+
+/// Loads the most recent toast notifications from Windows Action Center database.
+#[allow(dead_code)]
+pub fn load_recent(limit: usize) -> Vec<Notice> {
+    load_recent_with_order(limit).0
+}
+
+/// Formats a Windows FILETIME into a friendly relative time ("now", "5m ago", "2h ago", "1d ago").
+pub fn relative_time(arrival: i64) -> String {
+    if arrival <= 0 {
+        return "now".to_string();
+    }
+    let now = filetime_now();
+    let diff = now.saturating_sub(arrival);
+    let sec = diff / 10_000_000;
+    if sec < 60 {
+        "now".to_string()
+    } else if sec < 3600 {
+        format!("{}m ago", sec / 60)
+    } else if sec < 86400 {
+        format!("{}h ago", sec / 3600)
+    } else {
+        format!("{}d ago", sec / 86400)
     }
 }
 
@@ -254,51 +386,97 @@ pub struct Toast {
     pub circle: bool,
 }
 
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let nbytes = needle.as_bytes();
+    let nlen = nbytes.len();
+    if haystack.len() < nlen {
+        return None;
+    }
+    haystack.as_bytes().windows(nlen).position(|w| {
+        w.iter()
+            .zip(nbytes)
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
+    })
+}
+
 /// Reads the visible text of a toast's XML: the first `<text>` is the title, the rest the body.
+/// Robust against missing elements, attribution text, uppercase tags, and header titles.
 pub fn parse_toast(xml: &str) -> Option<Toast> {
-    let binding = xml.find("<binding").map(|i| &xml[i..]).unwrap_or(xml);
+    let binding = find_ignore_case(xml, "<binding")
+        .map(|i| &xml[i..])
+        .unwrap_or(xml);
     let mut texts = Vec::new();
+    let mut attributions = Vec::new();
     let mut rest = binding;
-    while let Some(start) = rest.find("<text") {
+    while let Some(start) = find_ignore_case(rest, "<text") {
         let after = &rest[start + 5..];
         let Some(open_end) = after.find('>') else {
             break;
         };
         let attrs = &after[..open_end];
-        if attrs.ends_with('/') {
+        if attrs.trim().ends_with('/') {
             rest = &after[open_end + 1..];
             continue;
         }
         let content = &after[open_end + 1..];
-        let Some(close) = content.find("</text>") else {
+        let Some(close) = find_ignore_case(content, "</text>") else {
             break;
         };
         let text = unescape_xml(&content[..close]);
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() && !attrs.contains("placement=\"attribution\"") {
-            texts.push(text);
+        if !text.is_empty() {
+            if find_ignore_case(attrs, "placement=\"attribution\"").is_some() {
+                attributions.push(text);
+            } else {
+                texts.push(text);
+            }
         }
         rest = &content[close + 7..];
     }
-    let mut texts = texts.into_iter();
-    let title = texts.next()?;
-    let body = texts.collect::<Vec<_>>().join(" · ");
+    if texts.is_empty() && !attributions.is_empty() {
+        texts = attributions;
+    }
+    if texts.is_empty() {
+        if let Some(h_start) = find_ignore_case(xml, "<header") {
+            let h_end = xml[h_start..].find('>').map_or(xml.len(), |e| h_start + e);
+            let header_tag = &xml[h_start..h_end];
+            if let Some(t) = attribute(header_tag, "title") {
+                let clean = unescape_xml(t);
+                let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !clean.is_empty() {
+                    texts.push(clean);
+                }
+            }
+        }
+    }
+    let title = if !texts.is_empty() {
+        texts.remove(0)
+    } else {
+        String::new()
+    };
+    let body = texts.join(" · ");
     let mut image = None;
     let mut circle = false;
     let mut from = 0;
-    while let Some(i) = xml[from..].find("<image") {
+    while let Some(i) = find_ignore_case(&xml[from..], "<image") {
         let tag_start = from + i;
         let tag = &xml[tag_start
             ..xml[tag_start..]
                 .find('>')
                 .map_or(xml.len(), |e| tag_start + e)];
         from = tag_start + 6;
-        if !tag.contains("placement=\"appLogoOverride\"") {
+        if find_ignore_case(tag, "placement=\"appLogoOverride\"").is_none() {
             continue;
         }
-        circle = tag.contains("hint-crop=\"circle\"");
+        circle = find_ignore_case(tag, "hint-crop=\"circle\"").is_some();
         image = attribute(tag, "src").and_then(|src| local_path(&unescape_xml(src)));
         break;
+    }
+    if title.is_empty() && body.is_empty() && image.is_none() {
+        return None;
     }
     Some(Toast {
         title,
@@ -310,17 +488,21 @@ pub fn parse_toast(xml: &str) -> Option<Toast> {
 
 fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let key = format!("{name}=\"");
-    let start = tag.find(&key)? + key.len();
+    let start = find_ignore_case(tag, &key)? + key.len();
     let end = tag[start..].find('"')? + start;
     Some(&tag[start..end])
 }
 
 /// `C:\…` or `file:///C:/…` (percent-encoded) become a local path; web and app-data URIs are skipped.
 fn local_path(src: &str) -> Option<String> {
-    let path = if let Some(rest) = src.strip_prefix("file:///") {
-        percent_decode(rest).replace('/', "\\")
-    } else if src.len() > 2 && src.as_bytes()[1] == b':' {
-        src.to_string()
+    let raw = src.trim();
+    let lower = raw.to_ascii_lowercase();
+    let path = if lower.starts_with("file:///") {
+        percent_decode(&raw[8..]).replace('/', "\\")
+    } else if lower.starts_with("file://") {
+        percent_decode(&raw[7..]).replace('/', "\\")
+    } else if raw.len() > 2 && raw.as_bytes()[1] == b':' {
+        raw.to_string()
     } else {
         return None;
     };
@@ -523,6 +705,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formats_relative_time() {
+        assert_eq!(relative_time(0), "now");
+        let now = filetime_now();
+        assert_eq!(relative_time(now), "now");
+        // 5 seconds ago
+        assert_eq!(relative_time(now - 5 * 10_000_000), "now");
+        // 5 minutes ago
+        assert_eq!(relative_time(now - 5 * 60 * 10_000_000), "5m ago");
+        // 2 hours ago
+        assert_eq!(relative_time(now - 2 * 3600 * 10_000_000), "2h ago");
+        // 3 days ago
+        assert_eq!(relative_time(now - 3 * 86400 * 10_000_000), "3d ago");
+    }
+
+    #[test]
     fn reads_title_body_and_logo() {
         let xml = r#"<toast><visual><binding template="ToastGeneric"><text>Mira &amp; Co</text><text>Hey, are you
             coming?</text><text placement="attribution">via Web</text><image placement="appLogoOverride" hint-crop="circle" src="file:///C:/Users/Me/avatar%20one.png"/></binding></visual></toast>"#;
@@ -549,10 +746,42 @@ mod tests {
         .is_none());
         let web = parse_toast(r#"<toast><visual><binding><text>A</text><image placement="appLogoOverride" src="https://x/y.png"/></binding></visual></toast>"#).unwrap();
         assert_eq!(web.image, None);
+        let spaced_empty = parse_toast(r#"<toast><visual><binding><text>Title</text><text id="1" /><text>Body</text></binding></visual></toast>"#).unwrap();
+        assert_eq!(spaced_empty.title, "Title");
+        assert_eq!(spaced_empty.body, "Body");
+        assert_eq!(local_path("file:///C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("file://C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("C:\\path\\to\\img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(local_path("https://example.com/a.png"), None);
         assert_eq!(
             unescape_xml("&#x1F44B; &#65; &bogus; &"),
             "\u{1F44B} A &bogus; &"
         );
+    }
+
+    #[test]
+    fn test_parse_toast_robustness() {
+        // Uppercase tags
+        let upper = r#"<TOAST><Visual><Binding><TEXT>Upper Title</TEXT><Text>Upper Body</Text></Binding></Visual></TOAST>"#;
+        let t1 = parse_toast(upper).expect("should parse uppercase tags");
+        assert_eq!(t1.title, "Upper Title");
+        assert_eq!(t1.body, "Upper Body");
+
+        // Attribution-only toast
+        let attr = r#"<toast><visual><binding><text placement="attribution">via Web</text></binding></visual></toast>"#;
+        let t2 = parse_toast(attr).expect("should parse attribution-only toast");
+        assert_eq!(t2.title, "via Web");
+
+        // Header-only toast
+        let header = r#"<toast><header id="category" title="System Alert"/><visual><binding></binding></visual></toast>"#;
+        let t3 = parse_toast(header).expect("should parse header title");
+        assert_eq!(t3.title, "System Alert");
+
+        // Image-only toast
+        let img = r#"<toast><visual><binding><image placement="appLogoOverride" src="C:\path\img.png"/></binding></visual></toast>"#;
+        let t4 = parse_toast(img).expect("should parse image-only toast");
+        assert_eq!(t4.title, "");
+        assert_eq!(t4.image.as_deref(), Some("C:\\path\\img.png"));
     }
 }
 
@@ -563,14 +792,48 @@ mod live {
     /// Reads this PC's notification database: `cargo test live_notifications -- --ignored --nocapture`.
     #[test]
     #[ignore]
+    fn test_start_receives_toast() {
+        let rx = start(None);
+        // Give worker thread a moment to initialize and query max order
+        std::thread::sleep(Duration::from_millis(500));
+        let title_rand = format!("WispTest_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        let cmd = format!(r#"
+            $template = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);
+            $texts = $template.GetElementsByTagName('text');
+            $texts.Item(0).AppendChild($template.CreateTextNode('{title_rand}')) | Out-Null;
+            $texts.Item(1).AppendChild($template.CreateTextNode('Testing live delivery')) | Out-Null;
+            $toast = [Windows.UI.Notifications.ToastNotification]::new($template);
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WispTestApp').Show($toast);
+        "#);
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &cmd])
+            .output();
+
+        let start_time = std::time::Instant::now();
+        let mut found = false;
+        while start_time.elapsed() < Duration::from_secs(4) {
+            if let Ok(notice) = rx.recv_timeout(Duration::from_millis(500)) {
+                println!("Received notice: {} - {}", notice.title, notice.body);
+                if notice.title == title_rand {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Notification should be received by start() receiver!");
+    }
+
+    #[test]
+    #[ignore]
     fn live_notifications() {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let db = Db::open().expect("notification database");
             let mut rows = Vec::new();
             assert!(db.query(
-                "select h.PrimaryId, n.Payload from Notification n join NotificationHandler h on h.RecordId = n.HandlerId \
-                 where n.Type = 'toast' order by n.[Order] desc limit ?1",
+                "select coalesce(h.PrimaryId, ''), n.Payload from Notification n \
+                 left join NotificationHandler h on h.RecordId = n.HandlerId \
+                 where lower(n.Type) = 'toast' order by n.[Order] desc limit ?1",
                 5,
                 |stmt| rows.push((String::from_utf8_lossy(&column_bytes(stmt, 0, false)).into_owned(), String::from_utf8_lossy(&column_bytes(stmt, 1, true)).into_owned())),
             ));
