@@ -6,6 +6,7 @@ mod notify;
 mod render;
 mod settings;
 mod tasks;
+mod todo_input;
 mod tray;
 mod volume;
 use std::{ffi::c_void, mem::size_of, ptr::null_mut};
@@ -109,6 +110,7 @@ extern "system" {
     fn TrackMouseEvent(event: *mut MouseTracking) -> i32;
     fn MessageBeep(kind: u32) -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    fn GetKeyState(key: i32) -> i16;
     fn SystemParametersInfoW(action: u32, param: u32, value: *mut c_void, flags: u32) -> i32;
     fn UpdateLayeredWindow(
         hwnd: Hwnd,
@@ -187,6 +189,8 @@ extern "system" {
         offset: u32,
     ) -> Handle;
     fn GdiFlush() -> i32;
+    fn SaveDC(dc: Handle) -> i32;
+    fn RestoreDC(dc: Handle, saved: i32) -> i32;
     fn IntersectClipRect(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     fn SelectClipRgn(dc: Handle, region: Handle) -> i32;
     fn GetTextExtentPoint32W(dc: Handle, text: *const u16, len: i32, size: *mut Size) -> i32;
@@ -731,6 +735,8 @@ struct State {
     wheel_acc: f64,
     todos: Vec<tasks::Todo>,
     todo_input: String,
+    todo_editor: todo_input::Editor,
+    input_editors: [todo_input::Editor; 4],
     todo_editing: bool,
     todo_scroll: usize,
     quick_items: Vec<tasks::QuickItem>,
@@ -757,7 +763,6 @@ struct State {
     /// The date whose list `agenda_t` animates in.
     agenda_key: (i32, u32, u32),
     cal_scroll: usize,
-    high_surrogate: u16,
     pomo: tasks::Pomodoro,
     timer_t: f64,
     timer_vel: f64,
@@ -1010,6 +1015,8 @@ impl State {
                 tasks::load_todos()
             },
             todo_input: String::new(),
+            todo_editor: Default::default(),
+            input_editors: [100, 80, 80, 80].map(todo_input::Editor::with_limit),
             todo_editing: false,
             todo_scroll: 0,
             quick_items: if smoke {
@@ -1045,7 +1052,6 @@ impl State {
             agenda_v: 0.,
             agenda_key: (0, 0, 0),
             cal_scroll: 0,
-            high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
             timer_t: 0.,
             timer_vel: 0.,
@@ -1591,9 +1597,8 @@ impl State {
             .min(self.todos.len().saturating_sub(TODO_ROWS));
     }
     fn push_input(&mut self, ch: char) {
-        if self.todo_input.chars().count() < 120 {
-            self.todo_input.push(ch);
-        }
+        self.todo_editor
+            .replace(&mut self.todo_input, ch.encode_utf8(&mut [0; 4]));
     }
     fn commit_todo(&mut self) {
         let text = self.todo_input.trim().to_string();
@@ -1602,10 +1607,68 @@ impl State {
         }
         self.todos.push(tasks::Todo { text, done: false });
         self.todo_input.clear();
+        self.todo_editor = Default::default();
         self.todo_scroll = self.todos.len().saturating_sub(TODO_ROWS);
         self.save_todos();
     }
+    fn active_input(&self) -> Option<usize> {
+        match self.active_tab {
+            TAB_TODO if self.todo_editing => Some(0),
+            TAB_CAL if self.cal_editing => Some(1),
+            TAB_QUICK if self.quick_editing => Some(2),
+            TAB_QUICK if self.quick_add_mode => Some(3 + self.quick_add_field),
+            _ => None,
+        }
+    }
+    fn input_mut(&mut self, id: usize) -> (&mut String, &mut todo_input::Editor) {
+        match id {
+            0 => (&mut self.todo_input, &mut self.todo_editor),
+            1 => (&mut self.cal_input, &mut self.input_editors[0]),
+            2 => (&mut self.quick_input, &mut self.input_editors[1]),
+            3 => (&mut self.quick_name_input, &mut self.input_editors[2]),
+            4 => (&mut self.quick_cmd_input, &mut self.input_editors[3]),
+            _ => unreachable!(),
+        }
+    }
+    fn input_geometry(id: usize) -> (usize, f64, f64) {
+        match id {
+            0 => (1, 52., TODO_W - 88.),
+            1 => (1, AGENDA_X + 28., AGENDA_W - 36.),
+            2 => (1, 54., QUICK_W - 174.),
+            _ => (2, 46., QUICK_W - 92.),
+        }
+    }
+    unsafe fn input_pointer(&mut self, id: usize, x: f64, extend: bool) {
+        let (font, left, width) = Self::input_geometry(id);
+        let (text, editor) = self.input_mut(id);
+        let (text, caret) = (text.clone(), editor.caret);
+        let caret_x = text_width(self.dc, self, font, &text[..caret]);
+        let total = text_width(self.dc, self, font, &text);
+        let scroll = self.input_mut(id).1.viewport(caret_x, total, width - 3.);
+        let pos = todo_input::Editor::hit(&text, x - left + scroll, |prefix| {
+            text_width(self.dc, self, font, prefix)
+        });
+        let (text, editor) = self.input_mut(id);
+        editor.move_to(text, pos, extend);
+    }
+    fn end_input_drag(&mut self) {
+        self.todo_editor.end_interaction();
+        for editor in &mut self.input_editors {
+            editor.end_interaction();
+        }
+    }
+    fn dragging_input(&self) -> Option<usize> {
+        if self.todo_editor.dragging {
+            Some(0)
+        } else {
+            self.input_editors
+                .iter()
+                .position(|e| e.dragging)
+                .map(|i| i + 1)
+        }
+    }
     unsafe fn todo_click(&mut self, hwnd: Hwnd, hit: i32) {
+        self.todo_editor.end_interaction();
         match hit {
             1000 => {
                 self.todo_editing = true;
@@ -1726,11 +1789,14 @@ impl State {
             tasks::save_quick_items(&self.quick_items);
         }
         self.quick_name_input.clear();
+        self.input_editors[2] = todo_input::Editor::with_limit(80);
         self.quick_cmd_input.clear();
+        self.input_editors[3] = todo_input::Editor::with_limit(80);
         self.quick_add_mode = false;
         self.quick_add_field = 0;
     }
     unsafe fn quick_click(&mut self, hwnd: Hwnd, hit: i32) {
+        self.end_input_drag();
         match hit {
             6000 => {
                 self.quick_editing = true;
@@ -1740,13 +1806,16 @@ impl State {
             }
             6001 => {
                 self.quick_input.clear();
+                self.input_editors[1] = todo_input::Editor::with_limit(80);
                 self.quick_scroll = 0;
             }
             6002 => {
                 self.quick_add_mode = !self.quick_add_mode;
                 self.quick_editing = false;
                 self.quick_name_input.clear();
+                self.input_editors[2] = todo_input::Editor::with_limit(80);
                 self.quick_cmd_input.clear();
+                self.input_editors[3] = todo_input::Editor::with_limit(80);
                 self.quick_add_field = 0;
                 if self.quick_add_mode {
                     SetForegroundWindow(hwnd);
@@ -1769,7 +1838,9 @@ impl State {
             6013 => {
                 self.quick_add_mode = false;
                 self.quick_name_input.clear();
+                self.input_editors[2] = todo_input::Editor::with_limit(80);
                 self.quick_cmd_input.clear();
+                self.input_editors[3] = todo_input::Editor::with_limit(80);
             }
             6099 => {
                 let cmd = self.quick_input.trim().to_string();
@@ -1899,6 +1970,7 @@ impl State {
     unsafe fn start_new_event(&mut self, hwnd: Hwnd) {
         if !self.cal_editing || self.cal_editing_id.is_some() {
             self.cal_input.clear();
+            self.input_editors[0] = todo_input::Editor::with_limit(100);
             self.cal_editing_id = None;
             self.cal_end.clear();
             let mut now = Time::default();
@@ -1920,6 +1992,7 @@ impl State {
         self.cal_editing = false;
         self.cal_editing_id = None;
         self.cal_input.clear();
+        self.input_editors[0] = todo_input::Editor::with_limit(100);
         self.cal_end.clear();
     }
     /// Moves the picked time by `steps` × 15 minutes, wrapping around midnight.
@@ -1992,6 +2065,8 @@ impl State {
                     let time = tasks::parse_time(&item.start_time);
                     self.cal_editing_id = Some(id);
                     self.cal_input = title;
+                    self.input_editors[0] = todo_input::Editor::with_limit(100);
+                    self.input_editors[0].move_to(&self.cal_input, self.cal_input.len(), false);
                     self.cal_time = time;
                     self.cal_end = end;
                     self.cal_editing = true;
@@ -2172,13 +2247,31 @@ impl State {
                 dt,
             )
         };
-        if self.active_tab != TAB_TODO {
+        if self.dragging_input().is_some()
+            && (self.dragging_input() != self.active_input() || !self.expanded)
+        {
+            unsafe {
+                ReleaseCapture();
+            }
+            self.end_input_drag();
+        }
+        if self.active_tab != TAB_TODO || !self.expanded {
+            if self.todo_editor.dragging {
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+            self.todo_editor.end_interaction();
             self.todo_editing = false;
         }
-        if self.active_tab != TAB_CAL {
+        if self.active_tab != TAB_CAL || !self.expanded {
+            self.input_editors[0].end_interaction();
             self.cal_editing = false;
         }
-        if self.active_tab != TAB_QUICK {
+        if self.active_tab != TAB_QUICK || !self.expanded {
+            self.input_editors[1..]
+                .iter_mut()
+                .for_each(todo_input::Editor::end_interaction);
             self.quick_editing = false;
             self.quick_add_mode = false;
         }
@@ -2371,14 +2464,8 @@ impl State {
                 d.progress = 1.0;
                 dismissing_animating = true;
             } else {
-                dismissing_animating |= spring(
-                    &mut d.progress,
-                    &mut d.velocity,
-                    1.0,
-                    22.,
-                    0.82,
-                    dt,
-                );
+                dismissing_animating |=
+                    spring(&mut d.progress, &mut d.velocity, 1.0, 22., 0.82, dt);
             }
         }
         self.dismissing_notifs.retain(|d| d.progress < 0.98);
@@ -2831,7 +2918,11 @@ impl State {
         self.backdrop_at = Some(std::time::Instant::now());
         let (w, h) = (self.stride, (DIB_H * self.scale).ceil() as usize);
         let x0 = (GetSystemMetrics(0) - w as i32) / 2;
-        let tint = self.renderer.as_ref().and_then(|r| r.tint()).unwrap_or(rgb(210, 210, 215));
+        let tint = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.tint())
+            .unwrap_or(rgb(210, 210, 215));
         let (color, blur) = (style_rgb(style, tint), self.settings.bg_blur);
         let alpha = self.settings.bg_opacity.clamp(50, 100) * 255 / 100;
         let (out, busy) = (self.backdrop.clone(), self.backdrop_busy.clone());
@@ -3541,7 +3632,11 @@ fn style_rgb(style: u32, tint: u32) -> (u32, u32, u32) {
     match style {
         1 => {
             let mix = |t: u32, base: u32| (t * 22 + base * 78) / 100;
-            (mix((tint >> 16) & 255, 14), mix((tint >> 8) & 255, 15), mix(tint & 255, 18))
+            (
+                mix((tint >> 16) & 255, 14),
+                mix((tint >> 8) & 255, 15),
+                mix(tint & 255, 18),
+            )
         }
         0 => (14, 15, 18),
         2 => (26, 27, 30),
@@ -3551,10 +3646,25 @@ fn style_rgb(style: u32, tint: u32) -> (u32, u32, u32) {
 /// Frosted glass from a screen capture `src` (w×h): blurred by `blur` px, on a quarter-size copy
 /// that looks the same at ~1/16 the cost, with the style colour laid over at `alpha` (0..=255).
 /// Returns opaque pixels.
-fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alpha: u32) -> Vec<u32> {
+fn frost(
+    src: &[u32],
+    w: usize,
+    h: usize,
+    blur: u32,
+    tint: (u32, u32, u32),
+    alpha: u32,
+) -> Vec<u32> {
     let mix = |c: f32, t: u32| ((c * (255 - alpha) as f32 + (t * alpha) as f32) / 255.) as u32;
-    let compose = |c: [f32; 3]| 0xff00_0000 | mix(c[0], tint.0) << 16 | mix(c[1], tint.1) << 8 | mix(c[2], tint.2);
-    let channels = |p: u32| [((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32];
+    let compose = |c: [f32; 3]| {
+        0xff00_0000 | mix(c[0], tint.0) << 16 | mix(c[1], tint.1) << 8 | mix(c[2], tint.2)
+    };
+    let channels = |p: u32| {
+        [
+            ((p >> 16) & 255) as f32,
+            ((p >> 8) & 255) as f32,
+            (p & 255) as f32,
+        ]
+    };
     if blur == 0 || w < 8 || h < 8 {
         return src.iter().map(|&p| compose(channels(p))).collect();
     }
@@ -3587,7 +3697,12 @@ fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alph
         let (y0, y1, ty) = axis(y, sh);
         for x in 0..w {
             let (x0, x1, tx) = axis(x, sw);
-            let (a, b, c, d) = (small[y0 * sw + x0], small[y0 * sw + x1], small[y1 * sw + x0], small[y1 * sw + x1]);
+            let (a, b, c, d) = (
+                small[y0 * sw + x0],
+                small[y0 * sw + x1],
+                small[y1 * sw + x0],
+                small[y1 * sw + x1],
+            );
             let px: [f32; 3] = std::array::from_fn(|i| {
                 let top = a[i] + (b[i] - a[i]) * tx;
                 top + (c[i] + (d[i] - c[i]) * tx - top) * ty
@@ -3599,24 +3714,25 @@ fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alph
 }
 /// One horizontal and one vertical box blur of radius `r`, clamping at the edges.
 fn box_blur(buf: &mut [[f32; 3]], w: usize, h: usize, r: usize) {
-    let pass = |buf: &mut [[f32; 3]], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
-        let mut line = vec![[0f32; 3]; len];
-        let n = (2 * r + 1) as f32;
-        for l in 0..lines {
-            (0..len).for_each(|i| line[i] = buf[at(l, i)]);
-            let mut sum = [0f32; 3];
-            for j in 0..=2 * r {
-                let c = line[j.saturating_sub(r).min(len - 1)];
-                (0..3).for_each(|k| sum[k] += c[k]);
+    let pass =
+        |buf: &mut [[f32; 3]], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+            let mut line = vec![[0f32; 3]; len];
+            let n = (2 * r + 1) as f32;
+            for l in 0..lines {
+                (0..len).for_each(|i| line[i] = buf[at(l, i)]);
+                let mut sum = [0f32; 3];
+                for j in 0..=2 * r {
+                    let c = line[j.saturating_sub(r).min(len - 1)];
+                    (0..3).for_each(|k| sum[k] += c[k]);
+                }
+                for i in 0..len {
+                    buf[at(l, i)] = sum.map(|v| v / n);
+                    let add = line[(i + r + 1).min(len - 1)];
+                    let sub = line[i.saturating_sub(r)];
+                    (0..3).for_each(|k| sum[k] += add[k] - sub[k]);
+                }
             }
-            for i in 0..len {
-                buf[at(l, i)] = sum.map(|v| v / n);
-                let add = line[(i + r + 1).min(len - 1)];
-                let sub = line[i.saturating_sub(r)];
-                (0..3).for_each(|k| sum[k] += add[k] - sub[k]);
-            }
-        }
-    };
+        };
     pass(buf, w, h, &|l, i| l * w + i);
     pass(buf, h, w, &|l, i| i * w + l);
 }
@@ -4914,31 +5030,25 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
     round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
     let (tx, tw) = (fx + 28., fw - 36.);
-    let mut shown = s.cal_input.as_str();
-    while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-        let mut chars = shown.chars();
-        chars.next();
-        shown = chars.as_str();
-    }
-    if s.cal_input.is_empty() {
-        let hint = if s.cal_editing {
+    input_text(
+        dc,
+        s,
+        &s.input_editors[0],
+        &s.cal_input,
+        if s.cal_editing {
             "Event title"
         } else {
             "Add an event"
-        };
-        let color = if s.cal_editing { TERTIARY } else { SECONDARY };
-        text_opt(dc, s, 1, hint, color, tx, fy, tw, fh, false, o, dx);
-    } else {
-        text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
-    }
-    if s.cal_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let caret = if shown.is_empty() {
-            0.
-        } else {
-            text_width(dc, s, 1, shown)
-        };
-        round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
-    }
+        },
+        s.cal_editing,
+        1,
+        tx,
+        fy,
+        tw,
+        fh,
+        dx,
+        o,
+    );
 
     // While composing: the time picker and the buttons slide out from under the field.
     // They fade over the second half of the motion, so the list sliding up never shows
@@ -5621,6 +5731,97 @@ fn pomo_hit(x: f64, y: f64) -> i32 {
     -1
 }
 // Apple Reminders-style list: a rounded input field, then rows with a circular checkbox.
+unsafe fn input_text(
+    dc: Handle,
+    s: &State,
+    editor: &todo_input::Editor,
+    text: &str,
+    placeholder: &str,
+    editing: bool,
+    font: usize,
+    tx: f64,
+    fy: f64,
+    tw: f64,
+    fh: f64,
+    dx: f64,
+    o: f64,
+) {
+    let total = text_width(dc, s, font, text);
+    let caret = text_width(dc, s, font, &text[..editor.caret]);
+    let scroll = editor.viewport(caret, total, tw - 3.);
+    let selected = editor.selection();
+    if editing && !selected.is_empty() {
+        let left = (text_width(dc, s, font, &text[..selected.start]) - scroll).clamp(0., tw);
+        let right = (text_width(dc, s, font, &text[..selected.end]) - scroll).clamp(0., tw);
+        round_opt(
+            s,
+            tx + left,
+            fy + 5.,
+            right - left,
+            fh - 10.,
+            2.,
+            BLUE,
+            o,
+            dx,
+        );
+    }
+    let saved = SaveDC(dc);
+    if saved != 0 {
+        let (ox, oy) = s.offset();
+        IntersectClipRect(
+            dc,
+            s.px(tx + ox + dx),
+            s.px(fy + oy),
+            s.px(tx + tw + ox + dx),
+            s.px(fy + fh + oy),
+        );
+        if text.is_empty() {
+            text_opt(
+                dc,
+                s,
+                font,
+                placeholder,
+                TERTIARY,
+                tx,
+                fy,
+                tw,
+                fh,
+                false,
+                o,
+                dx,
+            );
+        } else {
+            text_opt(
+                dc,
+                s,
+                font,
+                text,
+                WHITE,
+                tx - scroll,
+                fy,
+                total + 4.,
+                fh,
+                false,
+                o,
+                dx,
+            );
+        }
+        RestoreDC(dc, saved);
+    }
+    if editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+        round_opt(
+            s,
+            tx + (caret - scroll).clamp(0., tw - 2.) + 1.,
+            fy + 7.,
+            1.6,
+            fh - 14.,
+            0.8,
+            BLUE,
+            o,
+            dx,
+        );
+    }
+}
 unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     let (fx, fy, fw, fh) = (24., 44., TODO_W - 48., 30.);
     if s.todo_editing {
@@ -5657,39 +5858,21 @@ unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
     round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
     let (tx, tw) = (fx + 28., fw - 40.);
-    // Long input keeps its tail in view, like a single-line text field.
-    let mut shown = s.todo_input.as_str();
-    while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-        let mut chars = shown.chars();
-        chars.next();
-        shown = chars.as_str();
-    }
-    if s.todo_input.is_empty() {
-        text_opt(
-            dc,
-            s,
-            1,
-            "Add a task",
-            TERTIARY,
-            tx,
-            fy,
-            tw,
-            fh,
-            false,
-            o,
-            dx,
-        );
-    } else {
-        text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
-    }
-    if s.todo_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let caret = if shown.is_empty() {
-            0.
-        } else {
-            text_width(dc, s, 1, shown)
-        };
-        round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
-    }
+    input_text(
+        dc,
+        s,
+        &s.todo_editor,
+        &s.todo_input,
+        "Add a task",
+        s.todo_editing,
+        1,
+        tx,
+        fy,
+        tw,
+        fh,
+        dx,
+        o,
+    );
     let n = s.todos.len();
     if n == 0 {
         text_opt(
@@ -5847,43 +6030,22 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
 
     // Search text / placeholder
     let (tx, tw) = (sx + 30., sw - 54.);
-    if s.quick_input.is_empty() {
-        text_opt(
-            dc,
-            s,
-            1,
-            "Search or run...",
-            TERTIARY,
-            tx,
-            sy + 2.,
-            tw,
-            sh - 4.,
-            false,
-            o,
-            dx,
-        );
-    } else {
-        let mut shown = s.quick_input.as_str();
-        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-            let mut chars = shown.chars();
-            chars.next();
-            shown = chars.as_str();
-        }
-        text_opt(
-            dc,
-            s,
-            1,
-            shown,
-            WHITE,
-            tx,
-            sy + 2.,
-            tw,
-            sh - 4.,
-            false,
-            o,
-            dx,
-        );
-
+    input_text(
+        dc,
+        s,
+        &s.input_editors[1],
+        &s.quick_input,
+        "Search or run...",
+        s.quick_editing,
+        1,
+        tx,
+        sy + 2.,
+        tw,
+        sh - 4.,
+        dx,
+        o,
+    );
+    if !s.quick_input.is_empty() {
         // Clear 'x' button inside search bar
         let clr_hover = s.hover == 6001;
         pill_opt(
@@ -5914,18 +6076,6 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
             o,
             dx,
         );
-    }
-
-    // Caret when search editing
-    if s.quick_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let mut shown = s.quick_input.as_str();
-        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-            let mut chars = shown.chars();
-            chars.next();
-            shown = chars.as_str();
-        }
-        let cw = text_width(dc, s, 1, shown);
-        round_opt(s, tx + cw + 1., sy + 7., 1.5, sh - 14., 0.75, BLUE, o, dx);
     }
 
     // "+ Add" or "Cancel" button
@@ -6019,34 +6169,21 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 dx,
             );
         }
-        let n_txt = if s.quick_name_input.is_empty() {
-            "Name (e.g. Chrome, Discord)"
-        } else {
-            &s.quick_name_input
-        };
-        let n_col = if s.quick_name_input.is_empty() {
-            TERTIARY
-        } else {
-            WHITE
-        };
-        text_opt(
+        input_text(
             dc,
             s,
+            &s.input_editors[2],
+            &s.quick_name_input,
+            "Name (e.g. Chrome, Discord)",
+            n_sel,
             2,
-            n_txt,
-            n_col,
             46.,
-            125.,
+            125.0,
             QUICK_W - 92.,
             22.,
-            false,
-            o,
             dx,
+            o,
         );
-        if n_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-            let nw = text_width(dc, s, 2, &s.quick_name_input);
-            round_opt(s, 46. + nw + 1., 126., 1.5, 20., 0.75, BLUE, o, dx);
-        }
 
         // Field 1: Command / Path
         let c_sel = s.quick_add_field == 1;
@@ -6081,34 +6218,21 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 dx,
             );
         }
-        let c_txt = if s.quick_cmd_input.is_empty() {
-            "Command / Path (e.g. chrome.exe, code, calc)"
-        } else {
-            &s.quick_cmd_input
-        };
-        let c_col = if s.quick_cmd_input.is_empty() {
-            TERTIARY
-        } else {
-            WHITE
-        };
-        text_opt(
+        input_text(
             dc,
             s,
+            &s.input_editors[3],
+            &s.quick_cmd_input,
+            "Command / Path (e.g. chrome.exe, code, calc)",
+            c_sel,
             2,
-            c_txt,
-            c_col,
             46.,
-            161.,
+            161.0,
             QUICK_W - 92.,
             22.,
-            false,
-            o,
             dx,
+            o,
         );
-        if c_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-            let cw = text_width(dc, s, 2, &s.quick_cmd_input);
-            round_opt(s, 46. + cw + 1., 162., 1.5, 20., 0.75, BLUE, o, dx);
-        }
 
         // Cancel and Save buttons
         let cancel_hover = s.hover == 6013;
@@ -6922,7 +7046,17 @@ unsafe fn draw_notif_card(
     } else {
         rgb(26, 26, 28)
     };
-    round_opt(s, card_x, card_y, card_w, card_h, 10., card_bg, card_opacity, extra_dx);
+    round_opt(
+        s,
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        10.,
+        card_bg,
+        card_opacity,
+        extra_dx,
+    );
 
     // Icon
     let icon_size = 32.;
@@ -6940,7 +7074,14 @@ unsafe fn draw_notif_card(
     if let Some(pixels) = notice.icon.as_deref() {
         if let Some(r) = s.renderer.as_ref() {
             let (ox, oy) = s.offset();
-            drawn = r.draw_icon_slice(pixels, icon_x + ox + extra_dx, icon_y + oy, icon_size, radius, card_opacity);
+            drawn = r.draw_icon_slice(
+                pixels,
+                icon_x + ox + extra_dx,
+                icon_y + oy,
+                icon_size,
+                radius,
+                card_opacity,
+            );
         }
     }
     if !drawn {
@@ -7111,7 +7252,8 @@ unsafe fn notif_page(dc: Handle, s: &State, dx: f64, o: f64) {
     }
 
     // Continuous scroll offset based on spring solver
-    let scroll_offset = (s.notif_scroll as f64 - s.notif_scroll_pos) * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+    let scroll_offset =
+        (s.notif_scroll as f64 - s.notif_scroll_pos) * (NOTIF_CARD_H + NOTIF_CARD_GAP);
 
     for k in 0..NOTIF_ROWS {
         let i = s.notif_scroll + k;
@@ -7433,7 +7575,10 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
         s.bg_custom_pixels.as_ref().map(|(w, h, v)| (*w, *h, v))
     } else {
         let dib_h = (DIB_H * s.scale).ceil() as usize;
-        backdrop.as_ref().and_then(|b| b.as_ref()).map(|v| (s.stride, dib_h, v))
+        backdrop
+            .as_ref()
+            .and_then(|b| b.as_ref())
+            .map(|v| (s.stride, dib_h, v))
     };
     match source {
         Some((bw, bh, src)) if bw >= width && bh > 0 => {
@@ -7570,7 +7715,11 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
             rv,
             0.,
         );
-        for (tab, label) in [(TAB_SHELF, "Clear"), (TAB_TODO, "Clear Done"), (TAB_NOTIF, "Clear")] {
+        for (tab, label) in [
+            (TAB_SHELF, "Clear"),
+            (TAB_TODO, "Clear Done"),
+            (TAB_NOTIF, "Clear"),
+        ] {
             let o = mix[tab].0 * rv;
             if o <= 0. || !s.has_clear(tab) {
                 continue;
@@ -8122,11 +8271,23 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
         }
         13 => {
             // bell: top dome and flared sides, bottom rim, and clapper.
-            r.stroke_bezier([p(9., 3.8), p(5.8, 5.5), p(5.2, 10.5), p(3.5, 13.0)], w, color);
-            r.stroke_bezier([p(9., 3.8), p(12.2, 5.5), p(12.8, 10.5), p(14.5, 13.0)], w, color);
+            r.stroke_bezier(
+                [p(9., 3.8), p(5.8, 5.5), p(5.2, 10.5), p(3.5, 13.0)],
+                w,
+                color,
+            );
+            r.stroke_bezier(
+                [p(9., 3.8), p(12.2, 5.5), p(12.8, 10.5), p(14.5, 13.0)],
+                w,
+                color,
+            );
             r.stroke(&[p(2.8, 13.0), p(15.2, 13.0)], false, w, color);
             r.ellipse(x + 9., y + 2.5, 1.2, 1.2, color);
-            r.stroke_bezier([p(7.6, 13.6), p(7.6, 15.6), p(10.4, 15.6), p(10.4, 13.6)], w, color);
+            r.stroke_bezier(
+                [p(7.6, 13.6), p(7.6, 15.6), p(10.4, 15.6), p(10.4, 13.6)],
+                w,
+                color,
+            );
         }
         _ => {}
     }
@@ -8482,6 +8643,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
+                if let Some(id) = s.dragging_input() {
+                    s.input_pointer(id, x, true);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 let mut changed = false;
                 if s.vol_drag {
                     s.set_volume_x(x);
@@ -8698,6 +8864,41 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
                 if s.usable() {
+                    let field = match s.active_tab {
+                        TAB_TODO if s.todo_hit(x, y) == 1000 => {
+                            s.todo_click(hwnd, 1000);
+                            Some(0)
+                        }
+                        TAB_CAL if s.cal_hit(x, y) == 5000 => {
+                            if !s.cal_editing {
+                                s.start_new_event(hwnd);
+                            }
+                            SetForegroundWindow(hwnd);
+                            SetFocus(hwnd);
+                            Some(1)
+                        }
+                        TAB_QUICK => match s.quick_hit(x, y) {
+                            6000 => {
+                                s.quick_click(hwnd, 6000);
+                                Some(2)
+                            }
+                            6010 | 6011 => {
+                                let hit = s.quick_hit(x, y);
+                                s.quick_click(hwnd, hit);
+                                Some(if hit == 6010 { 3 } else { 4 })
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(id) = field {
+                        s.end_input_drag();
+                        s.input_pointer(id, x, GetKeyState(0x10) < 0);
+                        s.input_mut(id).1.dragging = true;
+                        SetCapture(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
                     let pressed = if y < HEADER_H {
                         match s.header_hit(x, y) {
                             12 => 120,
@@ -8830,6 +9031,13 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x202 => {
+                if let Some(id) = s.dragging_input() {
+                    s.input_pointer(id, (l as i16) as f64 / s.scale, true);
+                    s.end_input_drag();
+                    ReleaseCapture();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 if s.notice_shown() {
                     s.open_notice(hwnd);
                     return 0;
@@ -8954,7 +9162,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                     for k in 0..NOTIF_ROWS {
                                         let i = s.notif_scroll + k;
                                         if i < n {
-                                            let y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+                                            let y = NOTIF_Y0
+                                                + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
                                             s.dismissing_notifs.push(DismissingNotice {
                                                 notice: s.notif_history[i].clone(),
                                                 y,
@@ -9382,21 +9591,50 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
-            0x102 if s.todo_editing => {
-                let c = w as u16;
-                match c {
-                    8 => {
-                        s.todo_input.pop();
+            0x215 => {
+                // WM_CAPTURECHANGED
+                s.end_input_drag();
+            }
+            0x100 if s.active_input().is_some() && w != 27 => {
+                if s.dragging_input().is_some() {
+                    s.end_input_drag();
+                    ReleaseCapture();
+                }
+                let shift = GetKeyState(0x10) < 0;
+                let ctrl = GetKeyState(0x11) < 0;
+                let id = s.active_input().unwrap();
+                let (text, editor) = s.input_mut(id);
+                match w {
+                    0x41 if ctrl => {
+                        editor.move_to(text, 0, false);
+                        editor.move_to(text, text.len(), true);
                     }
-                    13 => s.commit_todo(),
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            s.push_input(ch);
+                    0x43 | 0x58 if ctrl => {
+                        if todo_input::copy(hwnd, &text[editor.selection()]) && w == 0x58 {
+                            editor.delete(text, false);
                         }
-                        s.high_surrogate = 0;
+                    }
+                    0x56 if ctrl => {
+                        if let Some(value) = todo_input::paste(hwnd) {
+                            editor.replace(text, &value);
+                        }
+                    }
+                    0x23..=0x25 | 0x27 => editor.navigate(text, w, shift),
+                    0x2e => editor.delete(text, false),
+                    _ => {}
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            0x102 if s.todo_editing && s.active_tab == TAB_TODO => {
+                match w as u16 {
+                    8 => s.todo_editor.delete(&mut s.todo_input, true),
+                    13 => s.commit_todo(),
+                    c if (0xd800..=0xdfff).contains(&c) => {
+                        s.todo_editor.character(&mut s.todo_input, c)
                     }
                     c if c >= 32 && c != 127 => {
+                        s.todo_editor.end_interaction();
                         if let Some(ch) = char::from_u32(c as u32) {
                             s.push_input(ch);
                         }
@@ -9406,30 +9644,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
-            0x102 if s.cal_editing => {
-                let c = w as u16;
-                match c {
-                    8 => {
-                        s.cal_input.pop();
-                    }
+            0x102 if s.active_tab == TAB_CAL && s.cal_editing => {
+                match w as u16 {
+                    8 => s.input_editors[0].delete(&mut s.cal_input, true),
                     13 => s.commit_cal_schedule(),
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            if s.cal_input.chars().count() < 100 {
-                                s.cal_input.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
-                    }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            if s.cal_input.chars().count() < 100 {
-                                s.cal_input.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
+                    c => s.input_editors[0].character(&mut s.cal_input, c),
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
@@ -9438,7 +9657,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let c = w as u16;
                 match c {
                     8 => {
-                        s.quick_input.pop();
+                        s.input_editors[1].delete(&mut s.quick_input, true);
                     }
                     13 => {
                         let filtered = tasks::filter_quick_items(&s.quick_items, &s.quick_input);
@@ -9456,23 +9675,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             }
                         }
                     }
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            if s.quick_input.chars().count() < 80 {
-                                s.quick_input.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
-                    }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            if s.quick_input.chars().count() < 80 {
-                                s.quick_input.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
+                    c => s.input_editors[1].character(&mut s.quick_input, c),
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
@@ -9481,13 +9684,12 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let c = w as u16;
                 match c {
                     8 => {
-                        if s.quick_add_field == 0 {
-                            s.quick_name_input.pop();
-                        } else {
-                            s.quick_cmd_input.pop();
-                        }
+                        let id = 3 + s.quick_add_field;
+                        let (text, editor) = s.input_mut(id);
+                        editor.delete(text, true);
                     }
                     9 => {
+                        s.end_input_drag();
                         s.quick_add_field = (s.quick_add_field + 1) % 2;
                     }
                     13 => {
@@ -9497,38 +9699,21 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             s.commit_quick_item();
                         }
                     }
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            let target = if s.quick_add_field == 0 {
-                                &mut s.quick_name_input
-                            } else {
-                                &mut s.quick_cmd_input
-                            };
-                            if target.chars().count() < 80 {
-                                target.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
+                    c => {
+                        let id = 3 + s.quick_add_field;
+                        let (text, editor) = s.input_mut(id);
+                        editor.character(text, c);
                     }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            let target = if s.quick_add_field == 0 {
-                                &mut s.quick_name_input
-                            } else {
-                                &mut s.quick_cmd_input
-                            };
-                            if target.chars().count() < 80 {
-                                target.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
             0x0008 => {
+                if s.dragging_input().is_some() {
+                    ReleaseCapture();
+                }
+                s.todo_editor.end_interaction();
+                s.end_input_drag();
                 // Focus moved to another app: stop typing, and close if the cursor is elsewhere.
                 if s.todo_editing || s.cal_editing || s.quick_editing || s.quick_add_mode {
                     s.todo_editing = false;
@@ -9549,6 +9734,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
             }
             0x100 if w == 27 => {
+                if s.dragging_input().is_some() {
+                    ReleaseCapture();
+                }
+                s.end_input_drag();
                 if s.active_tab == TAB_QUICK {
                     if s.quick_add_mode {
                         s.quick_add_mode = false;
@@ -9562,6 +9751,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     }
                 }
                 if s.todo_editing {
+                    if s.todo_editor.dragging {
+                        ReleaseCapture();
+                    }
+                    s.todo_editor.end_interaction();
                     s.todo_editing = false;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
@@ -9776,7 +9969,10 @@ unsafe fn grab_screen(a: &Rect) -> Vec<u32> {
         let old = SelectObject(dc, bitmap);
         BitBlt(dc, 0, 0, w, h, screen, a.left, a.top, 0x00CC0020);
         GdiFlush();
-        pixels.extend_from_slice(std::slice::from_raw_parts(bits as *const u32, (w * h) as usize));
+        pixels.extend_from_slice(std::slice::from_raw_parts(
+            bits as *const u32,
+            (w * h) as usize,
+        ));
         SelectObject(dc, old);
         DeleteObject(bitmap);
     }
@@ -10254,6 +10450,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn todo_selection_replaces_unicode_in_middle() {
+        let mut s = create_test_state();
+        s.todo_input = "a😀éz".into();
+        s.todo_editor.move_to(&s.todo_input, 1, false);
+        s.todo_editor.move_to(&s.todo_input, 7, true);
+        s.push_input('中');
+        assert_eq!(s.todo_input, "a中z");
+        assert_eq!(s.todo_editor.caret, 4);
+    }
+
+    #[test]
+    fn todo_window_messages_preserve_enter_escape_and_focus_lifecycle() {
+        unsafe {
+            // Hidden, isolated window: no clipboard, input injection or app startup.
+            let class: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            let mut s = create_test_state();
+            s.smoke = true;
+            s.active_tab = TAB_TODO;
+            s.todo_editing = true;
+            SetWindowLongPtrW(hwnd, -21, &mut s as *mut State as isize);
+            procedure(hwnd, 0x102, 'a' as usize, 0);
+            procedure(hwnd, 0x102, 0xd83d, 0);
+            procedure(hwnd, 0x102, 0xde00, 0);
+            procedure(hwnd, 0x100, 0x24, 0);
+            procedure(hwnd, 0x102, 'b' as usize, 0);
+            assert_eq!(s.todo_input, "ba😀");
+            procedure(hwnd, 0x100, 0x2e, 0);
+            assert_eq!(s.todo_input, "b😀");
+            procedure(hwnd, 0x102, 13, 0);
+            assert_eq!(s.todos[0].text, "b😀");
+            assert!(s.todo_editing);
+            assert!(s.todo_input.is_empty());
+            procedure(hwnd, 0x102, 'z' as usize, 0);
+            procedure(hwnd, 0x100, 27, 0);
+            assert!(!s.todo_editing);
+            assert_eq!(s.todo_input, "z");
+            s.todo_editing = true;
+            procedure(hwnd, 0x0008, 0, 0);
+            assert!(!s.todo_editing);
+            assert_eq!(s.todo_input, "z");
+            s.todo_editing = true;
+            s.active_tab = TAB_CAL;
+            procedure(hwnd, 0x102, 'x' as usize, 0);
+            assert_eq!(s.todo_input, "z");
+            SetWindowLongPtrW(hwnd, -21, 0);
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn other_input_editors_preserve_limits_and_independent_selections() {
+        let mut s = create_test_state();
+        for id in 1..=4 {
+            let (text, editor) = s.input_mut(id);
+            editor.replace(text, "a😀éz");
+            editor.move_to(text, 1, false);
+            editor.move_to(text, 7, true);
+            editor.replace(text, "中");
+            assert_eq!(text, "a中z");
+            editor.move_to(text, 0, false);
+            editor.move_to(text, text.len(), true);
+            editor.replace(text, &"x".repeat(150));
+            assert_eq!(text.len(), if id == 1 { 100 } else { 80 });
+        }
+        assert!(s.todo_input.is_empty());
+    }
+
     fn create_test_state() -> State {
         State {
             expanded: true,
@@ -10300,6 +10579,8 @@ mod tests {
             wheel_acc: 0.,
             todos: Vec::new(),
             todo_input: String::new(),
+            todo_editor: Default::default(),
+            input_editors: [100, 80, 80, 80].map(todo_input::Editor::with_limit),
             todo_editing: false,
             todo_scroll: 0,
             quick_items: tasks::default_quick_items(),
@@ -10322,7 +10603,6 @@ mod tests {
             agenda_v: 0.,
             agenda_key: (0, 0, 0),
             cal_scroll: 0,
-            high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
             timer_t: 0.,
             timer_vel: 0.,
@@ -10529,7 +10809,13 @@ mod tests {
         let (w, h) = (64, 32);
         // A white square in the middle of black.
         let src: Vec<u32> = (0..w * h)
-            .map(|i| if (24..40).contains(&(i % w)) && (8..24).contains(&(i / w)) { 0xffffff } else { 0 })
+            .map(|i| {
+                if (24..40).contains(&(i % w)) && (8..24).contains(&(i / w)) {
+                    0xffffff
+                } else {
+                    0
+                }
+            })
             .collect();
         let sharp = frost(&src, w, h, 0, (0, 0, 0), 0);
         let soft = frost(&src, w, h, 16, (0, 0, 0), 0);
@@ -10539,7 +10825,9 @@ mod tests {
         assert!(soft[16 * w + 20] & 255 > 20);
         assert!(soft[16 * w + 32] & 255 < 255);
         // Full tint covers the capture.
-        assert!(frost(&src, w, h, 16, (10, 20, 30), 255).iter().all(|&p| p == 0xff0a141e));
+        assert!(frost(&src, w, h, 16, (10, 20, 30), 255)
+            .iter()
+            .all(|&p| p == 0xff0a141e));
     }
 
     #[test]

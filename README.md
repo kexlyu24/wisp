@@ -48,6 +48,20 @@ Wisp uses Apple's **SF Pro Display** if you've [installed it](https://developer.
 
 **Privacy:** everything stays in `%APPDATA%\Wisp`. The only network requests are lyrics lookups (song title and artist). Notifications are read locally and never stored or sent.
 
+## Text editing
+
+The Calendar event title, Quick Access search, and shortcut name/command fields
+support the same selection, clipboard shortcuts, caret navigation and horizontal
+scrolling as the To-do field. Existing Enter/Tab actions and character limits stay
+unchanged (Calendar: 100; Quick Access fields: 80; To-do: 120).
+
+### To-do
+
+Click inside the task field to place the caret, or drag to select text. Use Left/Right,
+Home/End (hold Shift to select), Ctrl+A/C/X/V, Backspace and Delete. Long drafts scroll
+with the caret; Enter adds the task, and Escape leaves the draft without adding it.
+These editing shortcuts currently apply only to To-do, not Calendar or Quick Access.
+
 ## Build
 
 Needs [Rust](https://rustup.rs) with the `stable-x86_64-pc-windows-gnu` toolchain.

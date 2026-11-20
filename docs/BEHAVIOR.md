@@ -22,6 +22,27 @@ The Calendar page follows Apple's Calendar widget: red weekday label, a large da
 
 The To-do page (checklist icon) is laid out like Apple Reminders. Click the "Add a task" field and type; Enter adds the task and keeps the field open for the next one, and Escape stops typing. While you type, the panel stays open even if the cursor leaves it; switching to another app or page ends typing. Each row has a circular checkbox: click a row to tick it (blue check, dimmed text) or click it again to untick. Hovering a row shows a delete button. "Clear Done" in the header removes ticked tasks. Four rows are visible; the wheel over the list scrolls longer lists. Tasks are saved to `%APPDATA%\Wisp\todos.txt` (one `0|1<TAB>text` line per task) after every change and loaded at startup.
 
+### Task field editing
+
+- Click to place the caret; drag in either direction to select, including outside the field while captured. Shift-click extends the selection. Moving the pointer beyond the field scrolls toward the moving selection endpoint.
+- Left/Right move one Unicode scalar; Home/End go to the start/end. Hold Shift to extend selection. Without Shift, Left/Right collapse an existing selection to its corresponding edge.
+- Ctrl+A selects the draft, Ctrl+C copies selection, Ctrl+X copies then removes it only if copying succeeds, and Ctrl+V replaces selection with Unicode clipboard text. Empty selections do not change the clipboard. A busy/unavailable clipboard leaves the draft unchanged.
+- Typing, paste, Backspace and Delete replace/remove selection. Without selection, Backspace removes the preceding scalar and Delete the following scalar. The existing 120-scalar limit applies after replacement. Pasted control characters (including line breaks, tabs and NUL) and Unicode line/paragraph separators are removed, not submitted as tasks; an empty/fully filtered paste leaves selection intact.
+- The field clips long drafts and scrolls horizontally to keep the caret visible. Enter adds a trimmed nonempty task and resets the caret, selection and scroll while keeping editing active. Escape, focus loss and changing pages stop editing without discarding the draft; pointer capture is canceled on focus/capture loss or page exit.
+- Scope is To-do only. This remains a custom field on the layered drawing surface, not a child EDIT control. Positions never split UTF-8 or UTF-16 surrogate pairs, but combining sequences/emoji clusters can be split into individual scalars; bidirectional visual navigation, IME composition UI, undo/redo and word navigation are not implemented.
+
+### Manual regression checklist (user-run)
+
+1. Open To-do, type `alpha beta`, click between the words, type `X`: insertion must occur there, not at the tail. Click each end and use Home/End and Left/Right.
+2. Drag left-to-right and right-to-left; check the blue selection. Hold Shift with Left/Right/Home/End and Shift-click. Type a replacement, then repeat using Backspace and Delete. Without selection, each deletes only the adjacent character.
+3. Copy disposable Unicode text `a😀é中z` from another app. Ctrl+A then Ctrl+V in To-do; select part, Ctrl+C and paste into the other app. Ctrl+X must remove exactly the selected text; paste it back. Copy/cut with no selection must preserve the clipboard.
+4. Paste a draft longer than the field (up to 120 characters). Use Home/End, arrows and Shift selection; confirm caret and selected endpoint remain visible and nothing overlaps the plus icon or border. Drag beyond each edge to extend selection; release outside, return, and confirm selection is no longer dragging.
+5. Paste more than 120 characters, then replace a selected portion: the result must remain capped at 120 scalars without corrupting Unicode. Paste multiline/tabbed text: it becomes one draft, never multiple submitted tasks. Empty paste must not delete selection.
+6. Enter adds exactly one nonempty trimmed task and keeps typing active with an empty field. Blank Enter adds nothing. Escape preserves the draft and ends typing. Click the field again, switch apps, switch tabs and return: draft survives and editing resumes only after clicking the field. Cancel a drag by changing focus; no stuck selection/capture.
+7. Tick/untick/delete tasks and Clear Done; confirm saved tasks survive restarting. Confirm Calendar and Quick Access retain their existing input behavior.
+
+Automated editor and hidden-window regression tests are included but have not been executed for this change at the user's request. To run only these tests (no live media tests): `cargo test --locked todo_ -- --test-threads=1`.
+
 ## Lyrics & Volume
 
 Now Playing's bottom row holds a lyrics button on the left (quote bubble), previous / play-pause / next in the middle, and the system volume on the right (speaker icon plus slider).
@@ -87,6 +108,24 @@ Header and drop-zone icons are SF Symbols-style line glyphs (music.note, calenda
 Rendering reuses the full-size BGRA DIB, GDI+ graphics context, path, solid brush, artwork texture, and UTF-16 conversion buffer. Artwork resources change only when the media artwork changes; no blanket high-resolution supersampling buffer is used. GDI+ is loaded from the Windows system DLL through cached exports, so the GNU Rust build does not require a separate GDI+ import library. Text and native drawing are synchronized before the layered-window pixels are presented.
 
 Frames are driven by DwmFlush on a worker, with one synchronous UI message per compositor cycle (no queued backlog or fixed 16ms timer). Only motion of the notch itself (opening, closing, resizing, page switches) is locked to DwmFlush. If DwmFlush stops pacing (it can return immediately while the display is off or the session is locked), the worker falls back to a timer, so the UI thread is never flooded and repaints are never starved. While only the waveform or a lyric line moves, or the panel sits open, frames come from a high-resolution timer at the display refresh rate instead, since DwmFlush costs noticeable CPU on some drivers. While nothing moves (collapsed, no music playing, no notification or drag), it slows to about 10 ticks a second, enough for the clock, notifications and media updates; any mouse or keyboard input brings it back to full rate within 10 ms. Each frame only does coverage math on the silhouette band. Text, icons and the artwork are cached once rendered: text as grayscale masks per string, font and box, icons per glyph and quarter-pixel position, and the rounded artwork at its current size. A frame of the open Now Playing panel with lyrics takes about 0.65 ms instead of about 2.9 ms; GDI text with SF Pro alone cost ~100 µs a string. The media worker keeps one Windows media-session manager for its lifetime; requesting a new one every second leaked a little memory each time. This follows Windows compositor cadence, which may differ from physical refresh on mixed-refresh displays or remote sessions. The spring uses an exact elapsed-time update rather than fixed frame steps, with a small position/velocity settling threshold. Content fading is composited against the black interior, reusing the existing drawing resources without additional surfaces.
+
+## Shared text-field editing
+
+Calendar event titles, Quick Access search and shortcut name/command fields use
+independent instances of the same editor as To-do: click caret placement, mouse
+selection, Shift-click/Left/Right/Home/End, Ctrl+A/C/X/V, selection replacement,
+Backspace/Delete and horizontally clipped scrolling. Clipboard pastes never
+submit or launch anything; Enter retains the existing field-specific action.
+Tab still switches shortcut fields. Limits remain 100 Unicode scalars for the
+calendar and 80 for Quick Access fields (120 for To-do). Control characters and
+line separators are filtered from pasted input. Clearing a field resets its
+selection and scroll; changing pages/focus ends dragging and surrogate input.
+
+Manual verification (user-run): repeat the To-do selection/clipboard checks in
+each field, edit an existing calendar event, clear search using its x button,
+switch shortcut fields with Tab/Enter, cancel/reopen forms and paste long text.
+Confirm that only Enter or an explicit launch/save action executes a command.
+Regression tests are compile-checked only; runtime and UI testing is user-run.
 
 ## Quick Access
 
