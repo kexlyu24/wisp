@@ -218,6 +218,12 @@ pub fn start() -> Receiver<Media> {
                     .and_then(|op| op.get())
                     .ok();
             }
+            if manager.is_none() {
+                crate::diagnostics::limited_error(
+                    "media",
+                    "Windows media session manager is unavailable; retrying",
+                );
+            }
             let result = (|| -> windows::core::Result<Media> {
                 let Some(manager) = &manager else {
                     return Ok(default_media());

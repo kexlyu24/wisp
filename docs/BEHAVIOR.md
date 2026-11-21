@@ -109,6 +109,63 @@ Rendering reuses the full-size BGRA DIB, GDI+ graphics context, path, solid brus
 
 Frames are driven by DwmFlush on a worker, with one synchronous UI message per compositor cycle (no queued backlog or fixed 16ms timer). Only motion of the notch itself (opening, closing, resizing, page switches) is locked to DwmFlush. If DwmFlush stops pacing (it can return immediately while the display is off or the session is locked), the worker falls back to a timer, so the UI thread is never flooded and repaints are never starved. While only the waveform or a lyric line moves, or the panel sits open, frames come from a high-resolution timer at the display refresh rate instead, since DwmFlush costs noticeable CPU on some drivers. While nothing moves (collapsed, no music playing, no notification or drag), it slows to about 10 ticks a second, enough for the clock, notifications and media updates; any mouse or keyboard input brings it back to full rate within 10 ms. Each frame only does coverage math on the silhouette band. Text, icons and the artwork are cached once rendered: text as grayscale masks per string, font and box, icons per glyph and quarter-pixel position, and the rounded artwork at its current size. A frame of the open Now Playing panel with lyrics takes about 0.65 ms instead of about 2.9 ms; GDI text with SF Pro alone cost ~100 µs a string. The media worker keeps one Windows media-session manager for its lifetime; requesting a new one every second leaked a little memory each time. This follows Windows compositor cadence, which may differ from physical refresh on mixed-refresh displays or remote sessions. The spring uses an exact elapsed-time update rather than fixed frame steps, with a small position/velocity settling threshold. Content fading is composited against the black interior, reusing the existing drawing resources without additional surfaces.
 
+## Diagnostic logging
+
+English-only application records append to `%APPDATA%\Wisp\wisp.log`, with local
+wall-clock timestamps, level, component and PID. Rotation retains wisp.log.1..3
+at a 2 MiB threshold. Lines are bounded and control characters are removed.
+Selected media/lyrics/notification retry errors log at most once per minute.
+No user drafts, notifications, clipboard contents, full URLs or panic payloads
+are recorded. Normal I/O errors record their kind and OS error code, not paths
+or localized OS prose. Missing optional data files are normal first-run state.
+Logging never propagates I/O errors and concurrent records may be skipped to
+avoid deadlock. Native exception recording bypasses the regular logger lock;
+it remains best-effort, not a crash dump. Running multiple instances may cause
+rotation contention. Runtime and rotation tests remain user-run.
+
+## Browser image drop candidate
+
+OLE drops first preserve the existing local-file path. Otherwise Wisp reads the
+browser HTML image src, then Unicode/ANSI URL formats. A single background worker
+fetches a direct HTTPS image without browser cookies; the shelf reports download,
+success or failure. Failures and unsupported drops show a modal in-app alert
+with a Yes button (Enter/Space also dismiss). Persistent bottom-left status text
+is removed. The alert blocks underlying mouse/keyboard actions until dismissed.
+Drop diagnostics query availability of CF_BITMAP, CF_DIB, CF_DIBV5, PNG,
+image/png, FileGroupDescriptorW/ANSI and FileContents via QueryGetData, including
+HGLOBAL/IStream/GDI media and virtual-file index 0. These probes log HRESULTs
+without fetching payloads; positive availability is not proof extraction works.
+Drop diagnostics also record HTML/URL format availability and blob/data markers,
+never the source URL or chat contents. Unsupported drops are logged before any
+network worker starts. The source is bounded to 20 MiB, decoded with allocation and
+8192-pixel dimension limits, then re-encoded as PNG under web-images in APPDATA.
+A successful result is inserted in the shelf root and supports existing open and
+drag-out actions. Clear/remove do not delete cached files. Login-required images,
+blob/data URLs, SVG/GIF and generic webpage links are outside this first scope.
+
+Known limitation / handoff: user-tested WhatsApp Web image drops reference blob
+URLs. QueryGetData reports FileGroupDescriptorW and FileContents available,
+including item index 0, but no payload extraction has been implemented or verified.
+The current HTTPS-only path therefore rejects these drops. Future work should
+read and validate virtual-file data with bounded sizes and correct COM lifetime
+handling; availability alone does not guarantee GetData will succeed.
+
+User-run checks: drag public PNG/JPEG/WebP images from Chrome and Edge, wait for
+completion, open and drag the cached item to Explorer; retry the same image,
+check offline/non-image URL failures, and confirm local-file drops still work.
+The application and regression tests are compile-checked only, not executed.
+
+## In-app update candidate
+
+Settings > Updates opens a dedicated page in the existing settings surface.
+It shows the installed version, daily-at-startup automatic-check toggle, current
+status, a four-line release-note preview, download progress/cancellation and
+an explicit Restart & update action. Network work stays off the UI thread.
+Checks never install anything. Unsigned/malformed/mismatched packages are rejected.
+Only wisp.exe is replaced; user data stays intact. Startup failure triggers an
+attempt to restore the retained executable backup. See [UPDATES.md](UPDATES.md)
+for the release asset contract, signing, limits and user-run verification.
+
 ## Shared text-field editing
 
 Calendar event titles, Quick Access search and shortcut name/command fields use

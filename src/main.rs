@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod diagnostics;
 mod lyrics;
 mod media;
 mod notify;
@@ -8,7 +9,9 @@ mod settings;
 mod tasks;
 mod todo_input;
 mod tray;
+mod updater;
 mod volume;
+mod web_drop;
 use std::{ffi::c_void, mem::size_of, ptr::null_mut};
 type Handle = *mut c_void;
 type Hwnd = Handle;
@@ -480,7 +483,12 @@ unsafe extern "system" fn dt_drop(
 ) -> i32 {
     if !this.is_null() {
         let paths = extract_hdrop_paths(p_data_obj);
-        SendMessageW((*this).hwnd, 0x8006, &paths as *const _ as usize, 0);
+        if !paths.is_empty() {
+            SendMessageW((*this).hwnd, 0x8006, &paths as *const _ as usize, 0);
+        } else {
+            let url = extract_browser_image(p_data_obj);
+            SendMessageW((*this).hwnd, 0x8008, &url as *const _ as usize, 0);
+        }
     }
     if !pdw_effect.is_null() {
         *pdw_effect = 1;
@@ -532,6 +540,171 @@ unsafe fn extract_hdrop_paths(p_data_obj: *mut IDataObject) -> Vec<String> {
     }
     ReleaseStgMedium(&mut medium);
     paths
+}
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterClipboardFormatW(name: *const u16) -> u32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn GlobalLock(memory: Handle) -> *mut c_void;
+    fn GlobalUnlock(memory: Handle) -> i32;
+    fn GlobalSize(memory: Handle) -> usize;
+}
+unsafe fn drop_format_bytes(object: *mut IDataObject, format: u16) -> Option<Vec<u8>> {
+    if object.is_null() || (*object).lp_vtbl.is_null() {
+        return None;
+    }
+    let format = FormatEtc {
+        cf_format: format,
+        _pad: [0; 6],
+        ptd: null_mut(),
+        dw_aspect: 1,
+        lindex: -1,
+        tymed: 1,
+    };
+    let mut medium: StgMedium = std::mem::zeroed();
+    if ((*(*object).lp_vtbl).get_data)(object.cast(), &format, &mut medium) != 0 {
+        return None;
+    }
+    let mut bytes = None;
+    if medium.tymed == 1 && !medium.h_global.is_null() {
+        let size = GlobalSize(medium.h_global);
+        if size > 0 && size <= 1024 * 1024 {
+            let ptr = GlobalLock(medium.h_global);
+            if !ptr.is_null() {
+                bytes = Some(std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec());
+                GlobalUnlock(medium.h_global);
+            }
+        }
+    }
+    ReleaseStgMedium(&mut medium);
+    bytes
+}
+/// QueryGetData only: inspect availability without reading image/chat contents.
+unsafe fn diagnose_browser_formats(object: *mut IDataObject) {
+    if object.is_null() || (*object).lp_vtbl.is_null() {
+        return;
+    }
+    // IDataObject slot 5 is QueryGetData (after IUnknown, GetData, GetDataHere).
+    let slots = (*object).lp_vtbl.cast::<*const c_void>();
+    let query: unsafe extern "system" fn(*mut c_void, *const FormatEtc) -> i32 =
+        std::mem::transmute(*slots.add(5));
+    let formats = [
+        ("CF_BITMAP", 2u16),
+        ("CF_DIB", 8),
+        ("CF_DIBV5", 17),
+        ("PNG", RegisterClipboardFormatW(wide("PNG").as_ptr()) as u16),
+        (
+            "image/png",
+            RegisterClipboardFormatW(wide("image/png").as_ptr()) as u16,
+        ),
+        (
+            "FileGroupDescriptorW",
+            RegisterClipboardFormatW(wide("FileGroupDescriptorW").as_ptr()) as u16,
+        ),
+        (
+            "FileGroupDescriptor",
+            RegisterClipboardFormatW(wide("FileGroupDescriptor").as_ptr()) as u16,
+        ),
+        (
+            "FileContents",
+            RegisterClipboardFormatW(wide("FileContents").as_ptr()) as u16,
+        ),
+    ];
+    diagnostics::info(
+        "shelf",
+        "Browser drag image/virtual-file format probe started; availability only",
+    );
+    for (name, id) in formats {
+        if id == 0 {
+            continue;
+        }
+        for (medium, tymed) in [("HGLOBAL", 1u32), ("ISTREAM", 4), ("GDI", 16)] {
+            // FileContents uses an item index; other formats conventionally use -1.
+            let indices: &[i32] = if name == "FileContents" {
+                &[-1, 0]
+            } else {
+                &[-1]
+            };
+            for index in indices {
+                let format = FormatEtc {
+                    cf_format: id,
+                    _pad: [0; 6],
+                    ptd: null_mut(),
+                    dw_aspect: 1,
+                    lindex: *index,
+                    tymed,
+                };
+                let hr = query(object.cast(), &format);
+                diagnostics::info("shelf",&format!("Drag format probe; format={name}; medium={medium}; index={index}; available={}; HRESULT=0x{:08X}",hr==0,hr as u32));
+            }
+        }
+    }
+    diagnostics::info(
+        "shelf",
+        "Browser drag format probe completed; no payload was read",
+    );
+}
+unsafe fn extract_browser_image(object: *mut IDataObject) -> Option<String> {
+    diagnose_browser_formats(object);
+    let mut found_html = false;
+    let mut found_url = false;
+    let html_format = RegisterClipboardFormatW(wide("HTML Format").as_ptr()) as u16;
+    if let Some(bytes) = drop_format_bytes(object, html_format) {
+        found_html = true;
+        diagnostics::info("shelf", "Browser drop offers HTML Format");
+        let lower = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        if lower.contains("blob:") {
+            diagnostics::log(
+                "WARN",
+                "shelf",
+                "Browser HTML references browser-local blob data; not accessible over HTTPS",
+            );
+        }
+        if lower.contains("data:image/") {
+            diagnostics::log(
+                "WARN",
+                "shelf",
+                "Browser HTML contains an embedded image; data URLs are not supported",
+            );
+        }
+        if let Some(url) = web_drop::image_source(&String::from_utf8_lossy(&bytes)) {
+            return Some(url);
+        }
+    }
+    for (name, unicode) in [
+        ("UniformResourceLocatorW", true),
+        ("UniformResourceLocator", false),
+    ] {
+        let format = RegisterClipboardFormatW(wide(name).as_ptr()) as u16;
+        if let Some(bytes) = drop_format_bytes(object, format) {
+            found_url = true;
+            diagnostics::info(
+                "shelf",
+                if unicode {
+                    "Browser drop offers Unicode URL format"
+                } else {
+                    "Browser drop offers ANSI URL format"
+                },
+            );
+            let text = if unicode {
+                let units: Vec<_> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .take_while(|c| *c != 0)
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or(&[])).into_owned()
+            };
+            if let Some(url) = web_drop::safe_url(&text) {
+                return Some(url);
+            }
+        }
+    }
+    diagnostics::log("WARN","shelf",&format!("Unsupported browser drop; HTML={found_html}; URL={found_url}; no accepted image source"));
+    None
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -834,6 +1007,10 @@ struct State {
     notif_badge_v: f64,
     settings: settings::Settings,
     settings_subpage: usize,
+    updater: updater::Updater,
+    web_drop_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    web_drop_status: String,
+    shelf_alert: Option<String>,
     bg_custom_pixels: Option<(usize, usize, Vec<u32>)>,
     /// Frosted glass: the blurred, tinted capture of what is behind the panel (DIB-sized, opaque),
     /// made on a short-lived thread so the ~20 ms capture and blur never stall a frame.
@@ -1139,6 +1316,10 @@ impl State {
             deep_idle_ticks: 0,
             settings: loaded_settings,
             settings_subpage: 0,
+            updater: updater::Updater::new(!smoke),
+            web_drop_rx: None,
+            web_drop_status: String::new(),
+            shelf_alert: None,
             bg_custom_pixels,
             backdrop: Default::default(),
             backdrop_busy: Default::default(),
@@ -2638,6 +2819,27 @@ impl State {
     /// Settings page targets: 5000+k switch row, 5200 Quit, 5250 Appearance drilldown, 5260 Back,
     /// 5300..=5304 style, 5310..=5313 opacity, 5320 import, 5321 reset, 5330..=5332 pos, 5340..=5343 blur, -1 none.
     fn settings_hit(&self, x: f64, y: f64) -> i32 {
+        if self.settings_subpage == 2 {
+            if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
+                return 5260;
+            }
+            if (65. ..93.).contains(&y) && (24. ..416.).contains(&x) {
+                return 5401;
+            }
+            if (246. ..276.).contains(&y) {
+                if (24. ..250.).contains(&x) {
+                    return if self.updater.action_enabled() {
+                        5400
+                    } else {
+                        -1
+                    };
+                }
+                if (260. ..416.).contains(&x) {
+                    return 5402;
+                }
+            }
+            return -1;
+        }
         if self.settings_subpage == 1 {
             // Back button (< Settings)
             if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
@@ -2697,6 +2899,9 @@ impl State {
         if (208. ..256.).contains(&y) && (24. ..416.).contains(&x) {
             return 5250;
         }
+        if (298. ..322.).contains(&y) && (238. ..322.).contains(&x) {
+            return 5405;
+        }
         // Quit button
         if (298. ..322.).contains(&y) && (SET_W - 24. - 84. ..SET_W - 24.).contains(&x) {
             return 5200;
@@ -2705,6 +2910,24 @@ impl State {
     }
     unsafe fn settings_click(&mut self, hwnd: Hwnd, hit: i32) {
         match hit {
+            5405 => self.settings_subpage = 2,
+            5401 => {
+                if !self.smoke {
+                    self.updater.toggle_auto();
+                }
+            }
+            5402 => self.updater.cancel(),
+            5400 if !self.smoke && self.updater.action_enabled() => match self.updater.phase {
+                updater::Phase::Ready => match self.updater.install() {
+                    Ok(()) => {
+                        DestroyWindow(hwnd);
+                    }
+                    Err(e) => self.updater.status = e,
+                },
+                updater::Phase::Available => self.updater.download(),
+                updater::Phase::Error if self.updater.release.is_some() => self.updater.download(),
+                _ => self.updater.check(),
+            },
             5000..=5006 => self.change_setting(hwnd, SETTING_ROWS[(hit - 5000) as usize].1),
             5200 => {
                 DestroyWindow(hwnd);
@@ -3112,6 +3335,10 @@ impl State {
         self.shelf_remove_hover = -1;
     }
     fn add_shelf_items(&mut self, paths: &[String], hwnd: Hwnd) {
+        diagnostics::info(
+            "shelf",
+            &format!("Add shelf items requested; count={}", paths.len()),
+        );
         let mut added = false;
         if let Some(folder_idx) = self.active_folder {
             if folder_idx < self.shelf_items.len() && self.shelf_items[folder_idx].is_group() {
@@ -3407,7 +3634,7 @@ fn parse_shelf(src: &str) -> Vec<Vec<String>> {
 }
 /// Restores the saved shelf, dropping files that no longer exist (a group of one becomes a file).
 fn load_shelf() -> Vec<ShelfItem> {
-    let Some(src) = tasks::data_path("shelf.txt").and_then(|p| std::fs::read_to_string(p).ok())
+    let Some(src) = tasks::data_path("shelf.txt").and_then(|p| crate::diagnostics::read_text(p))
     else {
         return Vec::new();
     };
@@ -5409,6 +5636,22 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
     );
 }
 unsafe fn shelf_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if s.web_drop_rx.is_some() {
+        text_opt(
+            dc,
+            s,
+            3,
+            "Downloading image...",
+            SECONDARY,
+            24.,
+            42.,
+            page_w(TAB_SHELF) - 48.,
+            18.,
+            false,
+            o,
+            dx,
+        );
+    }
     if let Some(folder_idx) = s.active_folder {
         if folder_idx < s.shelf_items.len() && s.shelf_items[folder_idx].is_group() {
             let bx = s.breadcrumb_x();
@@ -6463,6 +6706,10 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
 /// Settings, in the style of iOS / macOS dark mode: inset grouped cards with switches, a segmented
 /// control for the music player, and a footer with the version and Quit.
 unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if s.settings_subpage == 2 {
+        settings_updates_page(dc, s, dx, o);
+        return;
+    }
     if s.settings_subpage == 1 {
         settings_background_page(dc, s, dx, o);
         return;
@@ -6670,6 +6917,15 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
         dx,
     );
 
+    let update_bg = if s.hover == 5405 || s.pressed == 5405 {
+        rgb(44, 44, 46)
+    } else {
+        CARD
+    };
+    pill_opt(s, 238., 298., 84., 24., update_bg, o, dx);
+    text_opt(
+        dc, s, 2, "Updates", WHITE, 238., 298., 84., 24., true, o, dx,
+    );
     // Footer: version on the left, Quit on the right.
     text_opt(
         dc,
@@ -6695,6 +6951,175 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
     };
     pill_opt(s, qx, 298., qw, 24., quit_bg, o, dx);
     text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 298., qw, 24., true, o, dx);
+}
+
+fn update_note_lines(notes: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in notes.lines() {
+        let mut wrapped = String::new();
+        for word in line.split_whitespace() {
+            if wrapped.chars().count() + word.chars().count() > 48 && !wrapped.is_empty() {
+                lines.push(std::mem::take(&mut wrapped));
+            }
+            if !wrapped.is_empty() {
+                wrapped.push(' ');
+            }
+            wrapped.extend(word.chars().take(60));
+        }
+        lines.push(wrapped);
+    }
+    lines
+}
+unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    let u = &s.updater;
+    text_opt(
+        dc, s, 1, "Updates", WHITE, 24., 38., 392., 24., false, o, dx,
+    );
+    let auto = if u.auto {
+        "Automatic checks: On (daily at startup)"
+    } else {
+        "Automatic checks: Off"
+    };
+    pill_opt(s, 24., 65., 392., 28., rgb(28, 28, 30), o, dx);
+    text_opt(dc, s, 2, auto, WHITE, 34., 65., 370., 28., false, o, dx);
+    text_opt(
+        dc,
+        s,
+        3,
+        &format!(
+            "Installed: {} | Stable releases only",
+            env!("CARGO_PKG_VERSION")
+        ),
+        SECONDARY,
+        24.,
+        98.,
+        392.,
+        18.,
+        false,
+        o,
+        dx,
+    );
+    let status = update_note_lines(&u.status);
+    for (i, line) in status.iter().take(2).enumerate() {
+        text_opt(
+            dc,
+            s,
+            2,
+            line,
+            WHITE,
+            24.,
+            120. + i as f64 * 18.,
+            392.,
+            18.,
+            false,
+            o,
+            dx,
+        );
+    }
+    if u.phase == updater::Phase::Downloading && u.progress.1 > 0 {
+        let fraction = u.progress.0 as f64 / u.progress.1 as f64;
+        round_opt(s, 24., 158., 392., 3., 1., rgb(40, 40, 44), o, dx);
+        round_opt(s, 24., 158., 392. * fraction, 3., 1., BLUE, o, dx);
+        text_opt(
+            dc,
+            s,
+            3,
+            &format!("{:.0}%", fraction * 100.),
+            SECONDARY,
+            350.,
+            140.,
+            66.,
+            18.,
+            true,
+            o,
+            dx,
+        );
+    }
+    let notes = u
+        .release
+        .as_ref()
+        .map(|r| r.notes.as_str())
+        .unwrap_or("Release notes appear here when an update is available.");
+    let lines = update_note_lines(notes);
+    for (i, line) in lines.iter().take(4).enumerate() {
+        text_opt(
+            dc,
+            s,
+            3,
+            line,
+            SECONDARY,
+            24.,
+            168. + i as f64 * 16.,
+            392.,
+            16.,
+            false,
+            o,
+            dx,
+        );
+    }
+    let label = match u.phase {
+        updater::Phase::Checking => "Checking...",
+        updater::Phase::Downloading => "Downloading...",
+        updater::Phase::Ready => "Restart & update",
+        updater::Phase::Available => "Download update",
+        updater::Phase::Error if u.release.is_some() => "Retry download",
+        _ => "Check for updates",
+    };
+    let waiting = format!("Try again in {}s", u.cooldown());
+    let label = if !u.action_enabled()
+        && !matches!(
+            u.phase,
+            updater::Phase::Checking | updater::Phase::Downloading
+        ) {
+        waiting.as_str()
+    } else {
+        label
+    };
+    let enabled = u.action_enabled();
+    pill_opt(
+        s,
+        24.,
+        246.,
+        226.,
+        30.,
+        if enabled { BLUE } else { rgb(45, 45, 48) },
+        o,
+        dx,
+    );
+    text_opt(
+        dc,
+        s,
+        2,
+        label,
+        if enabled { WHITE } else { SECONDARY },
+        24.,
+        246.,
+        226.,
+        30.,
+        true,
+        o,
+        dx,
+    );
+    if u.phase == updater::Phase::Downloading {
+        pill_opt(s, 260., 246., 156., 30., rgb(28, 28, 30), o, dx);
+        text_opt(
+            dc, s, 2, "Cancel", WHITE, 260., 246., 156., 30., true, o, dx,
+        );
+    }
+    text_opt(
+        dc,
+        s,
+        2,
+        "< Settings",
+        BLUE,
+        24.,
+        284.,
+        100.,
+        24.,
+        false,
+        o,
+        dx,
+    );
 }
 
 unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
@@ -7545,6 +7970,52 @@ unsafe fn pomo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     pill_opt(s, 312., 136., 104., 36., bg, o, dx);
     text_opt(dc, s, 1, label, fg, 312., 136., 104., 36., true, o, dx);
 }
+fn shelf_alert_button(s: &State) -> (f64, f64, f64, f64) {
+    let w = page_w(s.active_tab);
+    let h = s.page_h(s.active_tab);
+    (w / 2. - 42., h / 2. + 40., 84., 26.)
+}
+unsafe fn shelf_alert_view(dc: Handle, s: &State) {
+    let Some(message) = s.shelf_alert.as_ref() else {
+        return;
+    };
+    let w = page_w(s.active_tab);
+    let h = s.page_h(s.active_tab);
+    round_opt(s, 18., 42., w - 36., h - 54., 12., rgb(18, 18, 22), 1., 0.);
+    text_opt(
+        dc,
+        s,
+        1,
+        "Image drop",
+        WHITE,
+        36.,
+        h / 2. - 64.,
+        w - 72.,
+        24.,
+        false,
+        1.,
+        0.,
+    );
+    for (i, line) in update_note_lines(message).iter().take(4).enumerate() {
+        text_opt(
+            dc,
+            s,
+            2,
+            line,
+            SECONDARY,
+            36.,
+            h / 2. - 34. + i as f64 * 16.,
+            w - 72.,
+            16.,
+            false,
+            1.,
+            0.,
+        );
+    }
+    let (x, y, bw, bh) = shelf_alert_button(s);
+    pill_opt(s, x, y, bw, bh, BLUE, 1., 0.);
+    text_opt(dc, s, 2, "Yes", WHITE, x, y, bw, bh, true, 1., 0.);
+}
 unsafe fn paint(hwnd: Hwnd, s: &State) {
     let mut ps: Paint = std::mem::zeroed();
     BeginPaint(hwnd, &mut ps);
@@ -7873,6 +8344,9 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
         clock(dc, s, clock_opacity);
     }
     notice_view(dc, s, cur_w);
+    if s.expanded {
+        shelf_alert_view(dc, s);
+    }
     GdiFlush();
     let width = r.right as usize;
     let height = r.bottom as usize;
@@ -8296,6 +8770,27 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
     let ptr = GetWindowLongPtrW(hwnd, -21) as *mut State;
     if !ptr.is_null() {
         let s = &mut *ptr;
+        if s.shelf_alert.is_some() {
+            if msg == 0x202 {
+                let x = (l as i16) as f64 / s.scale;
+                let y = ((l >> 16) as i16) as f64 / s.scale;
+                let (bx, by, bw, bh) = shelf_alert_button(s);
+                if (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y) {
+                    s.shelf_alert = None;
+                    diagnostics::info("shelf", "Image drop alert dismissed");
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                return 0;
+            }
+            if msg == 0x100 && (w == 13 || w == 32) {
+                s.shelf_alert = None;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            if (0x100..=0x109).contains(&msg) || (0x201..=0x20e).contains(&msg) {
+                return 0;
+            }
+        }
         // Input (keyboard, mouse, mouse leave, OLE drag) wakes the frame thread from its idle pace at once.
         if (0x100..=0x20e).contains(&msg) || msg == 0x2a3 || (0x8004..=0x8007).contains(&msg) {
             s.pace
@@ -8308,6 +8803,38 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x8001 => {
+                let web_result = s.web_drop_rx.as_ref().and_then(|rx| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("Image download worker stopped.".into()))
+                    }
+                    Err(_) => None,
+                });
+                if let Some(result) = web_result {
+                    s.web_drop_rx = None;
+                    match result {
+                        Ok(path) => {
+                            // Complete in the shelf root, never a folder selected after dropping.
+                            let folder = s.active_folder.take();
+                            s.add_shelf_items(&[path], hwnd);
+                            s.active_folder = folder.filter(|i| *i < s.shelf_items.len());
+                            diagnostics::info("shelf", "Browser image added to shelf");
+                            s.web_drop_status.clear();
+                        }
+                        Err(e) => {
+                            diagnostics::error("shelf", "Browser image download or validation failed; see network and image records");
+                            s.shelf_alert = Some(format!("Image download failed: {e}"));
+                        }
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                if s.shelf_alert.is_some() && !s.expanded {
+                    s.expanded = true;
+                    s.layout(hwnd);
+                }
+                if s.updater.poll() {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 s.ticks += 1;
                 while let Ok(mut media) = s.receiver.try_recv() {
                     if !s.smoke {
@@ -8438,6 +8965,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             && !s.quick_editing
                             && !s.quick_add_mode
                             && !s.menu_active
+                            && s.shelf_alert.is_none()
                         {
                             s.expanded = false;
                             s.layout(hwnd);
@@ -9004,6 +9532,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 if !s.smoke
                     && !s.menu_active
+                    && s.shelf_alert.is_none()
                     && !s.todo_editing
                     && !s.cal_editing
                     && !s.quick_editing
@@ -9577,6 +10106,33 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
+            0x8008 => {
+                diagnostics::info("shelf", "Browser image drop received");
+                if s.dragging_out {
+                    return 0;
+                }
+                let url = &*(w as *const Option<String>);
+                s.web_drop_status.clear();
+                if s.web_drop_rx.is_some() {
+                    diagnostics::log(
+                        "WARN",
+                        "shelf",
+                        "Browser image drop rejected: another download is active",
+                    );
+                    s.shelf_alert = Some("An image is already downloading. Please wait.".into());
+                } else if let Some(url) = url {
+                    s.web_drop_rx = Some(web_drop::start(url.clone()));
+                } else {
+                    diagnostics::log("WARN","shelf","Browser image drop rejected: no supported HTTPS image source; format details recorded during extraction");
+                    s.shelf_alert=Some("This content is not supported. Wisp could not find a direct HTTPS image source. Browser-local or login-protected images may not be accessible.".into());
+                }
+                s.expanded = true;
+                s.active_tab = TAB_SHELF;
+                s.ole_drag_target = None;
+                s.layout(hwnd);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
             0x8007 => {
                 if s.dragging_out {
                     return 0;
@@ -10122,14 +10678,7 @@ struct ExceptionPointers {
 unsafe extern "system" fn seh_filter(ep: *mut ExceptionPointers) -> i32 {
     if !ep.is_null() && !(*ep).record.is_null() {
         let code = (*(*ep).record).code;
-        let addr = (*(*ep).record).address;
-        let msg = format!("SEH CRASH DETECTED: code=0x{:08X}, addr={:?}\n", code, addr);
-        let _ = std::fs::write("wisp_crash.log", &msg);
-        let _ = std::fs::write(
-            "C:\\Users\\blur\\AppData\\Local\\Temp\\antigravity\\wisp_crash.log",
-            &msg,
-        );
-        eprintln!("{}", msg);
+        diagnostics::crash(code);
     }
     1
 }
@@ -10141,21 +10690,21 @@ extern "system" {
 }
 
 fn main() {
+    diagnostics::init();
+    if updater::helper_mode() {
+        return;
+    }
     unsafe {
         SetUnhandledExceptionFilter(seh_filter);
     }
     std::panic::set_hook(Box::new(|info| {
-        let msg = format!(
-            "PANIC: {:?}\nLocation: {:?}\nBacktrace:\n{:?}",
-            info,
-            info.location(),
-            std::backtrace::Backtrace::capture()
-        );
-        eprintln!("{}", msg);
-        let _ = std::fs::write("wisp_panic.log", &msg);
-        let _ = std::fs::write(
-            "C:\\Users\\blur\\AppData\\Local\\Temp\\antigravity\\wisp_panic.log",
-            &msg,
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        diagnostics::error(
+            "panic",
+            &format!("Rust panic; location={location}; payload omitted for privacy"),
         );
     }));
     unsafe {
@@ -10178,6 +10727,11 @@ fn main() {
             small_icon: null_mut(),
         };
         if RegisterClassExW(&wc) == 0 {
+            diagnostics::failure(
+                "window",
+                "Register window class",
+                &std::io::Error::last_os_error(),
+            );
             OleUninitialize();
             return;
         }
@@ -10196,6 +10750,11 @@ fn main() {
             null_mut(),
         );
         if hwnd.is_null() {
+            diagnostics::failure(
+                "window",
+                "Create native window",
+                &std::io::Error::last_os_error(),
+            );
             OleUninitialize();
             return;
         }
@@ -10218,6 +10777,8 @@ fn main() {
         SetWindowLongPtrW(hwnd, -21, (&mut *state) as *mut State as isize);
         state.layout(hwnd);
         ShowWindow(hwnd, 4);
+        updater::health_ready();
+        diagnostics::info("app", "Native window initialized successfully");
         let running = state.running.clone();
         let pace = state.pace.clone();
         let window = hwnd as usize;
@@ -10274,6 +10835,7 @@ fn main() {
             DispatchMessageW(&msg);
         }
     }
+    diagnostics::info("app", "Wisp stopped normally");
 }
 #[cfg(test)]
 mod tests {
@@ -10533,6 +11095,33 @@ mod tests {
         assert!(s.todo_input.is_empty());
     }
 
+    #[test]
+    fn updater_settings_targets_stay_inside_the_updates_page() {
+        let mut s = create_test_state();
+        assert_eq!(s.settings_hit(280., 310.), 5405);
+        assert_eq!(s.settings_hit(370., 310.), 5200);
+        assert_eq!(s.settings_hit(40., 274.), -1);
+        s.settings_subpage = 2;
+        assert_eq!(s.settings_hit(40., 75.), 5401);
+        assert_eq!(s.settings_hit(40., 260.), 5400);
+        assert_eq!(s.settings_hit(280., 260.), 5402);
+        assert_eq!(s.settings_hit(40., 295.), 5260);
+        assert_eq!(s.settings_hit(430., 75.), -1);
+        let lines = update_note_lines("one two\nthree");
+        assert_eq!(lines, vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn shelf_alert_yes_button_fits_inside_shelf() {
+        let mut s = create_test_state();
+        s.active_tab = TAB_SHELF;
+        let (x, y, w, h) = shelf_alert_button(&s);
+        assert!(x >= 0. && y >= 0.);
+        assert!(x + w <= page_w(TAB_SHELF));
+        assert!(y + h <= s.page_h(TAB_SHELF));
+        assert!(s.shelf_alert.is_none());
+    }
+
     fn create_test_state() -> State {
         State {
             expanded: true,
@@ -10686,6 +11275,10 @@ mod tests {
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
             settings_subpage: 0,
+            updater: updater::Updater::default(),
+            web_drop_rx: None,
+            web_drop_status: String::new(),
+            shelf_alert: None,
             bg_custom_pixels: None,
             backdrop: Default::default(),
             backdrop_busy: Default::default(),

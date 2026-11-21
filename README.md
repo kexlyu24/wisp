@@ -46,7 +46,36 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 
 Wisp uses Apple's **SF Pro Display** if you've [installed it](https://developer.apple.com/fonts/), and otherwise the built-in Inter font.
 
-**Privacy:** everything stays in `%APPDATA%\Wisp`. The only network requests are lyrics lookups (song title and artist). Notifications are read locally and never stored or sent.
+**Privacy:** application data stays in `%APPDATA%\Wisp`. Network requests include lyrics lookups (song title and artist), GitHub release checks, and update downloads when requested. Automatic update checks can be disabled in Settings → Updates. Notifications are read locally and never stored or sent.
+
+## Local diagnostics
+
+Wisp writes English diagnostic records to `%APPDATA%\Wisp\wisp.log`, with local
+timestamps, severity, component and process ID. Logs rotate at 2 MiB and keep
+three previous archives. They cover startup/shutdown, update operations, image
+drops, data-file failures and selected integration errors. Repeated integration
+errors are rate-limited. User text, clipboard content, full URLs and credentials
+are not logged. Native crashes use a separate best-effort `wisp_crash.log`.
+Logs stay local; share them manually when reporting a problem. Logging is
+best-effort and may drop records during concurrent writes or abrupt termination.
+
+## Browser image drops (candidate)
+
+Drag a direct HTTPS image from Chrome or Edge onto the shelf. Wisp downloads it
+in the background, validates it and keeps a PNG copy in `%APPDATA%\Wisp\web-images`.
+Local file drops still work. Supported sources are PNG/JPEG/WebP/BMP images up to
+20 MiB and 8192 pixels per dimension. Sites requiring login, blob/data URLs and
+SVG/GIF are not supported. Cached copies remain after removing a shelf item;
+they can be deleted manually when no longer needed. Dropping web content sends
+a request to that image host, without importing browser cookies.
+
+## In-app updates (candidate)
+
+Settings → Updates provides stable-release checks, release notes, signed downloads
+and explicit Restart & update. No browser or account is required. Update packages
+must be published by the maintainer; historical ZIP-only releases cannot be
+installed through the updater. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
+recovery limitations and the user-run verification checklist.
 
 ## Text editing
 
