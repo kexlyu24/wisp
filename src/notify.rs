@@ -237,6 +237,7 @@ unsafe fn run(tx: Sender<Notice>, initial_last: Option<i64>) {
         if !ok {
             consecutive_errors += 1;
             if consecutive_errors >= 5 {
+                crate::diagnostics::limited_error("notifications", "Notification database queries failed repeatedly; reopening database");
                 if let Some(new_db) = Db::open() {
                     db = new_db;
                     consecutive_errors = 0;

@@ -152,7 +152,7 @@ impl Settings {
     }
     pub fn load() -> Self {
         crate::tasks::data_path("settings.txt")
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|p| crate::diagnostics::read_text(p))
             .map(|src| Self::parse(&src))
             .unwrap_or_default()
     }
