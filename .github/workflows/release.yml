@@ -1,0 +1,82 @@
+name: Release
+
+# Pushing a version tag (v0.2.2, or a hotfix like v0.2.2hf) builds Wisp on Windows and attaches
+# the zip and the bare exe to a *draft* GitHub Release. The updater files (wisp-update.json and
+# its .sig) are signed afterwards on the owner's PC with scripts/sign-release.py: the private
+# signing key never comes to GitHub.
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install the GNU toolchain
+      run: |
+        rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+        rustup default stable-x86_64-pc-windows-gnu
+
+    # v0.2.2 needs Cargo version 0.2.2; v0.2.2hf needs 0.2.2+hf.
+    - name: Check the tag matches Cargo.toml
+      shell: pwsh
+      run: |
+        $tag = "${{ github.ref_name }}"
+        $version = $tag.Substring(1)
+        $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+        if ($cargo -ne ($version -replace 'hf$', '+hf')) { throw "tag $tag does not match Cargo.toml version $cargo" }
+        "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Run tests
+      run: cargo test --locked
+
+    - name: Build release
+      run: cargo build --release --locked
+
+    - name: Smoke test
+      shell: pwsh
+      run: |
+        $p = Start-Process -FilePath target/release/wisp.exe -ArgumentList '--smoke-test' -PassThru
+        if (-not $p.WaitForExit(30000)) { $p.Kill(); throw "smoke test did not exit within 30 s" }
+        $result = Get-Content smoke-result.txt -Raw
+        Write-Output $result
+        if (-not $result.StartsWith('PASS')) { throw "smoke test failed" }
+
+    - name: Package
+      shell: pwsh
+      run: |
+        $name = "Wisp-$env:VERSION-windows-x64"
+        New-Item -ItemType Directory -Path "out/$name" | Out-Null
+        Copy-Item target/release/wisp.exe "out/$name/wisp.exe"
+        Copy-Item dist/README-TESTER.txt "out/$name/README.txt"
+        Copy-Item LICENSE "out/$name/LICENSE.txt"
+        Copy-Item assets/fonts/Inter-LICENSE.txt "out/$name/Inter-LICENSE.txt"
+        Compress-Archive -Path "out/$name" -DestinationPath "out/$name.zip"
+        Copy-Item target/release/wisp.exe out/wisp-windows-x64.exe
+        Get-FileHash "out/$name.zip", out/wisp-windows-x64.exe -Algorithm SHA256 | Format-Table Hash, Path -AutoSize | Out-String -Width 200
+
+    - name: Draft the GitHub Release
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $tag = "${{ github.ref_name }}"
+        $assets = "out/Wisp-$env:VERSION-windows-x64.zip", "out/wisp-windows-x64.exe"
+        $draft = gh release view $tag --json isDraft --jq .isDraft 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          # Re-running only refreshes a draft; a published release is never overwritten.
+          if ($draft -ne 'true') { throw "release $tag is already published; not touching it" }
+          gh release upload $tag @assets --clobber
+        } else {
+          gh release create $tag @assets --draft --verify-tag --title "Wisp $env:VERSION" --notes "Draft built by CI. Sign the updater files with scripts/sign-release.py, add the release notes, then publish."
+        }
