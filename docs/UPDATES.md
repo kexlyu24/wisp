@@ -1,4 +1,4 @@
-# In-app updates (candidate)
+# In-app updates
 
 Open **Settings > Updates**. Checks use the latest stable GitHub Release in
 `kexlyu24/wisp`; drafts and prereleases are ignored. Automatic checks are enabled
@@ -49,9 +49,10 @@ Manual checks have a persisted 60-second cooldown, including failed attempts;
 the primary action is disabled while checking/downloading. This reduces repeated
 requests but does not bypass GitHub rate limits or HTTP 403 responses.
 
-A public update with these assets has **not** been published as part of this
-implementation. The historical v0.2.0 ZIP alone is not updater-compatible.
-Pushing a branch is not publishing an update.
+v0.2.1 is the first release meant to carry these assets. Releases up to and
+including v0.2.0 have no updater, so their users install 0.2.1 from the zip once;
+later releases then arrive through Settings > Updates. Pushing a branch is not
+publishing an update.
 
 ### Maintainer packaging
 
@@ -81,8 +82,8 @@ Windows Authenticode/SmartScreen reputation is separate from updater signing.
 
 ## User-run verification
 
-Automated regression tests are written and compile-checked, not executed by the
-agent. The updater/application has not been launched by the agent.
+The `updater::tests` unit tests pass (`cargo test`, 0.2.1). A real
+download, replace and roll-back has not been run yet; do the checks below.
 
 - Open Updates; check current version, auto-check toggle persistence and Back.
 - Check while offline; confirm a useful error and responsive UI; retry online.
