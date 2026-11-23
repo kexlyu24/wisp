@@ -56,10 +56,12 @@ publishing an update.
 
 ### Maintainer packaging
 
-The initial signing seed is stored locally outside the repository at
-`C:\Users\Administrator\AppData\Local\hermes\wisp-update-signing-key.hex`.
-Do not upload that file, paste its contents into chat or commit it. Back it up
-securely: losing it prevents signing updates accepted by existing installations.
+The signing seed is stored locally outside the repository at
+`C:\Users\eq\Documents\wisp-update-signing-key.hex`. It was created for 0.2.1,
+replacing the original key, which was lost before any signed release shipped.
+Do not upload that file, paste its contents into chat or commit it. **Back it up
+now** (for example to an encrypted USB drive or a password manager): losing it
+means no later release can be signed in a way existing installations accept.
 Public-key rotation requires a deliberate migration in a trusted release.
 
 1. Set the correct stable `[package].version` in Cargo.toml, matching the tag.
