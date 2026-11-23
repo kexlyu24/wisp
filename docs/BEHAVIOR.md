@@ -123,7 +123,7 @@ avoid deadlock. Native exception recording bypasses the regular logger lock;
 it remains best-effort, not a crash dump. Running multiple instances may cause
 rotation contention. Runtime and rotation tests remain user-run.
 
-## Browser image drop candidate
+## Browser image drops
 
 OLE drops first preserve the existing local-file path. Otherwise Wisp reads the
 browser HTML image src, then Unicode/ANSI URL formats. A single background worker
@@ -153,9 +153,9 @@ handling; availability alone does not guarantee GetData will succeed.
 User-run checks: drag public PNG/JPEG/WebP images from Chrome and Edge, wait for
 completion, open and drag the cached item to Explorer; retry the same image,
 check offline/non-image URL failures, and confirm local-file drops still work.
-The application and regression tests are compile-checked only, not executed.
+The `web_drop` unit tests pass; real browser drops are user-run.
 
-## In-app update candidate
+## In-app updates
 
 Settings > Updates opens a dedicated page in the existing settings surface.
 It shows the installed version, daily-at-startup automatic-check toggle, current
@@ -182,7 +182,7 @@ Manual verification (user-run): repeat the To-do selection/clipboard checks in
 each field, edit an existing calendar event, clear search using its x button,
 switch shortcut fields with Tab/Enter, cancel/reopen forms and paste long text.
 Confirm that only Enter or an explicit launch/save action executes a command.
-Regression tests are compile-checked only; runtime and UI testing is user-run.
+The `todo_input` unit tests pass; runtime and UI testing is user-run.
 
 ## Quick Access
 

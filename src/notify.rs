@@ -177,7 +177,8 @@ unsafe fn run(tx: Sender<Notice>, initial_last: Option<i64>) {
                         l = sqlite3_column_int64(stmt, 0).unwrap_or(0);
                         initialized = true;
                     },
-                ) && initialized {
+                ) && initialized
+                {
                     break l;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -237,7 +238,10 @@ unsafe fn run(tx: Sender<Notice>, initial_last: Option<i64>) {
         if !ok {
             consecutive_errors += 1;
             if consecutive_errors >= 5 {
-                crate::diagnostics::limited_error("notifications", "Notification database queries failed repeatedly; reopening database");
+                crate::diagnostics::limited_error(
+                    "notifications",
+                    "Notification database queries failed repeatedly; reopening database",
+                );
                 if let Some(new_db) = Db::open() {
                     db = new_db;
                     consecutive_errors = 0;
@@ -750,9 +754,18 @@ mod tests {
         let spaced_empty = parse_toast(r#"<toast><visual><binding><text>Title</text><text id="1" /><text>Body</text></binding></visual></toast>"#).unwrap();
         assert_eq!(spaced_empty.title, "Title");
         assert_eq!(spaced_empty.body, "Body");
-        assert_eq!(local_path("file:///C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
-        assert_eq!(local_path("file://C:/path/to/img.png").as_deref(), Some("C:\\path\\to\\img.png"));
-        assert_eq!(local_path("C:\\path\\to\\img.png").as_deref(), Some("C:\\path\\to\\img.png"));
+        assert_eq!(
+            local_path("file:///C:/path/to/img.png").as_deref(),
+            Some("C:\\path\\to\\img.png")
+        );
+        assert_eq!(
+            local_path("file://C:/path/to/img.png").as_deref(),
+            Some("C:\\path\\to\\img.png")
+        );
+        assert_eq!(
+            local_path("C:\\path\\to\\img.png").as_deref(),
+            Some("C:\\path\\to\\img.png")
+        );
         assert_eq!(local_path("https://example.com/a.png"), None);
         assert_eq!(
             unescape_xml("&#x1F44B; &#65; &bogus; &"),
@@ -797,15 +810,23 @@ mod live {
         let rx = start(None);
         // Give worker thread a moment to initialize and query max order
         std::thread::sleep(Duration::from_millis(500));
-        let title_rand = format!("WispTest_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-        let cmd = format!(r#"
+        let title_rand = format!(
+            "WispTest_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let cmd = format!(
+            r#"
             $template = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);
             $texts = $template.GetElementsByTagName('text');
             $texts.Item(0).AppendChild($template.CreateTextNode('{title_rand}')) | Out-Null;
             $texts.Item(1).AppendChild($template.CreateTextNode('Testing live delivery')) | Out-Null;
             $toast = [Windows.UI.Notifications.ToastNotification]::new($template);
             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WispTestApp').Show($toast);
-        "#);
+        "#
+        );
         let _ = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", &cmd])
             .output();
@@ -821,7 +842,10 @@ mod live {
                 }
             }
         }
-        assert!(found, "Notification should be received by start() receiver!");
+        assert!(
+            found,
+            "Notification should be received by start() receiver!"
+        );
     }
 
     #[test]
@@ -836,7 +860,10 @@ mod live {
                  left join NotificationHandler h on h.RecordId = n.HandlerId \
                  where lower(n.Type) = 'toast' order by n.[Order] desc limit ?1",
                 5,
-                |stmt| rows.push((String::from_utf8_lossy(&column_bytes(stmt, 0, false)).into_owned(), String::from_utf8_lossy(&column_bytes(stmt, 1, true)).into_owned())),
+                |stmt| rows.push((
+                    String::from_utf8_lossy(&column_bytes(stmt, 0, false)).into_owned(),
+                    String::from_utf8_lossy(&column_bytes(stmt, 1, true)).into_owned()
+                )),
             ));
             for (aumid, payload) in rows {
                 let (app, icon) = app_info(&aumid);

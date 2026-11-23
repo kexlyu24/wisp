@@ -25,6 +25,7 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 - 📥 **File shelf**: drop files on the notch, drag them back out, and group them into folders
 - 🪶 **Minimal mode**: shrinks to a sliver when it would hide something, like browser tabs
 - 🚀 **Quick Access**: search and launch apps, or add your own shortcuts
+- ⬆️ **In-app updates**: signed downloads from GitHub Releases, installed only when you click Restart & update
 - ⚙️ **Settings** right inside the notch, including the background (black by default, frosted glass, or your own image), and every movement runs on springs
 
 <table>
@@ -59,7 +60,7 @@ are not logged. Native crashes use a separate best-effort `wisp_crash.log`.
 Logs stay local; share them manually when reporting a problem. Logging is
 best-effort and may drop records during concurrent writes or abrupt termination.
 
-## Browser image drops (candidate)
+## Browser image drops
 
 Drag a direct HTTPS image from Chrome or Edge onto the shelf. Wisp downloads it
 in the background, validates it and keeps a PNG copy in `%APPDATA%\Wisp\web-images`.
@@ -69,12 +70,12 @@ SVG/GIF are not supported. Cached copies remain after removing a shelf item;
 they can be deleted manually when no longer needed. Dropping web content sends
 a request to that image host, without importing browser cookies.
 
-## In-app updates (candidate)
+## In-app updates
 
 Settings → Updates provides stable-release checks, release notes, signed downloads
 and explicit Restart & update. No browser or account is required. Update packages
-must be published by the maintainer; historical ZIP-only releases cannot be
-installed through the updater. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
+must be published by the maintainer; 0.2.1 is the first release with them, so
+update from 0.2.0 or older by downloading the zip once. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
 recovery limitations and the user-run verification checklist.
 
 ## Text editing
@@ -89,7 +90,7 @@ unchanged (Calendar: 100; Quick Access fields: 80; To-do: 120).
 Click inside the task field to place the caret, or drag to select text. Use Left/Right,
 Home/End (hold Shift to select), Ctrl+A/C/X/V, Backspace and Delete. Long drafts scroll
 with the caret; Enter adds the task, and Escape leaves the draft without adding it.
-These editing shortcuts currently apply only to To-do, not Calendar or Quick Access.
+The same shortcuts work in the Calendar and Quick Access fields listed above.
 
 ## Build
 
@@ -123,6 +124,11 @@ Every behavior, size and timing is documented in **[docs/BEHAVIOR.md](docs/BEHAV
       <a href="https://github.com/aoisaki01"><img src="https://avatars.githubusercontent.com/u/198209758?v=4&s=200" width="88" height="88" alt="aoisaki01"></a><br>
       <a href="https://github.com/aoisaki01"><b>aoisaki01</b></a><br>
       <sub>🧩 Quick Access · 🎨 Background themes</sub>
+    </td>
+    <td align="center" width="230">
+      <a href="https://github.com/levialavender"><img src="https://avatars.githubusercontent.com/u/124757715?v=4&s=200" width="88" height="88" alt="levialavender"></a><br>
+      <a href="https://github.com/levialavender"><b>levialavender</b></a><br>
+      <sub>✏️ Text editing · ⬆️ Updater · 🖼️ Image drops</sub>
     </td>
   </tr>
 </table>

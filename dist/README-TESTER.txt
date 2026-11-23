@@ -1,4 +1,4 @@
-WISP 0.1.9 FOR WINDOWS
+WISP 0.2.1 FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
@@ -32,7 +32,8 @@ Want the exact original look? SF Pro is a free download from Apple:
 ------------
   - Hover the notch to open it. Move away to close it.
   - Scroll or swipe on the open notch to switch pages:
-    Now Playing, Calendar, To-do, Pomodoro, Shelf, Settings.
+    Now Playing, Calendar, To-do, Pomodoro, Shelf, Quick Access,
+    Notifications, Settings.
   - Calendar: pick a date, click "Add an event", type a title, set the
     time with - / + (or choose "All day") and click Add. Click an event
     to change it, or its x to delete it.
@@ -45,6 +46,9 @@ Want the exact original look? SF Pro is a free download from Apple:
     follows it; for Spotify, Chrome and Edge it sets that app's level in
     the Windows Volume Mixer. Your Windows volume stays as it is.
   - Drop files on the notch to keep them on the shelf. Drag them back out.
+    You can also drag an image straight from Chrome or Edge onto the notch.
+  - Text fields (To-do, Calendar, Quick Access) support selecting with the
+    mouse or Shift+arrows, Home/End and Ctrl+A/C/X/V.
   - Notifications from any app pop up in the notch.
   - When the notch would hide something (say, browser tabs that reach
     it), it shrinks to a thin sliver so it stays visible. An empty title
@@ -57,6 +61,8 @@ Want the exact original look? SF Pro is a free download from Apple:
   - Settings: click the gear at the right end of the notch's header, or click
     the Wisp icon in the system tray (near the clock, maybe behind the ^
     arrow) and choose "Settings...". "Quit Wisp" is in both places.
+  - Updates: Settings > Updates checks for a new version, downloads it
+    and installs it when you click Restart & update.
 
 
 4. GOOD TO KNOW
@@ -64,10 +70,13 @@ Want the exact original look? SF Pro is a free download from Apple:
   - Your to-dos, calendar events, shelf, settings and cached lyrics are
     stored in
     %APPDATA%\Wisp. Delete that folder to reset everything.
-  - The only internet access is looking up lyrics on lrclib.net
-    (it sends the song title, artist, album and length). If LRCLIB
-    has no synced lyrics, it asks music.163.com (NetEase) with the
-    title and artist.
+  - Internet access: lyrics lookups on lrclib.net (song title, artist,
+    album and length) and, if LRCLIB has no synced lyrics, music.163.com
+    (NetEase) with the title and artist; update checks and downloads from
+    GitHub (turn off automatic checks in Settings > Updates); and images
+    you drag in from a browser, fetched from that image's site.
+  - Wisp keeps a local troubleshooting log in %APPDATA%\Wisp\wisp.log.
+    It never leaves your PC; attach it when you report a problem.
   - Notifications are only read on your PC, never stored or sent.
   - To remove Wisp: quit it from the tray, delete wisp.exe and the
     %APPDATA%\Wisp folder. If you turned on "Start with Windows", turn it
