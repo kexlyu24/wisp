@@ -10846,7 +10846,11 @@ mod tests {
         unsafe {
             OleInitialize(null_mut());
         }
-        let dir = std::env::temp_dir().join("wisp-dragout-test");
+        // The shell hands back long names, while TEMP can be a short 8.3 path (RUNNER~1 on CI),
+        // so start from the long form.
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let temp = temp.to_string_lossy();
+        let dir = std::path::PathBuf::from(temp.trim_start_matches(r"\\?\")).join("wisp-dragout-test");
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let a = dir.join("a.txt");
