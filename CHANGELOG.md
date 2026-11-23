@@ -2,6 +2,23 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
+## [0.2.1] - 2026-11-23
+
+### Added
+- **Text editing** in the To-do, Calendar event title and Quick Access search, name and command fields: click to place the caret, drag or Shift-click to select, Left/Right/Home/End (Shift extends), Ctrl+A/C/X/V, Backspace/Delete, and horizontal scrolling for long text. Pasted line breaks and control characters are removed, and the character limits stay the same (To-do 120, Calendar 100, Quick Access 80) (#22).
+- **In-app updater** (Settings > Updates): checks the latest stable GitHub Release, shows its notes, downloads in the background with progress and cancel, and verifies an Ed25519-signed manifest, size, SHA-256 and the x64 executable before Restart & update replaces `wisp.exe`. If the new version fails to start within 15 seconds, the helper tries to restore the previous executable. Automatic checks run at most once a day at startup and can be turned off; manual checks have a 60-second cooldown (#22).
+- **Browser image drops**: drag a direct HTTPS PNG, JPEG, WebP or BMP image from Chrome or Edge onto the notch and it is downloaded (no browser cookies, up to 20 MiB and 8192 px), saved as a PNG in `%APPDATA%\Wisp\web-images` and added to the shelf. Failures show an in-app alert (#22).
+- **Local diagnostics**: `%APPDATA%\Wisp\wisp.log` records startup, updates, image drops and data-file errors, rotating at 2 MiB with three archives. User text, clipboard contents, full URLs and credentials are never logged, and nothing is sent anywhere (#22).
+
+### Changed
+- The README's privacy note lists update checks and update downloads as network requests.
+
+### Known limitations
+- WhatsApp Web image drops are not supported: they use blob URLs, and reading the virtual-file data they offer is not implemented.
+- 0.2.0 and older have no updater, so updating to 0.2.1 means downloading the zip once.
+- The updater's replace and roll-back paths have not yet been exercised end to end on Windows.
+- Apple Music's volume adapter only detects the app; it does not change the volume yet.
+
 ## [0.1.9] - 2026-11-04
 
 ### Added

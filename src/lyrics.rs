@@ -102,6 +102,12 @@ pub fn start() -> (Sender<Request>, Receiver<Reply>) {
                     Some(client) => fetch(client, &req),
                     None => Status::Failed,
                 };
+                if matches!(status, Status::Failed) {
+                    crate::diagnostics::limited_error(
+                        "lyrics",
+                        "Lyrics lookup failed; retrying with backoff; track metadata omitted",
+                    );
+                }
                 if !matches!(status, Status::Failed) {
                     break;
                 }

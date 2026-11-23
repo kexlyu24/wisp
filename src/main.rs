@@ -1,13 +1,17 @@
 #![windows_subsystem = "windows"]
 
+mod diagnostics;
 mod lyrics;
 mod media;
 mod notify;
 mod render;
 mod settings;
 mod tasks;
+mod todo_input;
 mod tray;
+mod updater;
 mod volume;
+mod web_drop;
 use std::{ffi::c_void, mem::size_of, ptr::null_mut};
 type Handle = *mut c_void;
 type Hwnd = Handle;
@@ -109,6 +113,7 @@ extern "system" {
     fn TrackMouseEvent(event: *mut MouseTracking) -> i32;
     fn MessageBeep(kind: u32) -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    fn GetKeyState(key: i32) -> i16;
     fn SystemParametersInfoW(action: u32, param: u32, value: *mut c_void, flags: u32) -> i32;
     fn UpdateLayeredWindow(
         hwnd: Hwnd,
@@ -187,6 +192,8 @@ extern "system" {
         offset: u32,
     ) -> Handle;
     fn GdiFlush() -> i32;
+    fn SaveDC(dc: Handle) -> i32;
+    fn RestoreDC(dc: Handle, saved: i32) -> i32;
     fn IntersectClipRect(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     fn SelectClipRgn(dc: Handle, region: Handle) -> i32;
     fn GetTextExtentPoint32W(dc: Handle, text: *const u16, len: i32, size: *mut Size) -> i32;
@@ -476,7 +483,12 @@ unsafe extern "system" fn dt_drop(
 ) -> i32 {
     if !this.is_null() {
         let paths = extract_hdrop_paths(p_data_obj);
-        SendMessageW((*this).hwnd, 0x8006, &paths as *const _ as usize, 0);
+        if !paths.is_empty() {
+            SendMessageW((*this).hwnd, 0x8006, &paths as *const _ as usize, 0);
+        } else {
+            let url = extract_browser_image(p_data_obj);
+            SendMessageW((*this).hwnd, 0x8008, &url as *const _ as usize, 0);
+        }
     }
     if !pdw_effect.is_null() {
         *pdw_effect = 1;
@@ -528,6 +540,171 @@ unsafe fn extract_hdrop_paths(p_data_obj: *mut IDataObject) -> Vec<String> {
     }
     ReleaseStgMedium(&mut medium);
     paths
+}
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterClipboardFormatW(name: *const u16) -> u32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn GlobalLock(memory: Handle) -> *mut c_void;
+    fn GlobalUnlock(memory: Handle) -> i32;
+    fn GlobalSize(memory: Handle) -> usize;
+}
+unsafe fn drop_format_bytes(object: *mut IDataObject, format: u16) -> Option<Vec<u8>> {
+    if object.is_null() || (*object).lp_vtbl.is_null() {
+        return None;
+    }
+    let format = FormatEtc {
+        cf_format: format,
+        _pad: [0; 6],
+        ptd: null_mut(),
+        dw_aspect: 1,
+        lindex: -1,
+        tymed: 1,
+    };
+    let mut medium: StgMedium = std::mem::zeroed();
+    if ((*(*object).lp_vtbl).get_data)(object.cast(), &format, &mut medium) != 0 {
+        return None;
+    }
+    let mut bytes = None;
+    if medium.tymed == 1 && !medium.h_global.is_null() {
+        let size = GlobalSize(medium.h_global);
+        if size > 0 && size <= 1024 * 1024 {
+            let ptr = GlobalLock(medium.h_global);
+            if !ptr.is_null() {
+                bytes = Some(std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec());
+                GlobalUnlock(medium.h_global);
+            }
+        }
+    }
+    ReleaseStgMedium(&mut medium);
+    bytes
+}
+/// QueryGetData only: inspect availability without reading image/chat contents.
+unsafe fn diagnose_browser_formats(object: *mut IDataObject) {
+    if object.is_null() || (*object).lp_vtbl.is_null() {
+        return;
+    }
+    // IDataObject slot 5 is QueryGetData (after IUnknown, GetData, GetDataHere).
+    let slots = (*object).lp_vtbl.cast::<*const c_void>();
+    let query: unsafe extern "system" fn(*mut c_void, *const FormatEtc) -> i32 =
+        std::mem::transmute(*slots.add(5));
+    let formats = [
+        ("CF_BITMAP", 2u16),
+        ("CF_DIB", 8),
+        ("CF_DIBV5", 17),
+        ("PNG", RegisterClipboardFormatW(wide("PNG").as_ptr()) as u16),
+        (
+            "image/png",
+            RegisterClipboardFormatW(wide("image/png").as_ptr()) as u16,
+        ),
+        (
+            "FileGroupDescriptorW",
+            RegisterClipboardFormatW(wide("FileGroupDescriptorW").as_ptr()) as u16,
+        ),
+        (
+            "FileGroupDescriptor",
+            RegisterClipboardFormatW(wide("FileGroupDescriptor").as_ptr()) as u16,
+        ),
+        (
+            "FileContents",
+            RegisterClipboardFormatW(wide("FileContents").as_ptr()) as u16,
+        ),
+    ];
+    diagnostics::info(
+        "shelf",
+        "Browser drag image/virtual-file format probe started; availability only",
+    );
+    for (name, id) in formats {
+        if id == 0 {
+            continue;
+        }
+        for (medium, tymed) in [("HGLOBAL", 1u32), ("ISTREAM", 4), ("GDI", 16)] {
+            // FileContents uses an item index; other formats conventionally use -1.
+            let indices: &[i32] = if name == "FileContents" {
+                &[-1, 0]
+            } else {
+                &[-1]
+            };
+            for index in indices {
+                let format = FormatEtc {
+                    cf_format: id,
+                    _pad: [0; 6],
+                    ptd: null_mut(),
+                    dw_aspect: 1,
+                    lindex: *index,
+                    tymed,
+                };
+                let hr = query(object.cast(), &format);
+                diagnostics::info("shelf",&format!("Drag format probe; format={name}; medium={medium}; index={index}; available={}; HRESULT=0x{:08X}",hr==0,hr as u32));
+            }
+        }
+    }
+    diagnostics::info(
+        "shelf",
+        "Browser drag format probe completed; no payload was read",
+    );
+}
+unsafe fn extract_browser_image(object: *mut IDataObject) -> Option<String> {
+    diagnose_browser_formats(object);
+    let mut found_html = false;
+    let mut found_url = false;
+    let html_format = RegisterClipboardFormatW(wide("HTML Format").as_ptr()) as u16;
+    if let Some(bytes) = drop_format_bytes(object, html_format) {
+        found_html = true;
+        diagnostics::info("shelf", "Browser drop offers HTML Format");
+        let lower = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        if lower.contains("blob:") {
+            diagnostics::log(
+                "WARN",
+                "shelf",
+                "Browser HTML references browser-local blob data; not accessible over HTTPS",
+            );
+        }
+        if lower.contains("data:image/") {
+            diagnostics::log(
+                "WARN",
+                "shelf",
+                "Browser HTML contains an embedded image; data URLs are not supported",
+            );
+        }
+        if let Some(url) = web_drop::image_source(&String::from_utf8_lossy(&bytes)) {
+            return Some(url);
+        }
+    }
+    for (name, unicode) in [
+        ("UniformResourceLocatorW", true),
+        ("UniformResourceLocator", false),
+    ] {
+        let format = RegisterClipboardFormatW(wide(name).as_ptr()) as u16;
+        if let Some(bytes) = drop_format_bytes(object, format) {
+            found_url = true;
+            diagnostics::info(
+                "shelf",
+                if unicode {
+                    "Browser drop offers Unicode URL format"
+                } else {
+                    "Browser drop offers ANSI URL format"
+                },
+            );
+            let text = if unicode {
+                let units: Vec<_> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .take_while(|c| *c != 0)
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or(&[])).into_owned()
+            };
+            if let Some(url) = web_drop::safe_url(&text) {
+                return Some(url);
+            }
+        }
+    }
+    diagnostics::log("WARN","shelf",&format!("Unsupported browser drop; HTML={found_html}; URL={found_url}; no accepted image source"));
+    None
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -731,6 +908,8 @@ struct State {
     wheel_acc: f64,
     todos: Vec<tasks::Todo>,
     todo_input: String,
+    todo_editor: todo_input::Editor,
+    input_editors: [todo_input::Editor; 4],
     todo_editing: bool,
     todo_scroll: usize,
     quick_items: Vec<tasks::QuickItem>,
@@ -757,7 +936,6 @@ struct State {
     /// The date whose list `agenda_t` animates in.
     agenda_key: (i32, u32, u32),
     cal_scroll: usize,
-    high_surrogate: u16,
     pomo: tasks::Pomodoro,
     timer_t: f64,
     timer_vel: f64,
@@ -829,6 +1007,10 @@ struct State {
     notif_badge_v: f64,
     settings: settings::Settings,
     settings_subpage: usize,
+    updater: updater::Updater,
+    web_drop_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    web_drop_status: String,
+    shelf_alert: Option<String>,
     bg_custom_pixels: Option<(usize, usize, Vec<u32>)>,
     /// Frosted glass: the blurred, tinted capture of what is behind the panel (DIB-sized, opaque),
     /// made on a short-lived thread so the ~20 ms capture and blur never stall a frame.
@@ -1010,6 +1192,8 @@ impl State {
                 tasks::load_todos()
             },
             todo_input: String::new(),
+            todo_editor: Default::default(),
+            input_editors: [100, 80, 80, 80].map(todo_input::Editor::with_limit),
             todo_editing: false,
             todo_scroll: 0,
             quick_items: if smoke {
@@ -1045,7 +1229,6 @@ impl State {
             agenda_v: 0.,
             agenda_key: (0, 0, 0),
             cal_scroll: 0,
-            high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
             timer_t: 0.,
             timer_vel: 0.,
@@ -1133,6 +1316,10 @@ impl State {
             deep_idle_ticks: 0,
             settings: loaded_settings,
             settings_subpage: 0,
+            updater: updater::Updater::new(!smoke),
+            web_drop_rx: None,
+            web_drop_status: String::new(),
+            shelf_alert: None,
             bg_custom_pixels,
             backdrop: Default::default(),
             backdrop_busy: Default::default(),
@@ -1591,9 +1778,8 @@ impl State {
             .min(self.todos.len().saturating_sub(TODO_ROWS));
     }
     fn push_input(&mut self, ch: char) {
-        if self.todo_input.chars().count() < 120 {
-            self.todo_input.push(ch);
-        }
+        self.todo_editor
+            .replace(&mut self.todo_input, ch.encode_utf8(&mut [0; 4]));
     }
     fn commit_todo(&mut self) {
         let text = self.todo_input.trim().to_string();
@@ -1602,10 +1788,68 @@ impl State {
         }
         self.todos.push(tasks::Todo { text, done: false });
         self.todo_input.clear();
+        self.todo_editor = Default::default();
         self.todo_scroll = self.todos.len().saturating_sub(TODO_ROWS);
         self.save_todos();
     }
+    fn active_input(&self) -> Option<usize> {
+        match self.active_tab {
+            TAB_TODO if self.todo_editing => Some(0),
+            TAB_CAL if self.cal_editing => Some(1),
+            TAB_QUICK if self.quick_editing => Some(2),
+            TAB_QUICK if self.quick_add_mode => Some(3 + self.quick_add_field),
+            _ => None,
+        }
+    }
+    fn input_mut(&mut self, id: usize) -> (&mut String, &mut todo_input::Editor) {
+        match id {
+            0 => (&mut self.todo_input, &mut self.todo_editor),
+            1 => (&mut self.cal_input, &mut self.input_editors[0]),
+            2 => (&mut self.quick_input, &mut self.input_editors[1]),
+            3 => (&mut self.quick_name_input, &mut self.input_editors[2]),
+            4 => (&mut self.quick_cmd_input, &mut self.input_editors[3]),
+            _ => unreachable!(),
+        }
+    }
+    fn input_geometry(id: usize) -> (usize, f64, f64) {
+        match id {
+            0 => (1, 52., TODO_W - 88.),
+            1 => (1, AGENDA_X + 28., AGENDA_W - 36.),
+            2 => (1, 54., QUICK_W - 174.),
+            _ => (2, 46., QUICK_W - 92.),
+        }
+    }
+    unsafe fn input_pointer(&mut self, id: usize, x: f64, extend: bool) {
+        let (font, left, width) = Self::input_geometry(id);
+        let (text, editor) = self.input_mut(id);
+        let (text, caret) = (text.clone(), editor.caret);
+        let caret_x = text_width(self.dc, self, font, &text[..caret]);
+        let total = text_width(self.dc, self, font, &text);
+        let scroll = self.input_mut(id).1.viewport(caret_x, total, width - 3.);
+        let pos = todo_input::Editor::hit(&text, x - left + scroll, |prefix| {
+            text_width(self.dc, self, font, prefix)
+        });
+        let (text, editor) = self.input_mut(id);
+        editor.move_to(text, pos, extend);
+    }
+    fn end_input_drag(&mut self) {
+        self.todo_editor.end_interaction();
+        for editor in &mut self.input_editors {
+            editor.end_interaction();
+        }
+    }
+    fn dragging_input(&self) -> Option<usize> {
+        if self.todo_editor.dragging {
+            Some(0)
+        } else {
+            self.input_editors
+                .iter()
+                .position(|e| e.dragging)
+                .map(|i| i + 1)
+        }
+    }
     unsafe fn todo_click(&mut self, hwnd: Hwnd, hit: i32) {
+        self.todo_editor.end_interaction();
         match hit {
             1000 => {
                 self.todo_editing = true;
@@ -1726,11 +1970,14 @@ impl State {
             tasks::save_quick_items(&self.quick_items);
         }
         self.quick_name_input.clear();
+        self.input_editors[2] = todo_input::Editor::with_limit(80);
         self.quick_cmd_input.clear();
+        self.input_editors[3] = todo_input::Editor::with_limit(80);
         self.quick_add_mode = false;
         self.quick_add_field = 0;
     }
     unsafe fn quick_click(&mut self, hwnd: Hwnd, hit: i32) {
+        self.end_input_drag();
         match hit {
             6000 => {
                 self.quick_editing = true;
@@ -1740,13 +1987,16 @@ impl State {
             }
             6001 => {
                 self.quick_input.clear();
+                self.input_editors[1] = todo_input::Editor::with_limit(80);
                 self.quick_scroll = 0;
             }
             6002 => {
                 self.quick_add_mode = !self.quick_add_mode;
                 self.quick_editing = false;
                 self.quick_name_input.clear();
+                self.input_editors[2] = todo_input::Editor::with_limit(80);
                 self.quick_cmd_input.clear();
+                self.input_editors[3] = todo_input::Editor::with_limit(80);
                 self.quick_add_field = 0;
                 if self.quick_add_mode {
                     SetForegroundWindow(hwnd);
@@ -1769,7 +2019,9 @@ impl State {
             6013 => {
                 self.quick_add_mode = false;
                 self.quick_name_input.clear();
+                self.input_editors[2] = todo_input::Editor::with_limit(80);
                 self.quick_cmd_input.clear();
+                self.input_editors[3] = todo_input::Editor::with_limit(80);
             }
             6099 => {
                 let cmd = self.quick_input.trim().to_string();
@@ -1899,6 +2151,7 @@ impl State {
     unsafe fn start_new_event(&mut self, hwnd: Hwnd) {
         if !self.cal_editing || self.cal_editing_id.is_some() {
             self.cal_input.clear();
+            self.input_editors[0] = todo_input::Editor::with_limit(100);
             self.cal_editing_id = None;
             self.cal_end.clear();
             let mut now = Time::default();
@@ -1920,6 +2173,7 @@ impl State {
         self.cal_editing = false;
         self.cal_editing_id = None;
         self.cal_input.clear();
+        self.input_editors[0] = todo_input::Editor::with_limit(100);
         self.cal_end.clear();
     }
     /// Moves the picked time by `steps` × 15 minutes, wrapping around midnight.
@@ -1992,6 +2246,8 @@ impl State {
                     let time = tasks::parse_time(&item.start_time);
                     self.cal_editing_id = Some(id);
                     self.cal_input = title;
+                    self.input_editors[0] = todo_input::Editor::with_limit(100);
+                    self.input_editors[0].move_to(&self.cal_input, self.cal_input.len(), false);
                     self.cal_time = time;
                     self.cal_end = end;
                     self.cal_editing = true;
@@ -2172,13 +2428,31 @@ impl State {
                 dt,
             )
         };
-        if self.active_tab != TAB_TODO {
+        if self.dragging_input().is_some()
+            && (self.dragging_input() != self.active_input() || !self.expanded)
+        {
+            unsafe {
+                ReleaseCapture();
+            }
+            self.end_input_drag();
+        }
+        if self.active_tab != TAB_TODO || !self.expanded {
+            if self.todo_editor.dragging {
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+            self.todo_editor.end_interaction();
             self.todo_editing = false;
         }
-        if self.active_tab != TAB_CAL {
+        if self.active_tab != TAB_CAL || !self.expanded {
+            self.input_editors[0].end_interaction();
             self.cal_editing = false;
         }
-        if self.active_tab != TAB_QUICK {
+        if self.active_tab != TAB_QUICK || !self.expanded {
+            self.input_editors[1..]
+                .iter_mut()
+                .for_each(todo_input::Editor::end_interaction);
             self.quick_editing = false;
             self.quick_add_mode = false;
         }
@@ -2371,14 +2645,8 @@ impl State {
                 d.progress = 1.0;
                 dismissing_animating = true;
             } else {
-                dismissing_animating |= spring(
-                    &mut d.progress,
-                    &mut d.velocity,
-                    1.0,
-                    22.,
-                    0.82,
-                    dt,
-                );
+                dismissing_animating |=
+                    spring(&mut d.progress, &mut d.velocity, 1.0, 22., 0.82, dt);
             }
         }
         self.dismissing_notifs.retain(|d| d.progress < 0.98);
@@ -2551,6 +2819,27 @@ impl State {
     /// Settings page targets: 5000+k switch row, 5200 Quit, 5250 Appearance drilldown, 5260 Back,
     /// 5300..=5304 style, 5310..=5313 opacity, 5320 import, 5321 reset, 5330..=5332 pos, 5340..=5343 blur, -1 none.
     fn settings_hit(&self, x: f64, y: f64) -> i32 {
+        if self.settings_subpage == 2 {
+            if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
+                return 5260;
+            }
+            if (65. ..93.).contains(&y) && (24. ..416.).contains(&x) {
+                return 5401;
+            }
+            if (246. ..276.).contains(&y) {
+                if (24. ..250.).contains(&x) {
+                    return if self.updater.action_enabled() {
+                        5400
+                    } else {
+                        -1
+                    };
+                }
+                if (260. ..416.).contains(&x) {
+                    return 5402;
+                }
+            }
+            return -1;
+        }
         if self.settings_subpage == 1 {
             // Back button (< Settings)
             if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
@@ -2610,6 +2899,9 @@ impl State {
         if (208. ..256.).contains(&y) && (24. ..416.).contains(&x) {
             return 5250;
         }
+        if (298. ..322.).contains(&y) && (238. ..322.).contains(&x) {
+            return 5405;
+        }
         // Quit button
         if (298. ..322.).contains(&y) && (SET_W - 24. - 84. ..SET_W - 24.).contains(&x) {
             return 5200;
@@ -2618,6 +2910,24 @@ impl State {
     }
     unsafe fn settings_click(&mut self, hwnd: Hwnd, hit: i32) {
         match hit {
+            5405 => self.settings_subpage = 2,
+            5401 => {
+                if !self.smoke {
+                    self.updater.toggle_auto();
+                }
+            }
+            5402 => self.updater.cancel(),
+            5400 if !self.smoke && self.updater.action_enabled() => match self.updater.phase {
+                updater::Phase::Ready => match self.updater.install() {
+                    Ok(()) => {
+                        DestroyWindow(hwnd);
+                    }
+                    Err(e) => self.updater.status = e,
+                },
+                updater::Phase::Available => self.updater.download(),
+                updater::Phase::Error if self.updater.release.is_some() => self.updater.download(),
+                _ => self.updater.check(),
+            },
             5000..=5006 => self.change_setting(hwnd, SETTING_ROWS[(hit - 5000) as usize].1),
             5200 => {
                 DestroyWindow(hwnd);
@@ -2831,7 +3141,11 @@ impl State {
         self.backdrop_at = Some(std::time::Instant::now());
         let (w, h) = (self.stride, (DIB_H * self.scale).ceil() as usize);
         let x0 = (GetSystemMetrics(0) - w as i32) / 2;
-        let tint = self.renderer.as_ref().and_then(|r| r.tint()).unwrap_or(rgb(210, 210, 215));
+        let tint = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.tint())
+            .unwrap_or(rgb(210, 210, 215));
         let (color, blur) = (style_rgb(style, tint), self.settings.bg_blur);
         let alpha = self.settings.bg_opacity.clamp(50, 100) * 255 / 100;
         let (out, busy) = (self.backdrop.clone(), self.backdrop_busy.clone());
@@ -3021,6 +3335,10 @@ impl State {
         self.shelf_remove_hover = -1;
     }
     fn add_shelf_items(&mut self, paths: &[String], hwnd: Hwnd) {
+        diagnostics::info(
+            "shelf",
+            &format!("Add shelf items requested; count={}", paths.len()),
+        );
         let mut added = false;
         if let Some(folder_idx) = self.active_folder {
             if folder_idx < self.shelf_items.len() && self.shelf_items[folder_idx].is_group() {
@@ -3316,7 +3634,7 @@ fn parse_shelf(src: &str) -> Vec<Vec<String>> {
 }
 /// Restores the saved shelf, dropping files that no longer exist (a group of one becomes a file).
 fn load_shelf() -> Vec<ShelfItem> {
-    let Some(src) = tasks::data_path("shelf.txt").and_then(|p| std::fs::read_to_string(p).ok())
+    let Some(src) = tasks::data_path("shelf.txt").and_then(|p| crate::diagnostics::read_text(p))
     else {
         return Vec::new();
     };
@@ -3541,7 +3859,11 @@ fn style_rgb(style: u32, tint: u32) -> (u32, u32, u32) {
     match style {
         1 => {
             let mix = |t: u32, base: u32| (t * 22 + base * 78) / 100;
-            (mix((tint >> 16) & 255, 14), mix((tint >> 8) & 255, 15), mix(tint & 255, 18))
+            (
+                mix((tint >> 16) & 255, 14),
+                mix((tint >> 8) & 255, 15),
+                mix(tint & 255, 18),
+            )
         }
         0 => (14, 15, 18),
         2 => (26, 27, 30),
@@ -3551,10 +3873,25 @@ fn style_rgb(style: u32, tint: u32) -> (u32, u32, u32) {
 /// Frosted glass from a screen capture `src` (w×h): blurred by `blur` px, on a quarter-size copy
 /// that looks the same at ~1/16 the cost, with the style colour laid over at `alpha` (0..=255).
 /// Returns opaque pixels.
-fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alpha: u32) -> Vec<u32> {
+fn frost(
+    src: &[u32],
+    w: usize,
+    h: usize,
+    blur: u32,
+    tint: (u32, u32, u32),
+    alpha: u32,
+) -> Vec<u32> {
     let mix = |c: f32, t: u32| ((c * (255 - alpha) as f32 + (t * alpha) as f32) / 255.) as u32;
-    let compose = |c: [f32; 3]| 0xff00_0000 | mix(c[0], tint.0) << 16 | mix(c[1], tint.1) << 8 | mix(c[2], tint.2);
-    let channels = |p: u32| [((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32];
+    let compose = |c: [f32; 3]| {
+        0xff00_0000 | mix(c[0], tint.0) << 16 | mix(c[1], tint.1) << 8 | mix(c[2], tint.2)
+    };
+    let channels = |p: u32| {
+        [
+            ((p >> 16) & 255) as f32,
+            ((p >> 8) & 255) as f32,
+            (p & 255) as f32,
+        ]
+    };
     if blur == 0 || w < 8 || h < 8 {
         return src.iter().map(|&p| compose(channels(p))).collect();
     }
@@ -3587,7 +3924,12 @@ fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alph
         let (y0, y1, ty) = axis(y, sh);
         for x in 0..w {
             let (x0, x1, tx) = axis(x, sw);
-            let (a, b, c, d) = (small[y0 * sw + x0], small[y0 * sw + x1], small[y1 * sw + x0], small[y1 * sw + x1]);
+            let (a, b, c, d) = (
+                small[y0 * sw + x0],
+                small[y0 * sw + x1],
+                small[y1 * sw + x0],
+                small[y1 * sw + x1],
+            );
             let px: [f32; 3] = std::array::from_fn(|i| {
                 let top = a[i] + (b[i] - a[i]) * tx;
                 top + (c[i] + (d[i] - c[i]) * tx - top) * ty
@@ -3599,24 +3941,25 @@ fn frost(src: &[u32], w: usize, h: usize, blur: u32, tint: (u32, u32, u32), alph
 }
 /// One horizontal and one vertical box blur of radius `r`, clamping at the edges.
 fn box_blur(buf: &mut [[f32; 3]], w: usize, h: usize, r: usize) {
-    let pass = |buf: &mut [[f32; 3]], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
-        let mut line = vec![[0f32; 3]; len];
-        let n = (2 * r + 1) as f32;
-        for l in 0..lines {
-            (0..len).for_each(|i| line[i] = buf[at(l, i)]);
-            let mut sum = [0f32; 3];
-            for j in 0..=2 * r {
-                let c = line[j.saturating_sub(r).min(len - 1)];
-                (0..3).for_each(|k| sum[k] += c[k]);
+    let pass =
+        |buf: &mut [[f32; 3]], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+            let mut line = vec![[0f32; 3]; len];
+            let n = (2 * r + 1) as f32;
+            for l in 0..lines {
+                (0..len).for_each(|i| line[i] = buf[at(l, i)]);
+                let mut sum = [0f32; 3];
+                for j in 0..=2 * r {
+                    let c = line[j.saturating_sub(r).min(len - 1)];
+                    (0..3).for_each(|k| sum[k] += c[k]);
+                }
+                for i in 0..len {
+                    buf[at(l, i)] = sum.map(|v| v / n);
+                    let add = line[(i + r + 1).min(len - 1)];
+                    let sub = line[i.saturating_sub(r)];
+                    (0..3).for_each(|k| sum[k] += add[k] - sub[k]);
+                }
             }
-            for i in 0..len {
-                buf[at(l, i)] = sum.map(|v| v / n);
-                let add = line[(i + r + 1).min(len - 1)];
-                let sub = line[i.saturating_sub(r)];
-                (0..3).for_each(|k| sum[k] += add[k] - sub[k]);
-            }
-        }
-    };
+        };
     pass(buf, w, h, &|l, i| l * w + i);
     pass(buf, h, w, &|l, i| i * w + l);
 }
@@ -4914,31 +5257,25 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
     round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
     let (tx, tw) = (fx + 28., fw - 36.);
-    let mut shown = s.cal_input.as_str();
-    while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-        let mut chars = shown.chars();
-        chars.next();
-        shown = chars.as_str();
-    }
-    if s.cal_input.is_empty() {
-        let hint = if s.cal_editing {
+    input_text(
+        dc,
+        s,
+        &s.input_editors[0],
+        &s.cal_input,
+        if s.cal_editing {
             "Event title"
         } else {
             "Add an event"
-        };
-        let color = if s.cal_editing { TERTIARY } else { SECONDARY };
-        text_opt(dc, s, 1, hint, color, tx, fy, tw, fh, false, o, dx);
-    } else {
-        text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
-    }
-    if s.cal_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let caret = if shown.is_empty() {
-            0.
-        } else {
-            text_width(dc, s, 1, shown)
-        };
-        round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
-    }
+        },
+        s.cal_editing,
+        1,
+        tx,
+        fy,
+        tw,
+        fh,
+        dx,
+        o,
+    );
 
     // While composing: the time picker and the buttons slide out from under the field.
     // They fade over the second half of the motion, so the list sliding up never shows
@@ -5299,6 +5636,22 @@ unsafe fn calendar_page(dc: Handle, s: &State, dx: f64, o: f64) {
     );
 }
 unsafe fn shelf_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if s.web_drop_rx.is_some() {
+        text_opt(
+            dc,
+            s,
+            3,
+            "Downloading image...",
+            SECONDARY,
+            24.,
+            42.,
+            page_w(TAB_SHELF) - 48.,
+            18.,
+            false,
+            o,
+            dx,
+        );
+    }
     if let Some(folder_idx) = s.active_folder {
         if folder_idx < s.shelf_items.len() && s.shelf_items[folder_idx].is_group() {
             let bx = s.breadcrumb_x();
@@ -5621,6 +5974,97 @@ fn pomo_hit(x: f64, y: f64) -> i32 {
     -1
 }
 // Apple Reminders-style list: a rounded input field, then rows with a circular checkbox.
+unsafe fn input_text(
+    dc: Handle,
+    s: &State,
+    editor: &todo_input::Editor,
+    text: &str,
+    placeholder: &str,
+    editing: bool,
+    font: usize,
+    tx: f64,
+    fy: f64,
+    tw: f64,
+    fh: f64,
+    dx: f64,
+    o: f64,
+) {
+    let total = text_width(dc, s, font, text);
+    let caret = text_width(dc, s, font, &text[..editor.caret]);
+    let scroll = editor.viewport(caret, total, tw - 3.);
+    let selected = editor.selection();
+    if editing && !selected.is_empty() {
+        let left = (text_width(dc, s, font, &text[..selected.start]) - scroll).clamp(0., tw);
+        let right = (text_width(dc, s, font, &text[..selected.end]) - scroll).clamp(0., tw);
+        round_opt(
+            s,
+            tx + left,
+            fy + 5.,
+            right - left,
+            fh - 10.,
+            2.,
+            BLUE,
+            o,
+            dx,
+        );
+    }
+    let saved = SaveDC(dc);
+    if saved != 0 {
+        let (ox, oy) = s.offset();
+        IntersectClipRect(
+            dc,
+            s.px(tx + ox + dx),
+            s.px(fy + oy),
+            s.px(tx + tw + ox + dx),
+            s.px(fy + fh + oy),
+        );
+        if text.is_empty() {
+            text_opt(
+                dc,
+                s,
+                font,
+                placeholder,
+                TERTIARY,
+                tx,
+                fy,
+                tw,
+                fh,
+                false,
+                o,
+                dx,
+            );
+        } else {
+            text_opt(
+                dc,
+                s,
+                font,
+                text,
+                WHITE,
+                tx - scroll,
+                fy,
+                total + 4.,
+                fh,
+                false,
+                o,
+                dx,
+            );
+        }
+        RestoreDC(dc, saved);
+    }
+    if editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
+        round_opt(
+            s,
+            tx + (caret - scroll).clamp(0., tw - 2.) + 1.,
+            fy + 7.,
+            1.6,
+            fh - 14.,
+            0.8,
+            BLUE,
+            o,
+            dx,
+        );
+    }
+}
 unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     let (fx, fy, fw, fh) = (24., 44., TODO_W - 48., 30.);
     if s.todo_editing {
@@ -5657,39 +6101,21 @@ unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     round_opt(s, fx + 10., fy + 14., 10., 2., 1., plus, o, dx);
     round_opt(s, fx + 14., fy + 10., 2., 10., 1., plus, o, dx);
     let (tx, tw) = (fx + 28., fw - 40.);
-    // Long input keeps its tail in view, like a single-line text field.
-    let mut shown = s.todo_input.as_str();
-    while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-        let mut chars = shown.chars();
-        chars.next();
-        shown = chars.as_str();
-    }
-    if s.todo_input.is_empty() {
-        text_opt(
-            dc,
-            s,
-            1,
-            "Add a task",
-            TERTIARY,
-            tx,
-            fy,
-            tw,
-            fh,
-            false,
-            o,
-            dx,
-        );
-    } else {
-        text_opt(dc, s, 1, shown, WHITE, tx, fy, tw, fh, false, o, dx);
-    }
-    if s.todo_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let caret = if shown.is_empty() {
-            0.
-        } else {
-            text_width(dc, s, 1, shown)
-        };
-        round_opt(s, tx + caret + 1., fy + 7., 1.6, fh - 14., 0.8, BLUE, o, dx);
-    }
+    input_text(
+        dc,
+        s,
+        &s.todo_editor,
+        &s.todo_input,
+        "Add a task",
+        s.todo_editing,
+        1,
+        tx,
+        fy,
+        tw,
+        fh,
+        dx,
+        o,
+    );
     let n = s.todos.len();
     if n == 0 {
         text_opt(
@@ -5847,43 +6273,22 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
 
     // Search text / placeholder
     let (tx, tw) = (sx + 30., sw - 54.);
-    if s.quick_input.is_empty() {
-        text_opt(
-            dc,
-            s,
-            1,
-            "Search or run...",
-            TERTIARY,
-            tx,
-            sy + 2.,
-            tw,
-            sh - 4.,
-            false,
-            o,
-            dx,
-        );
-    } else {
-        let mut shown = s.quick_input.as_str();
-        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-            let mut chars = shown.chars();
-            chars.next();
-            shown = chars.as_str();
-        }
-        text_opt(
-            dc,
-            s,
-            1,
-            shown,
-            WHITE,
-            tx,
-            sy + 2.,
-            tw,
-            sh - 4.,
-            false,
-            o,
-            dx,
-        );
-
+    input_text(
+        dc,
+        s,
+        &s.input_editors[1],
+        &s.quick_input,
+        "Search or run...",
+        s.quick_editing,
+        1,
+        tx,
+        sy + 2.,
+        tw,
+        sh - 4.,
+        dx,
+        o,
+    );
+    if !s.quick_input.is_empty() {
         // Clear 'x' button inside search bar
         let clr_hover = s.hover == 6001;
         pill_opt(
@@ -5914,18 +6319,6 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
             o,
             dx,
         );
-    }
-
-    // Caret when search editing
-    if s.quick_editing && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-        let mut shown = s.quick_input.as_str();
-        while !shown.is_empty() && text_width(dc, s, 1, shown) > tw {
-            let mut chars = shown.chars();
-            chars.next();
-            shown = chars.as_str();
-        }
-        let cw = text_width(dc, s, 1, shown);
-        round_opt(s, tx + cw + 1., sy + 7., 1.5, sh - 14., 0.75, BLUE, o, dx);
     }
 
     // "+ Add" or "Cancel" button
@@ -6019,34 +6412,21 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 dx,
             );
         }
-        let n_txt = if s.quick_name_input.is_empty() {
-            "Name (e.g. Chrome, Discord)"
-        } else {
-            &s.quick_name_input
-        };
-        let n_col = if s.quick_name_input.is_empty() {
-            TERTIARY
-        } else {
-            WHITE
-        };
-        text_opt(
+        input_text(
             dc,
             s,
+            &s.input_editors[2],
+            &s.quick_name_input,
+            "Name (e.g. Chrome, Discord)",
+            n_sel,
             2,
-            n_txt,
-            n_col,
             46.,
-            125.,
+            125.0,
             QUICK_W - 92.,
             22.,
-            false,
-            o,
             dx,
+            o,
         );
-        if n_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-            let nw = text_width(dc, s, 2, &s.quick_name_input);
-            round_opt(s, 46. + nw + 1., 126., 1.5, 20., 0.75, BLUE, o, dx);
-        }
 
         // Field 1: Command / Path
         let c_sel = s.quick_add_field == 1;
@@ -6081,34 +6461,21 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 dx,
             );
         }
-        let c_txt = if s.quick_cmd_input.is_empty() {
-            "Command / Path (e.g. chrome.exe, code, calc)"
-        } else {
-            &s.quick_cmd_input
-        };
-        let c_col = if s.quick_cmd_input.is_empty() {
-            TERTIARY
-        } else {
-            WHITE
-        };
-        text_opt(
+        input_text(
             dc,
             s,
+            &s.input_editors[3],
+            &s.quick_cmd_input,
+            "Command / Path (e.g. chrome.exe, code, calc)",
+            c_sel,
             2,
-            c_txt,
-            c_col,
             46.,
-            161.,
+            161.0,
             QUICK_W - 92.,
             22.,
-            false,
-            o,
             dx,
+            o,
         );
-        if c_sel && (s.clock.elapsed().as_secs_f64() * 2.) as i64 % 2 == 0 {
-            let cw = text_width(dc, s, 2, &s.quick_cmd_input);
-            round_opt(s, 46. + cw + 1., 162., 1.5, 20., 0.75, BLUE, o, dx);
-        }
 
         // Cancel and Save buttons
         let cancel_hover = s.hover == 6013;
@@ -6339,6 +6706,10 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
 /// Settings, in the style of iOS / macOS dark mode: inset grouped cards with switches, a segmented
 /// control for the music player, and a footer with the version and Quit.
 unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    if s.settings_subpage == 2 {
+        settings_updates_page(dc, s, dx, o);
+        return;
+    }
     if s.settings_subpage == 1 {
         settings_background_page(dc, s, dx, o);
         return;
@@ -6546,6 +6917,15 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
         dx,
     );
 
+    let update_bg = if s.hover == 5405 || s.pressed == 5405 {
+        rgb(44, 44, 46)
+    } else {
+        CARD
+    };
+    pill_opt(s, 238., 298., 84., 24., update_bg, o, dx);
+    text_opt(
+        dc, s, 2, "Updates", WHITE, 238., 298., 84., 24., true, o, dx,
+    );
     // Footer: version on the left, Quit on the right.
     text_opt(
         dc,
@@ -6571,6 +6951,175 @@ unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
     };
     pill_opt(s, qx, 298., qw, 24., quit_bg, o, dx);
     text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 298., qw, 24., true, o, dx);
+}
+
+fn update_note_lines(notes: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in notes.lines() {
+        let mut wrapped = String::new();
+        for word in line.split_whitespace() {
+            if wrapped.chars().count() + word.chars().count() > 48 && !wrapped.is_empty() {
+                lines.push(std::mem::take(&mut wrapped));
+            }
+            if !wrapped.is_empty() {
+                wrapped.push(' ');
+            }
+            wrapped.extend(word.chars().take(60));
+        }
+        lines.push(wrapped);
+    }
+    lines
+}
+unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
+    let u = &s.updater;
+    text_opt(
+        dc, s, 1, "Updates", WHITE, 24., 38., 392., 24., false, o, dx,
+    );
+    let auto = if u.auto {
+        "Automatic checks: On (daily at startup)"
+    } else {
+        "Automatic checks: Off"
+    };
+    pill_opt(s, 24., 65., 392., 28., rgb(28, 28, 30), o, dx);
+    text_opt(dc, s, 2, auto, WHITE, 34., 65., 370., 28., false, o, dx);
+    text_opt(
+        dc,
+        s,
+        3,
+        &format!(
+            "Installed: {} | Stable releases only",
+            env!("CARGO_PKG_VERSION")
+        ),
+        SECONDARY,
+        24.,
+        98.,
+        392.,
+        18.,
+        false,
+        o,
+        dx,
+    );
+    let status = update_note_lines(&u.status);
+    for (i, line) in status.iter().take(2).enumerate() {
+        text_opt(
+            dc,
+            s,
+            2,
+            line,
+            WHITE,
+            24.,
+            120. + i as f64 * 18.,
+            392.,
+            18.,
+            false,
+            o,
+            dx,
+        );
+    }
+    if u.phase == updater::Phase::Downloading && u.progress.1 > 0 {
+        let fraction = u.progress.0 as f64 / u.progress.1 as f64;
+        round_opt(s, 24., 158., 392., 3., 1., rgb(40, 40, 44), o, dx);
+        round_opt(s, 24., 158., 392. * fraction, 3., 1., BLUE, o, dx);
+        text_opt(
+            dc,
+            s,
+            3,
+            &format!("{:.0}%", fraction * 100.),
+            SECONDARY,
+            350.,
+            140.,
+            66.,
+            18.,
+            true,
+            o,
+            dx,
+        );
+    }
+    let notes = u
+        .release
+        .as_ref()
+        .map(|r| r.notes.as_str())
+        .unwrap_or("Release notes appear here when an update is available.");
+    let lines = update_note_lines(notes);
+    for (i, line) in lines.iter().take(4).enumerate() {
+        text_opt(
+            dc,
+            s,
+            3,
+            line,
+            SECONDARY,
+            24.,
+            168. + i as f64 * 16.,
+            392.,
+            16.,
+            false,
+            o,
+            dx,
+        );
+    }
+    let label = match u.phase {
+        updater::Phase::Checking => "Checking...",
+        updater::Phase::Downloading => "Downloading...",
+        updater::Phase::Ready => "Restart & update",
+        updater::Phase::Available => "Download update",
+        updater::Phase::Error if u.release.is_some() => "Retry download",
+        _ => "Check for updates",
+    };
+    let waiting = format!("Try again in {}s", u.cooldown());
+    let label = if !u.action_enabled()
+        && !matches!(
+            u.phase,
+            updater::Phase::Checking | updater::Phase::Downloading
+        ) {
+        waiting.as_str()
+    } else {
+        label
+    };
+    let enabled = u.action_enabled();
+    pill_opt(
+        s,
+        24.,
+        246.,
+        226.,
+        30.,
+        if enabled { BLUE } else { rgb(45, 45, 48) },
+        o,
+        dx,
+    );
+    text_opt(
+        dc,
+        s,
+        2,
+        label,
+        if enabled { WHITE } else { SECONDARY },
+        24.,
+        246.,
+        226.,
+        30.,
+        true,
+        o,
+        dx,
+    );
+    if u.phase == updater::Phase::Downloading {
+        pill_opt(s, 260., 246., 156., 30., rgb(28, 28, 30), o, dx);
+        text_opt(
+            dc, s, 2, "Cancel", WHITE, 260., 246., 156., 30., true, o, dx,
+        );
+    }
+    text_opt(
+        dc,
+        s,
+        2,
+        "< Settings",
+        BLUE,
+        24.,
+        284.,
+        100.,
+        24.,
+        false,
+        o,
+        dx,
+    );
 }
 
 unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
@@ -6922,7 +7471,17 @@ unsafe fn draw_notif_card(
     } else {
         rgb(26, 26, 28)
     };
-    round_opt(s, card_x, card_y, card_w, card_h, 10., card_bg, card_opacity, extra_dx);
+    round_opt(
+        s,
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        10.,
+        card_bg,
+        card_opacity,
+        extra_dx,
+    );
 
     // Icon
     let icon_size = 32.;
@@ -6940,7 +7499,14 @@ unsafe fn draw_notif_card(
     if let Some(pixels) = notice.icon.as_deref() {
         if let Some(r) = s.renderer.as_ref() {
             let (ox, oy) = s.offset();
-            drawn = r.draw_icon_slice(pixels, icon_x + ox + extra_dx, icon_y + oy, icon_size, radius, card_opacity);
+            drawn = r.draw_icon_slice(
+                pixels,
+                icon_x + ox + extra_dx,
+                icon_y + oy,
+                icon_size,
+                radius,
+                card_opacity,
+            );
         }
     }
     if !drawn {
@@ -7111,7 +7677,8 @@ unsafe fn notif_page(dc: Handle, s: &State, dx: f64, o: f64) {
     }
 
     // Continuous scroll offset based on spring solver
-    let scroll_offset = (s.notif_scroll as f64 - s.notif_scroll_pos) * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+    let scroll_offset =
+        (s.notif_scroll as f64 - s.notif_scroll_pos) * (NOTIF_CARD_H + NOTIF_CARD_GAP);
 
     for k in 0..NOTIF_ROWS {
         let i = s.notif_scroll + k;
@@ -7403,6 +7970,52 @@ unsafe fn pomo_page(dc: Handle, s: &State, dx: f64, o: f64) {
     pill_opt(s, 312., 136., 104., 36., bg, o, dx);
     text_opt(dc, s, 1, label, fg, 312., 136., 104., 36., true, o, dx);
 }
+fn shelf_alert_button(s: &State) -> (f64, f64, f64, f64) {
+    let w = page_w(s.active_tab);
+    let h = s.page_h(s.active_tab);
+    (w / 2. - 42., h / 2. + 40., 84., 26.)
+}
+unsafe fn shelf_alert_view(dc: Handle, s: &State) {
+    let Some(message) = s.shelf_alert.as_ref() else {
+        return;
+    };
+    let w = page_w(s.active_tab);
+    let h = s.page_h(s.active_tab);
+    round_opt(s, 18., 42., w - 36., h - 54., 12., rgb(18, 18, 22), 1., 0.);
+    text_opt(
+        dc,
+        s,
+        1,
+        "Image drop",
+        WHITE,
+        36.,
+        h / 2. - 64.,
+        w - 72.,
+        24.,
+        false,
+        1.,
+        0.,
+    );
+    for (i, line) in update_note_lines(message).iter().take(4).enumerate() {
+        text_opt(
+            dc,
+            s,
+            2,
+            line,
+            SECONDARY,
+            36.,
+            h / 2. - 34. + i as f64 * 16.,
+            w - 72.,
+            16.,
+            false,
+            1.,
+            0.,
+        );
+    }
+    let (x, y, bw, bh) = shelf_alert_button(s);
+    pill_opt(s, x, y, bw, bh, BLUE, 1., 0.);
+    text_opt(dc, s, 2, "Yes", WHITE, x, y, bw, bh, true, 1., 0.);
+}
 unsafe fn paint(hwnd: Hwnd, s: &State) {
     let mut ps: Paint = std::mem::zeroed();
     BeginPaint(hwnd, &mut ps);
@@ -7433,7 +8046,10 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
         s.bg_custom_pixels.as_ref().map(|(w, h, v)| (*w, *h, v))
     } else {
         let dib_h = (DIB_H * s.scale).ceil() as usize;
-        backdrop.as_ref().and_then(|b| b.as_ref()).map(|v| (s.stride, dib_h, v))
+        backdrop
+            .as_ref()
+            .and_then(|b| b.as_ref())
+            .map(|v| (s.stride, dib_h, v))
     };
     match source {
         Some((bw, bh, src)) if bw >= width && bh > 0 => {
@@ -7570,7 +8186,11 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
             rv,
             0.,
         );
-        for (tab, label) in [(TAB_SHELF, "Clear"), (TAB_TODO, "Clear Done"), (TAB_NOTIF, "Clear")] {
+        for (tab, label) in [
+            (TAB_SHELF, "Clear"),
+            (TAB_TODO, "Clear Done"),
+            (TAB_NOTIF, "Clear"),
+        ] {
             let o = mix[tab].0 * rv;
             if o <= 0. || !s.has_clear(tab) {
                 continue;
@@ -7724,6 +8344,9 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
         clock(dc, s, clock_opacity);
     }
     notice_view(dc, s, cur_w);
+    if s.expanded {
+        shelf_alert_view(dc, s);
+    }
     GdiFlush();
     let width = r.right as usize;
     let height = r.bottom as usize;
@@ -8122,11 +8745,23 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
         }
         13 => {
             // bell: top dome and flared sides, bottom rim, and clapper.
-            r.stroke_bezier([p(9., 3.8), p(5.8, 5.5), p(5.2, 10.5), p(3.5, 13.0)], w, color);
-            r.stroke_bezier([p(9., 3.8), p(12.2, 5.5), p(12.8, 10.5), p(14.5, 13.0)], w, color);
+            r.stroke_bezier(
+                [p(9., 3.8), p(5.8, 5.5), p(5.2, 10.5), p(3.5, 13.0)],
+                w,
+                color,
+            );
+            r.stroke_bezier(
+                [p(9., 3.8), p(12.2, 5.5), p(12.8, 10.5), p(14.5, 13.0)],
+                w,
+                color,
+            );
             r.stroke(&[p(2.8, 13.0), p(15.2, 13.0)], false, w, color);
             r.ellipse(x + 9., y + 2.5, 1.2, 1.2, color);
-            r.stroke_bezier([p(7.6, 13.6), p(7.6, 15.6), p(10.4, 15.6), p(10.4, 13.6)], w, color);
+            r.stroke_bezier(
+                [p(7.6, 13.6), p(7.6, 15.6), p(10.4, 15.6), p(10.4, 13.6)],
+                w,
+                color,
+            );
         }
         _ => {}
     }
@@ -8135,6 +8770,27 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
     let ptr = GetWindowLongPtrW(hwnd, -21) as *mut State;
     if !ptr.is_null() {
         let s = &mut *ptr;
+        if s.shelf_alert.is_some() {
+            if msg == 0x202 {
+                let x = (l as i16) as f64 / s.scale;
+                let y = ((l >> 16) as i16) as f64 / s.scale;
+                let (bx, by, bw, bh) = shelf_alert_button(s);
+                if (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y) {
+                    s.shelf_alert = None;
+                    diagnostics::info("shelf", "Image drop alert dismissed");
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                return 0;
+            }
+            if msg == 0x100 && (w == 13 || w == 32) {
+                s.shelf_alert = None;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            if (0x100..=0x109).contains(&msg) || (0x201..=0x20e).contains(&msg) {
+                return 0;
+            }
+        }
         // Input (keyboard, mouse, mouse leave, OLE drag) wakes the frame thread from its idle pace at once.
         if (0x100..=0x20e).contains(&msg) || msg == 0x2a3 || (0x8004..=0x8007).contains(&msg) {
             s.pace
@@ -8147,6 +8803,38 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x8001 => {
+                let web_result = s.web_drop_rx.as_ref().and_then(|rx| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("Image download worker stopped.".into()))
+                    }
+                    Err(_) => None,
+                });
+                if let Some(result) = web_result {
+                    s.web_drop_rx = None;
+                    match result {
+                        Ok(path) => {
+                            // Complete in the shelf root, never a folder selected after dropping.
+                            let folder = s.active_folder.take();
+                            s.add_shelf_items(&[path], hwnd);
+                            s.active_folder = folder.filter(|i| *i < s.shelf_items.len());
+                            diagnostics::info("shelf", "Browser image added to shelf");
+                            s.web_drop_status.clear();
+                        }
+                        Err(e) => {
+                            diagnostics::error("shelf", "Browser image download or validation failed; see network and image records");
+                            s.shelf_alert = Some(format!("Image download failed: {e}"));
+                        }
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                if s.shelf_alert.is_some() && !s.expanded {
+                    s.expanded = true;
+                    s.layout(hwnd);
+                }
+                if s.updater.poll() {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 s.ticks += 1;
                 while let Ok(mut media) = s.receiver.try_recv() {
                     if !s.smoke {
@@ -8277,6 +8965,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             && !s.quick_editing
                             && !s.quick_add_mode
                             && !s.menu_active
+                            && s.shelf_alert.is_none()
                         {
                             s.expanded = false;
                             s.layout(hwnd);
@@ -8482,6 +9171,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
+                if let Some(id) = s.dragging_input() {
+                    s.input_pointer(id, x, true);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 let mut changed = false;
                 if s.vol_drag {
                     s.set_volume_x(x);
@@ -8698,6 +9392,41 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
                 if s.usable() {
+                    let field = match s.active_tab {
+                        TAB_TODO if s.todo_hit(x, y) == 1000 => {
+                            s.todo_click(hwnd, 1000);
+                            Some(0)
+                        }
+                        TAB_CAL if s.cal_hit(x, y) == 5000 => {
+                            if !s.cal_editing {
+                                s.start_new_event(hwnd);
+                            }
+                            SetForegroundWindow(hwnd);
+                            SetFocus(hwnd);
+                            Some(1)
+                        }
+                        TAB_QUICK => match s.quick_hit(x, y) {
+                            6000 => {
+                                s.quick_click(hwnd, 6000);
+                                Some(2)
+                            }
+                            6010 | 6011 => {
+                                let hit = s.quick_hit(x, y);
+                                s.quick_click(hwnd, hit);
+                                Some(if hit == 6010 { 3 } else { 4 })
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(id) = field {
+                        s.end_input_drag();
+                        s.input_pointer(id, x, GetKeyState(0x10) < 0);
+                        s.input_mut(id).1.dragging = true;
+                        SetCapture(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
                     let pressed = if y < HEADER_H {
                         match s.header_hit(x, y) {
                             12 => 120,
@@ -8803,6 +9532,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 if !s.smoke
                     && !s.menu_active
+                    && s.shelf_alert.is_none()
                     && !s.todo_editing
                     && !s.cal_editing
                     && !s.quick_editing
@@ -8830,6 +9560,13 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x202 => {
+                if let Some(id) = s.dragging_input() {
+                    s.input_pointer(id, (l as i16) as f64 / s.scale, true);
+                    s.end_input_drag();
+                    ReleaseCapture();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 if s.notice_shown() {
                     s.open_notice(hwnd);
                     return 0;
@@ -8954,7 +9691,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                     for k in 0..NOTIF_ROWS {
                                         let i = s.notif_scroll + k;
                                         if i < n {
-                                            let y = NOTIF_Y0 + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
+                                            let y = NOTIF_Y0
+                                                + k as f64 * (NOTIF_CARD_H + NOTIF_CARD_GAP);
                                             s.dismissing_notifs.push(DismissingNotice {
                                                 notice: s.notif_history[i].clone(),
                                                 y,
@@ -9368,6 +10106,33 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
+            0x8008 => {
+                diagnostics::info("shelf", "Browser image drop received");
+                if s.dragging_out {
+                    return 0;
+                }
+                let url = &*(w as *const Option<String>);
+                s.web_drop_status.clear();
+                if s.web_drop_rx.is_some() {
+                    diagnostics::log(
+                        "WARN",
+                        "shelf",
+                        "Browser image drop rejected: another download is active",
+                    );
+                    s.shelf_alert = Some("An image is already downloading. Please wait.".into());
+                } else if let Some(url) = url {
+                    s.web_drop_rx = Some(web_drop::start(url.clone()));
+                } else {
+                    diagnostics::log("WARN","shelf","Browser image drop rejected: no supported HTTPS image source; format details recorded during extraction");
+                    s.shelf_alert=Some("This content is not supported. Wisp could not find a direct HTTPS image source. Browser-local or login-protected images may not be accessible.".into());
+                }
+                s.expanded = true;
+                s.active_tab = TAB_SHELF;
+                s.ole_drag_target = None;
+                s.layout(hwnd);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
             0x8007 => {
                 if s.dragging_out {
                     return 0;
@@ -9382,21 +10147,50 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
-            0x102 if s.todo_editing => {
-                let c = w as u16;
-                match c {
-                    8 => {
-                        s.todo_input.pop();
+            0x215 => {
+                // WM_CAPTURECHANGED
+                s.end_input_drag();
+            }
+            0x100 if s.active_input().is_some() && w != 27 => {
+                if s.dragging_input().is_some() {
+                    s.end_input_drag();
+                    ReleaseCapture();
+                }
+                let shift = GetKeyState(0x10) < 0;
+                let ctrl = GetKeyState(0x11) < 0;
+                let id = s.active_input().unwrap();
+                let (text, editor) = s.input_mut(id);
+                match w {
+                    0x41 if ctrl => {
+                        editor.move_to(text, 0, false);
+                        editor.move_to(text, text.len(), true);
                     }
-                    13 => s.commit_todo(),
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            s.push_input(ch);
+                    0x43 | 0x58 if ctrl => {
+                        if todo_input::copy(hwnd, &text[editor.selection()]) && w == 0x58 {
+                            editor.delete(text, false);
                         }
-                        s.high_surrogate = 0;
+                    }
+                    0x56 if ctrl => {
+                        if let Some(value) = todo_input::paste(hwnd) {
+                            editor.replace(text, &value);
+                        }
+                    }
+                    0x23..=0x25 | 0x27 => editor.navigate(text, w, shift),
+                    0x2e => editor.delete(text, false),
+                    _ => {}
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            0x102 if s.todo_editing && s.active_tab == TAB_TODO => {
+                match w as u16 {
+                    8 => s.todo_editor.delete(&mut s.todo_input, true),
+                    13 => s.commit_todo(),
+                    c if (0xd800..=0xdfff).contains(&c) => {
+                        s.todo_editor.character(&mut s.todo_input, c)
                     }
                     c if c >= 32 && c != 127 => {
+                        s.todo_editor.end_interaction();
                         if let Some(ch) = char::from_u32(c as u32) {
                             s.push_input(ch);
                         }
@@ -9406,30 +10200,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
-            0x102 if s.cal_editing => {
-                let c = w as u16;
-                match c {
-                    8 => {
-                        s.cal_input.pop();
-                    }
+            0x102 if s.active_tab == TAB_CAL && s.cal_editing => {
+                match w as u16 {
+                    8 => s.input_editors[0].delete(&mut s.cal_input, true),
                     13 => s.commit_cal_schedule(),
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            if s.cal_input.chars().count() < 100 {
-                                s.cal_input.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
-                    }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            if s.cal_input.chars().count() < 100 {
-                                s.cal_input.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
+                    c => s.input_editors[0].character(&mut s.cal_input, c),
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
@@ -9438,7 +10213,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let c = w as u16;
                 match c {
                     8 => {
-                        s.quick_input.pop();
+                        s.input_editors[1].delete(&mut s.quick_input, true);
                     }
                     13 => {
                         let filtered = tasks::filter_quick_items(&s.quick_items, &s.quick_input);
@@ -9456,23 +10231,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             }
                         }
                     }
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            if s.quick_input.chars().count() < 80 {
-                                s.quick_input.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
-                    }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            if s.quick_input.chars().count() < 80 {
-                                s.quick_input.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
+                    c => s.input_editors[1].character(&mut s.quick_input, c),
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
@@ -9481,13 +10240,12 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let c = w as u16;
                 match c {
                     8 => {
-                        if s.quick_add_field == 0 {
-                            s.quick_name_input.pop();
-                        } else {
-                            s.quick_cmd_input.pop();
-                        }
+                        let id = 3 + s.quick_add_field;
+                        let (text, editor) = s.input_mut(id);
+                        editor.delete(text, true);
                     }
                     9 => {
+                        s.end_input_drag();
                         s.quick_add_field = (s.quick_add_field + 1) % 2;
                     }
                     13 => {
@@ -9497,38 +10255,21 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             s.commit_quick_item();
                         }
                     }
-                    0xD800..=0xDBFF => s.high_surrogate = c,
-                    0xDC00..=0xDFFF => {
-                        if let Some(Ok(ch)) = char::decode_utf16([s.high_surrogate, c]).next() {
-                            let target = if s.quick_add_field == 0 {
-                                &mut s.quick_name_input
-                            } else {
-                                &mut s.quick_cmd_input
-                            };
-                            if target.chars().count() < 80 {
-                                target.push(ch);
-                            }
-                        }
-                        s.high_surrogate = 0;
+                    c => {
+                        let id = 3 + s.quick_add_field;
+                        let (text, editor) = s.input_mut(id);
+                        editor.character(text, c);
                     }
-                    c if c >= 32 && c != 127 => {
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            let target = if s.quick_add_field == 0 {
-                                &mut s.quick_name_input
-                            } else {
-                                &mut s.quick_cmd_input
-                            };
-                            if target.chars().count() < 80 {
-                                target.push(ch);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
             0x0008 => {
+                if s.dragging_input().is_some() {
+                    ReleaseCapture();
+                }
+                s.todo_editor.end_interaction();
+                s.end_input_drag();
                 // Focus moved to another app: stop typing, and close if the cursor is elsewhere.
                 if s.todo_editing || s.cal_editing || s.quick_editing || s.quick_add_mode {
                     s.todo_editing = false;
@@ -9549,6 +10290,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
             }
             0x100 if w == 27 => {
+                if s.dragging_input().is_some() {
+                    ReleaseCapture();
+                }
+                s.end_input_drag();
                 if s.active_tab == TAB_QUICK {
                     if s.quick_add_mode {
                         s.quick_add_mode = false;
@@ -9562,6 +10307,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     }
                 }
                 if s.todo_editing {
+                    if s.todo_editor.dragging {
+                        ReleaseCapture();
+                    }
+                    s.todo_editor.end_interaction();
                     s.todo_editing = false;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
@@ -9776,7 +10525,10 @@ unsafe fn grab_screen(a: &Rect) -> Vec<u32> {
         let old = SelectObject(dc, bitmap);
         BitBlt(dc, 0, 0, w, h, screen, a.left, a.top, 0x00CC0020);
         GdiFlush();
-        pixels.extend_from_slice(std::slice::from_raw_parts(bits as *const u32, (w * h) as usize));
+        pixels.extend_from_slice(std::slice::from_raw_parts(
+            bits as *const u32,
+            (w * h) as usize,
+        ));
         SelectObject(dc, old);
         DeleteObject(bitmap);
     }
@@ -9926,14 +10678,7 @@ struct ExceptionPointers {
 unsafe extern "system" fn seh_filter(ep: *mut ExceptionPointers) -> i32 {
     if !ep.is_null() && !(*ep).record.is_null() {
         let code = (*(*ep).record).code;
-        let addr = (*(*ep).record).address;
-        let msg = format!("SEH CRASH DETECTED: code=0x{:08X}, addr={:?}\n", code, addr);
-        let _ = std::fs::write("wisp_crash.log", &msg);
-        let _ = std::fs::write(
-            "C:\\Users\\blur\\AppData\\Local\\Temp\\antigravity\\wisp_crash.log",
-            &msg,
-        );
-        eprintln!("{}", msg);
+        diagnostics::crash(code);
     }
     1
 }
@@ -9945,21 +10690,21 @@ extern "system" {
 }
 
 fn main() {
+    diagnostics::init();
+    if updater::helper_mode() {
+        return;
+    }
     unsafe {
         SetUnhandledExceptionFilter(seh_filter);
     }
     std::panic::set_hook(Box::new(|info| {
-        let msg = format!(
-            "PANIC: {:?}\nLocation: {:?}\nBacktrace:\n{:?}",
-            info,
-            info.location(),
-            std::backtrace::Backtrace::capture()
-        );
-        eprintln!("{}", msg);
-        let _ = std::fs::write("wisp_panic.log", &msg);
-        let _ = std::fs::write(
-            "C:\\Users\\blur\\AppData\\Local\\Temp\\antigravity\\wisp_panic.log",
-            &msg,
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        diagnostics::error(
+            "panic",
+            &format!("Rust panic; location={location}; payload omitted for privacy"),
         );
     }));
     unsafe {
@@ -9982,6 +10727,11 @@ fn main() {
             small_icon: null_mut(),
         };
         if RegisterClassExW(&wc) == 0 {
+            diagnostics::failure(
+                "window",
+                "Register window class",
+                &std::io::Error::last_os_error(),
+            );
             OleUninitialize();
             return;
         }
@@ -10000,6 +10750,11 @@ fn main() {
             null_mut(),
         );
         if hwnd.is_null() {
+            diagnostics::failure(
+                "window",
+                "Create native window",
+                &std::io::Error::last_os_error(),
+            );
             OleUninitialize();
             return;
         }
@@ -10022,6 +10777,8 @@ fn main() {
         SetWindowLongPtrW(hwnd, -21, (&mut *state) as *mut State as isize);
         state.layout(hwnd);
         ShowWindow(hwnd, 4);
+        updater::health_ready();
+        diagnostics::info("app", "Native window initialized successfully");
         let running = state.running.clone();
         let pace = state.pace.clone();
         let window = hwnd as usize;
@@ -10078,6 +10835,7 @@ fn main() {
             DispatchMessageW(&msg);
         }
     }
+    diagnostics::info("app", "Wisp stopped normally");
 }
 #[cfg(test)]
 mod tests {
@@ -10254,6 +11012,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn todo_selection_replaces_unicode_in_middle() {
+        let mut s = create_test_state();
+        s.todo_input = "a😀éz".into();
+        s.todo_editor.move_to(&s.todo_input, 1, false);
+        s.todo_editor.move_to(&s.todo_input, 7, true);
+        s.push_input('中');
+        assert_eq!(s.todo_input, "a中z");
+        assert_eq!(s.todo_editor.caret, 4);
+    }
+
+    #[test]
+    fn todo_window_messages_preserve_enter_escape_and_focus_lifecycle() {
+        unsafe {
+            // Hidden, isolated window: no clipboard, input injection or app startup.
+            let class: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            let mut s = create_test_state();
+            s.smoke = true;
+            s.active_tab = TAB_TODO;
+            s.todo_editing = true;
+            SetWindowLongPtrW(hwnd, -21, &mut s as *mut State as isize);
+            procedure(hwnd, 0x102, 'a' as usize, 0);
+            procedure(hwnd, 0x102, 0xd83d, 0);
+            procedure(hwnd, 0x102, 0xde00, 0);
+            procedure(hwnd, 0x100, 0x24, 0);
+            procedure(hwnd, 0x102, 'b' as usize, 0);
+            assert_eq!(s.todo_input, "ba😀");
+            procedure(hwnd, 0x100, 0x2e, 0);
+            assert_eq!(s.todo_input, "b😀");
+            procedure(hwnd, 0x102, 13, 0);
+            assert_eq!(s.todos[0].text, "b😀");
+            assert!(s.todo_editing);
+            assert!(s.todo_input.is_empty());
+            procedure(hwnd, 0x102, 'z' as usize, 0);
+            procedure(hwnd, 0x100, 27, 0);
+            assert!(!s.todo_editing);
+            assert_eq!(s.todo_input, "z");
+            s.todo_editing = true;
+            procedure(hwnd, 0x0008, 0, 0);
+            assert!(!s.todo_editing);
+            assert_eq!(s.todo_input, "z");
+            s.todo_editing = true;
+            s.active_tab = TAB_CAL;
+            procedure(hwnd, 0x102, 'x' as usize, 0);
+            assert_eq!(s.todo_input, "z");
+            SetWindowLongPtrW(hwnd, -21, 0);
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn other_input_editors_preserve_limits_and_independent_selections() {
+        let mut s = create_test_state();
+        for id in 1..=4 {
+            let (text, editor) = s.input_mut(id);
+            editor.replace(text, "a😀éz");
+            editor.move_to(text, 1, false);
+            editor.move_to(text, 7, true);
+            editor.replace(text, "中");
+            assert_eq!(text, "a中z");
+            editor.move_to(text, 0, false);
+            editor.move_to(text, text.len(), true);
+            editor.replace(text, &"x".repeat(150));
+            assert_eq!(text.len(), if id == 1 { 100 } else { 80 });
+        }
+        assert!(s.todo_input.is_empty());
+    }
+
+    #[test]
+    fn updater_settings_targets_stay_inside_the_updates_page() {
+        let mut s = create_test_state();
+        assert_eq!(s.settings_hit(280., 310.), 5405);
+        assert_eq!(s.settings_hit(370., 310.), 5200);
+        assert_eq!(s.settings_hit(40., 274.), -1);
+        s.settings_subpage = 2;
+        assert_eq!(s.settings_hit(40., 75.), 5401);
+        assert_eq!(s.settings_hit(40., 260.), 5400);
+        assert_eq!(s.settings_hit(280., 260.), 5402);
+        assert_eq!(s.settings_hit(40., 295.), 5260);
+        assert_eq!(s.settings_hit(430., 75.), -1);
+        let lines = update_note_lines("one two\nthree");
+        assert_eq!(lines, vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn shelf_alert_yes_button_fits_inside_shelf() {
+        let mut s = create_test_state();
+        s.active_tab = TAB_SHELF;
+        let (x, y, w, h) = shelf_alert_button(&s);
+        assert!(x >= 0. && y >= 0.);
+        assert!(x + w <= page_w(TAB_SHELF));
+        assert!(y + h <= s.page_h(TAB_SHELF));
+        assert!(s.shelf_alert.is_none());
+    }
+
     fn create_test_state() -> State {
         State {
             expanded: true,
@@ -10300,6 +11168,8 @@ mod tests {
             wheel_acc: 0.,
             todos: Vec::new(),
             todo_input: String::new(),
+            todo_editor: Default::default(),
+            input_editors: [100, 80, 80, 80].map(todo_input::Editor::with_limit),
             todo_editing: false,
             todo_scroll: 0,
             quick_items: tasks::default_quick_items(),
@@ -10322,7 +11192,6 @@ mod tests {
             agenda_v: 0.,
             agenda_key: (0, 0, 0),
             cal_scroll: 0,
-            high_surrogate: 0,
             pomo: tasks::Pomodoro::new(),
             timer_t: 0.,
             timer_vel: 0.,
@@ -10406,6 +11275,10 @@ mod tests {
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
             settings_subpage: 0,
+            updater: updater::Updater::default(),
+            web_drop_rx: None,
+            web_drop_status: String::new(),
+            shelf_alert: None,
             bg_custom_pixels: None,
             backdrop: Default::default(),
             backdrop_busy: Default::default(),
@@ -10529,7 +11402,13 @@ mod tests {
         let (w, h) = (64, 32);
         // A white square in the middle of black.
         let src: Vec<u32> = (0..w * h)
-            .map(|i| if (24..40).contains(&(i % w)) && (8..24).contains(&(i / w)) { 0xffffff } else { 0 })
+            .map(|i| {
+                if (24..40).contains(&(i % w)) && (8..24).contains(&(i / w)) {
+                    0xffffff
+                } else {
+                    0
+                }
+            })
             .collect();
         let sharp = frost(&src, w, h, 0, (0, 0, 0), 0);
         let soft = frost(&src, w, h, 16, (0, 0, 0), 0);
@@ -10539,7 +11418,9 @@ mod tests {
         assert!(soft[16 * w + 20] & 255 > 20);
         assert!(soft[16 * w + 32] & 255 < 255);
         // Full tint covers the capture.
-        assert!(frost(&src, w, h, 16, (10, 20, 30), 255).iter().all(|&p| p == 0xff0a141e));
+        assert!(frost(&src, w, h, 16, (10, 20, 30), 255)
+            .iter()
+            .all(|&p| p == 0xff0a141e));
     }
 
     #[test]

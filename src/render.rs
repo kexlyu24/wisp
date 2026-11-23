@@ -572,11 +572,31 @@ impl Renderer {
             return false;
         }
         let matrix: [f32; 25] = [
-            1., 0., 0., 0., 0.,
-            0., 1., 0., 0., 0.,
-            0., 0., 1., 0., 0.,
-            0., 0., 0., opacity.min(1.) as f32, 0.,
-            0., 0., 0., 0., 1.,
+            1.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            1.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            1.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            opacity.min(1.) as f32,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            1.,
         ];
         GdipSetImageAttributesColorMatrix(self.attr, 0, 1, matrix.as_ptr(), null_mut(), 0);
         if radius > 0. {

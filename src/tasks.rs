@@ -16,9 +16,23 @@ pub fn data_path(name: &str) -> Option<PathBuf> {
 pub fn write_data(name: &str, contents: &str) {
     if let Some(path) = data_path(name) {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                crate::diagnostics::failure("storage", "Create app data directory", &e);
+                return;
+            }
         }
-        let _ = std::fs::write(path, contents);
+        if let Err(e) = std::fs::write(path, contents) {
+            crate::diagnostics::failure(
+                "storage",
+                &format!("Write application data ({})", name),
+                &e,
+            );
+        }
+    } else {
+        crate::diagnostics::error(
+            "storage",
+            "Cannot write application data: APPDATA is unavailable",
+        );
     }
 }
 
@@ -51,7 +65,7 @@ pub fn format_todos(items: &[Todo]) -> String {
 
 pub fn load_todos() -> Vec<Todo> {
     todos_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| crate::diagnostics::read_text(path))
         .map(|src| parse_todos(&src))
         .unwrap_or_default()
 }
@@ -143,7 +157,7 @@ pub fn format_quick_items(items: &[QuickItem]) -> String {
 
 pub fn load_quick_items() -> Vec<QuickItem> {
     data_path("quick_access.txt")
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| crate::diagnostics::read_text(path))
         .map(|src| {
             let items = parse_quick_items(&src);
             if items.is_empty() {
@@ -311,7 +325,7 @@ pub fn format_schedules(items: &[Schedule]) -> String {
 
 pub fn load_schedules() -> Vec<Schedule> {
     data_path("calendar.txt")
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| crate::diagnostics::read_text(p))
         .map(|s| parse_schedules(&s))
         .unwrap_or_default()
 }
