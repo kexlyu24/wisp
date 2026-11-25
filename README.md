@@ -1,6 +1,6 @@
 <div align="center">
 
-# Wisp
+<img src="assets/icons/wisp-logo.png" alt="Wisp" width="180">
 
 **A Dynamic Island–style notch for Windows, inspired by Apple's design.**
 
@@ -26,7 +26,7 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 - 🪶 **Minimal mode**: shrinks to a sliver when it would hide something, like browser tabs
 - 🚀 **Quick Access**: search and launch apps, or add your own shortcuts
 - ⬆️ **In-app updates**: HTTPS downloads verified with SHA-256 from GitHub Releases, installed only when you click Restart & update
-- ⚙️ **Settings** right inside the notch, including the background (black by default, frosted glass, or your own image), and every movement runs on springs
+- ⚙️ **Settings** in a standalone dark-mode popup window (Notch, General, Appearance background themes, and Updates), opened from the notch gear button or tray icon, with spring-driven motion throughout
 
 <table>
   <tr>
@@ -43,7 +43,7 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 
 1. Download the zip from **[Releases](https://github.com/kexlyu24/wisp/releases/latest)** and unzip it.
 2. Run `wisp.exe`. There's no installer. If Windows warns you, click **More info → Run anyway**, since the app isn't signed.
-3. Hover the notch at the top of your screen. Settings and Quit are in the notch's gear tab and in the tray icon.
+3. Hover the notch at the top of your screen. Settings and Quit are in the notch's gear button (standalone Settings popup) and in the tray icon.
 
 Wisp uses Apple's **SF Pro Display** if you've [installed it](https://developer.apple.com/fonts/), and otherwise the built-in Inter font.
 

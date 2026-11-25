@@ -74,7 +74,7 @@ A native file holding shelf inspired by Apple Dynamic Island and macOS notch she
 - **Header Navigation & Tabs**:
   - **Now Playing** (music note), **Calendar** (calendar icon), and **Shelf** (tray icon, with an item-count badge) are separate pages.
   - **No menus on the notch**: everything is reached from the header tabs, the drop zone (click to add files) and the header Clear button.
-  - **Tray icon**: Wisp sits in the notification area as a small Dynamic Island glyph (white on a dark taskbar, black on a light one; it follows theme changes). Click or right-click it for its menu: **Settings…**, which opens the notch on its Settings page (it closes again after 8 seconds unless the cursor is on it), and **Quit Wisp**. On Windows 10 new tray icons start in the hidden overflow (the ^ arrow); drag the icon onto the taskbar to keep it visible. The icon is added back if Explorer restarts.
+  - **Tray icon**: Wisp sits in the notification area with its Wisp brand icon (notch+W icon on a light taskbar, vibrant purple W mark on a dark taskbar; it follows theme changes). Click or right-click it for its menu: **Settings…**, which opens and focuses the standalone Settings popup window without opening or holding the notch, and **Quit Wisp**. On Windows 10 new tray icons start in the hidden overflow (the ^ arrow); drag the icon onto the taskbar to keep it visible. The icon is added back if Explorer restarts.
   - **Clear**: Header action button to quickly clear all stored items from the shelf.
 - **Empty Drop Zone**: a quiet rounded drop zone with a tray icon, "Drop files here" and "or click to choose files"; clicking anywhere in it opens the native Windows file dialog (`GetOpenFileNameW`).
 - **Interactive File Cards**:
@@ -157,7 +157,7 @@ The `web_drop` unit tests pass; real browser drops are user-run.
 
 ## In-app updates
 
-Settings > Updates opens a dedicated page in the existing settings surface.
+Settings → Updates is a dedicated sidebar category in the standalone Settings popup window.
 It shows the installed version, daily-at-startup automatic-check toggle, current
 status, a four-line release-note preview, download progress/cancellation and
 an explicit Restart & update action. Network work stays off the UI thread.
@@ -188,18 +188,17 @@ The `todo_input` unit tests pass; runtime and UI testing is user-run.
 
 The page after the shelf (grid icon) is a launcher. Type in **Search or run…** to filter the shortcuts, and press Enter to launch the first match or, when nothing matches, run what you typed (a program, path, URL or `ms-settings:` link). Shortcuts are two-column cards with a letter tile; click one to launch it, or its × to remove it. **+ Add** opens a small form with a name and a command. It starts with Notepad, Calculator, Terminal, Explorer, Task Manager, Settings and Snipping Tool, and your list is saved to `%APPDATA%\Wisp\quick_access.txt`. Commands are started with the shell, and only ever ones you typed.
 
-## Settings page
+## Settings popup
 
-The sixth page (gear tab alone at the right end of the header, with Clear / Clear Done just left of it; also reachable with the scroll wheel) is 440×300 and follows iOS/macOS dark-mode settings.
+Clicking the gear action button at the right end of the notch header (or choosing **Settings…** in the tray menu) opens a standalone 620×420 Apple dark-mode floating popup window (`WS_POPUP | WS_EX_LAYERED | WS_EX_TOOLWINDOW`, no taskbar button, non-topmost). Settings is no longer a notch tab: scrolling the notch cycles through the 7 notch pages (Now Playing, Calendar, To-do, Pomodoro, Shelf, Quick Access, Notifications). Clicking the gear button while the popup is open toggles it closed, and the gear shows an active highlight while the popup is open.
 
-- **Cards:** two inset grouped cards (#1C1C1E, 12 pt corners) under 11 pt section labels in the secondary label color, so they stay above 4.5:1 contrast. "Notch" holds Open on hover, Shrink over content, Lyrics when closed and Notifications; "General" holds 24-hour clock, Match Windows motion and Start with Windows, with a "Changes save automatically." note below.
-- **Rows:** 32 pt tall, separated by hairlines. The whole row is the click target. Hover and press tint an inset rounded highlight without moving anything.
-- **Switches:** iOS-style, 34×20, off #39393D, on system green. The knob slides on a spring (ω 24, ζ 0.82).
-- **Music player:** a full-width segmented control (Automatic, Spotify, Spotifast, Apple Music) whose thumb glides to the choice (ω 20, ζ 0.86).
-- **Appearance:** a Background card that opens its own sub-page (back with the "‹ Settings" button at the bottom left, or Esc). Styles: **Frost** (frosted glass: what is behind the panel, blurred, under a dark tint), **Aura** (the same glass tinted by the album art), **Slate** (charcoal glass), **OLED** (pure black, the default) and **Image** (your own PNG, JPG, BMP or WebP, centred). **Opacity** (70–100%, default 100%) is how much the tint covers the glass, so 100% is a solid colour; for an image it dims the picture. **Blur** (0–30 px) softens the glass or the image; for an image it applies when you release the slider. The closed notch always stays black, and the theme fades in as the panel opens. The glass is re-captured about 4 times a second while the panel is open, on a background thread; Wisp's own window is never in the capture. The image is copied to `%APPDATA%\Wisp\background.png`; Reset removes it and goes back to black.
-- **Footer:** the version, and a Quit Wisp button.
+- **Window behavior:** centered on the primary monitor's work area on first open, smoothly fading and gliding in/out on a spring (snaps when reduced motion is active), draggable by the titlebar, with its last position remembered for the session and clamped to the monitor work area on reopen. It stays open when you click outside so you can interact with the notch or other apps; press `Esc`, click `✕`, press `Alt+F4`, or click the notch gear button again to hide it.
+- **Sidebar (168 pt):** four categories — **Notch**, **General**, **Appearance**, and **Updates** — with a gliding blue active capsule, directional content crossfade/slide transitions, and a footer showing the installed version (`Wisp X.Y.Z`) and a neutral **Quit Wisp** pill.
+- **Notch & General:** grouped cards (`#1C1C1E`, 12 pt corners) with 54 pt rows (title + subtitle) separated by hairlines and 36×20 iOS-style green switches whose knobs glide on a spring (ω 24, ζ 0.82). **Notch** holds Open on hover, Minimal mode, Lyrics when closed, and Notification popups; **General** holds 24-hour clock, Match Windows motion, and Start with Windows.
+- **Appearance:** completely decoupled from notch expansion (opening Appearance does not auto-expand or pin the notch). Controls **Style** (**Frost**, **Aura**, **Slate**, **OLED** [default pure black], **Image**), **Custom image** choose/change/reset and **Framing** (Top, Center, Bottom; shown when **Image** style is selected), **Blur** slider (0–30 px; applies to custom images on slider release), and **Opacity** (70–100%, default 100%). The closed notch always stays black, and the theme fades in as the panel opens. Frost/Aura/Slate re-capture the screen behind the notch about 4 times a second on a background thread without capturing Wisp itself; custom images copy to `%APPDATA%\Wisp\background.png`.
+- **Updates:** installed version readout, **Check automatically** daily-at-startup switch (spring-animated), live status and download progress bar, up to four lines of release notes, primary action (**Check for updates** / **Download update** / **Restart & update** / **Retry download**) plus **Cancel** while downloading, and a local troubleshooting log info card.
 
-Everything is saved to `%APPDATA%\Wisp\settings.txt` (`key=0|1`, `player=…`) as soon as it changes. Start with Windows writes or removes a `Wisp` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and its switch reflects that value. With reduced motion, the switches and segment jump instead of sliding.
+Everything is saved to `%APPDATA%\Wisp\settings.txt` (`key=0|1`, background and Pomodoro values) as soon as it changes. Start with Windows writes or removes a `Wisp` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and its switch reflects that value. With reduced motion enabled, switches snap immediately instead of sliding.
 
 ## Minimal mode
 

@@ -6,6 +6,7 @@ mod media;
 mod notify;
 mod render;
 mod settings;
+mod settings_win;
 mod tasks;
 mod todo_input;
 mod tray;
@@ -127,6 +128,7 @@ extern "system" {
         flags: u32,
     ) -> i32;
     fn SendMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
+    pub(crate) fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn RegisterClassExW(class: *const WindowClass) -> u16;
     fn CreateWindowExW(
@@ -752,10 +754,13 @@ const TAB_POMO: usize = 3;
 const TAB_SHELF: usize = 4;
 const TAB_QUICK: usize = 5;
 const TAB_NOTIF: usize = 6;
-const TAB_SETTINGS: usize = 7;
-const TAB_COUNT: usize = 8;
+const TAB_COUNT: usize = 7;
+pub(crate) const HEADER_SETTINGS: i32 = 11;
 fn page_w(tab: usize) -> f64 {
-    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, QUICK_W, NOTIF_W, SET_W][tab.min(TAB_COUNT - 1)]
+    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, QUICK_W, NOTIF_W][tab.min(TAB_COUNT - 1)]
+}
+fn gear_rect(panel_w: f64) -> (f64, f64) {
+    (panel_w - 24. - 34., 34.)
 }
 /// Notification Center page geometry: 3 cards visible at a time.
 const NOTIF_W: f64 = 440.;
@@ -764,13 +769,7 @@ const NOTIF_ROWS: usize = 3;
 const NOTIF_Y0: f64 = 46.;
 const NOTIF_CARD_H: f64 = 58.;
 const NOTIF_CARD_GAP: f64 = 6.;
-/// Settings page: two inset grouped cards of switches, the music-player segmented control, a footer.
-const SET_W: f64 = 440.;
-const SET_H: f64 = 328.;
-const SET_CARD_Y: f64 = 60.;
-const SET_ROW_H: f64 = 32.;
-const SET_CARD_W: f64 = 190.;
-/// Switch rows in layout order: four in the "Notch" card, three in "General". Ids are `tray::item`s.
+/// Switch rows in layout order: four in "Notch", three in "General". Ids are `tray::item`s.
 const SETTING_ROWS: [(&str, usize); 7] = [
     ("Open on hover", tray::item::OPEN_ON_HOVER),
     ("Shrink over content", tray::item::MINIMAL),
@@ -780,14 +779,6 @@ const SETTING_ROWS: [(&str, usize); 7] = [
     ("Match Windows motion", tray::item::FOLLOW_ANIMATIONS),
     ("Start with Windows", tray::item::AUTOSTART),
 ];
-/// Card x and row y (page coordinates) of switch row `k`.
-fn setting_row(k: usize) -> (f64, f64) {
-    if k < 4 {
-        (24., SET_CARD_Y + k as f64 * SET_ROW_H)
-    } else {
-        (226., SET_CARD_Y + (k - 4) as f64 * SET_ROW_H)
-    }
-}
 const ROW_Y0: f64 = 82.;
 const ROW_H: f64 = 26.;
 const TODO_ROWS: usize = 4;
@@ -951,6 +942,7 @@ struct State {
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pace: std::sync::Arc<std::sync::atomic::AtomicU8>,
     menu_active: bool,
+    pub(crate) modal_dialog_open: bool,
     last_minute: u16,
     shelf_items: Vec<ShelfItem>,
     active_tab: usize,
@@ -1023,7 +1015,6 @@ struct State {
     vol_level: f32,
     vol_muted: bool,
     vol_drag: bool,
-    blur_drag: bool,
     clyric_t: f64,
     clyric_tv: f64,
     lyric_w: f64,
@@ -1070,7 +1061,9 @@ struct State {
     notif_badge_t: f64,
     notif_badge_v: f64,
     settings: settings::Settings,
-    settings_subpage: usize,
+    pub(crate) main_hwnd: Hwnd,
+    pub(crate) settings_win: settings_win::SettingsWindow,
+    settings_win_moving: bool,
     updater: updater::Updater,
     web_drop_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     web_drop_status: String,
@@ -1240,6 +1233,7 @@ impl State {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
             menu_active: false,
+            modal_dialog_open: false,
             last_minute: now.minute,
             shelf_items,
             active_tab: 0,
@@ -1325,7 +1319,6 @@ impl State {
             vol_level,
             vol_muted,
             vol_drag: false,
-            blur_drag: false,
             clyric_t: 0.,
             clyric_tv: 0.,
             lyric_w: COL_W,
@@ -1388,7 +1381,9 @@ impl State {
             cover_w: 0.,
             deep_idle_ticks: 0,
             settings: loaded_settings,
-            settings_subpage: 0,
+            main_hwnd: hwnd,
+            settings_win: settings_win::SettingsWindow::new(),
+            settings_win_moving: false,
             updater: updater::Updater::new(!smoke),
             web_drop_rx: None,
             web_drop_status: String::new(),
@@ -1426,8 +1421,6 @@ impl State {
             NP_LYRICS_H
         } else if tab == TAB_NOTIF {
             NOTIF_H
-        } else if tab == TAB_SETTINGS {
-            SET_H
         } else if tab == TAB_CAL {
             CAL_H
         } else if tab == TAB_QUICK {
@@ -1667,18 +1660,6 @@ impl State {
             self.vol_muted = false;
         }
     }
-    fn set_blur_x(&mut self, x: f64) {
-        const TRACK_X0: f64 = 86.;
-        const TRACK_X1: f64 = 352.;
-        const MAX_BLUR: u32 = 30;
-        let frac = ((x - TRACK_X0) / (TRACK_X1 - TRACK_X0)).clamp(0., 1.);
-        let new_blur = (frac * MAX_BLUR as f64).round() as u32;
-        if new_blur != self.settings.bg_blur {
-            // The image is re-blurred once when the slider is released, not on every step.
-            self.settings.bg_blur = new_blur;
-            self.apply_settings();
-        }
-    }
     fn music_click(&mut self, x: f64, hit: i32) {
         match hit {
             0 => media::prev(),
@@ -1763,7 +1744,7 @@ impl State {
             52.
         }
     }
-    /// Header tab positions: the pages and Quick Access from the left, Notification Center and Settings at the right edge.
+    /// Header tab positions: the pages and Quick Access from the left, Notification Center at the right edge next to the Gear action button.
     fn tab_x(&self, tab: usize) -> (f64, f64) {
         if tab < TAB_SHELF {
             (24. + 35. * tab as f64, 34.)
@@ -1771,10 +1752,8 @@ impl State {
             (164., self.shelf_tab_w())
         } else if tab == TAB_QUICK {
             (164. + self.shelf_tab_w() + 3., 34.)
-        } else if tab == TAB_NOTIF {
-            (self.panel_w_now() - 24. - 34. - 38., 34.)
         } else {
-            (self.panel_w_now() - 24. - 34., 34.)
+            (gear_rect(self.panel_w_now()).0 - 38., 34.)
         }
     }
     /// Right edge of the header tabs.
@@ -1793,7 +1772,7 @@ impl State {
             _ => false,
         }
     }
-    /// Header targets: 0..TAB_COUNT page tabs, 10 Clear, 12 folder breadcrumb, -1 none.
+    /// Header targets: 0..TAB_COUNT page tabs, 10 Clear, 11 Settings popup toggle, 12 folder breadcrumb, -1 none.
     fn header_hit(&self, x: f64, y: f64) -> i32 {
         if !(8. ..36.).contains(&y) {
             return -1;
@@ -1809,6 +1788,10 @@ impl State {
             if (tx..tx + tw).contains(&x) {
                 return tab as i32;
             }
+        }
+        let (gx, gw) = gear_rect(self.panel_w_now());
+        if (gx..gx + gw).contains(&x) {
+            return HEADER_SETTINGS;
         }
         if self.has_clear(self.active_tab) {
             let (cx, cw) = clear_rect(self.panel_w_now(), self.active_tab);
@@ -2774,6 +2757,15 @@ impl State {
                 dt,
             )
         };
+        let settings_win_animating = self.settings_win.advance(
+            self.updater.auto,
+            self.settings.bg_style,
+            self.settings.bg_opacity,
+            self.settings.bg_pos,
+            self.reduced_motion,
+            dt,
+        );
+        self.settings_win_moving = settings_animating || settings_win_animating;
         let quick_animating = self.advance_quick_motion(dt);
         geom_animating
             || play_animating
@@ -2787,6 +2779,7 @@ impl State {
             || notice_animating
             || mini_animating
             || settings_animating
+            || settings_win_animating
             || agenda_animating
             || notif_enter_animating
             || notif_scroll_animating
@@ -3000,207 +2993,31 @@ impl State {
             self.notice_until = None;
             self.notif_history.clear();
         }
-        InvalidateRect(hwnd, std::ptr::null(), 0);
-    }
-    /// Settings page targets: 5000+k switch row, 5200 Quit, 5250 Appearance drilldown, 5260 Back,
-    /// 5300..=5304 style, 5310..=5313 opacity, 5320 import, 5321 reset, 5330..=5332 pos, 5340..=5343 blur, -1 none.
-    fn settings_hit(&self, x: f64, y: f64) -> i32 {
-        if self.settings_subpage == 2 {
-            if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
-                return 5260;
-            }
-            if (65. ..93.).contains(&y) && (24. ..416.).contains(&x) {
-                return 5401;
-            }
-            if (246. ..276.).contains(&y) {
-                if (24. ..250.).contains(&x) {
-                    return if self.updater.action_enabled() {
-                        5400
-                    } else {
-                        -1
-                    };
-                }
-                if (260. ..416.).contains(&x) {
-                    return 5402;
-                }
-            }
-            return -1;
-        }
-        if self.settings_subpage == 1 {
-            // Back button (< Settings)
-            if (284. ..308.).contains(&y) && (24. ..116.).contains(&x) {
-                return 5260;
-            }
-            // Style pills (Frost, Aura, Slate, OLED, Image)
-            if (64. ..88.).contains(&y) {
-                for i in 0..5 {
-                    let bx = 30. + i as f64 * 76.;
-                    if (bx..bx + 72.).contains(&x) {
-                        return 5300 + i as i32;
-                    }
-                }
-            }
-            // Image row (Import / Change, Reset)
-            if (124. ..148.).contains(&y) {
-                if (34. ..164.).contains(&x) {
-                    return 5320;
-                }
-                if self.bg_custom_pixels.is_some() && (172. ..232.).contains(&x) {
-                    return 5321;
-                }
-            }
-            // Position pills (Top 5330, Center 5331, Bottom 5332)
-            if (156. ..178.).contains(&y) {
-                for i in 0..3 {
-                    let px = 110. + i as f64 * 70.;
-                    if (px..px + 64.).contains(&x) {
-                        return 5330 + i as i32;
-                    }
-                }
-            }
-            // Blur slider line (y = 208..234, x = 76..364)
-            if (208. ..234.).contains(&y) && (76. ..364.).contains(&x) {
-                return 5340;
-            }
-            // Opacity pills (70% 5310, 80% 5311, 90% 5312, 100% 5313)
-            if (242. ..264.).contains(&y) {
-                for i in 0..4 {
-                    let bx = 96. + i as f64 * 72.;
-                    if (bx..bx + 66.).contains(&x) {
-                        return 5310 + i as i32;
-                    }
-                }
-            }
-            return -1;
-        }
-
-        // Main Settings page
-        for k in 0..SETTING_ROWS.len() {
-            let (cx, ry) = setting_row(k);
-            if (cx..cx + SET_CARD_W).contains(&x) && (ry..ry + SET_ROW_H).contains(&y) {
-                return 5000 + k as i32;
-            }
-        }
-        // Appearance drilldown card
-        if (208. ..256.).contains(&y) && (24. ..416.).contains(&x) {
-            return 5250;
-        }
-        if (298. ..322.).contains(&y) && (238. ..322.).contains(&x) {
-            return 5405;
-        }
-        // Quit button
-        if (298. ..322.).contains(&y) && (SET_W - 24. - 84. ..SET_W - 24.).contains(&x) {
-            return 5200;
-        }
-        -1
-    }
-    unsafe fn settings_click(&mut self, hwnd: Hwnd, hit: i32) {
-        match hit {
-            5405 => self.settings_subpage = 2,
-            5401 => {
-                if !self.smoke {
-                    self.updater.toggle_auto();
-                }
-            }
-            5402 => self.updater.cancel(),
-            5400 if !self.smoke && self.updater.action_enabled() => match self.updater.phase {
-                updater::Phase::Ready => match self.updater.install() {
-                    Ok(()) => {
-                        DestroyWindow(hwnd);
-                    }
-                    Err(e) => self.updater.status = e,
-                },
-                updater::Phase::Available => self.updater.download(),
-                updater::Phase::Error if self.updater.release.is_some() => self.updater.download(),
-                _ => self.updater.check(),
-            },
-            5000..=5006 => self.change_setting(hwnd, SETTING_ROWS[(hit - 5000) as usize].1),
-            5200 => {
-                DestroyWindow(hwnd);
-            }
-            5250 => {
-                self.settings_subpage = 1;
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            5260 => {
-                self.settings_subpage = 0;
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            5300..=5304 => {
-                let style = (hit - 5300) as u32;
-                if style == 4 && self.bg_custom_pixels.is_none() {
-                    self.import_custom_bg(hwnd);
-                } else {
-                    self.settings.bg_style = style;
-                    self.apply_settings();
-                    if !self.smoke {
-                        self.settings.save();
-                    }
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                }
-            }
-            5310..=5313 => {
-                let opacities = [70, 80, 90, 100];
-                self.settings.bg_opacity = opacities[(hit - 5310) as usize];
-                if self.bg_custom_pixels.is_some() {
-                    self.reload_custom_bg();
-                }
-                self.apply_settings();
-                if !self.smoke {
-                    self.settings.save();
-                }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            5320 => {
-                self.import_custom_bg(hwnd);
-            }
-            5321 => {
-                self.reset_custom_bg(hwnd);
-            }
-            5330..=5332 => {
-                // 5330: Top (pos 1), 5331: Center (pos 0), 5332: Bottom (pos 2)
-                self.settings.bg_pos = match hit - 5330 {
-                    0 => 1,
-                    1 => 0,
-                    _ => 2,
-                };
-                self.reload_custom_bg();
-                self.apply_settings();
-                if !self.smoke {
-                    self.settings.save();
-                }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            5340 => {
-                if !self.smoke {
-                    self.settings.save();
-                }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            _ => {}
+        if !hwnd.is_null() {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
         }
     }
-    unsafe fn import_custom_bg(&mut self, hwnd: Hwnd) {
-        if let Some(file_path) = open_image_dialog(hwnd) {
-            let h = (DIB_H * self.scale).ceil() as usize;
-            if let Some(prepared) = prepare_custom_bg(
-                &file_path,
-                self.stride,
-                h,
-                self.settings.bg_blur,
-                self.settings.bg_pos,
-                self.settings.bg_opacity,
-            ) {
-                if let Some(dest) = tasks::data_path("background.png") {
-                    let _ = std::fs::copy(&file_path, dest);
-                }
-                self.bg_custom_pixels = Some(prepared);
-                self.settings.bg_style = 4;
-                self.apply_settings();
-                if !self.smoke {
-                    self.settings.save();
-                }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
+    pub(crate) unsafe fn apply_imported_custom_bg(&mut self, file_path: &str, main_hwnd: Hwnd) {
+        let h = (DIB_H * self.scale).ceil() as usize;
+        if let Some(prepared) = prepare_custom_bg(
+            file_path,
+            self.stride,
+            h,
+            self.settings.bg_blur,
+            self.settings.bg_pos,
+            self.settings.bg_opacity,
+        ) {
+            if let Some(dest) = tasks::data_path("background.png") {
+                let _ = std::fs::copy(file_path, dest);
+            }
+            self.bg_custom_pixels = Some(prepared);
+            self.settings.bg_style = 4;
+            self.apply_settings();
+            if !self.smoke {
+                self.settings.save();
+            }
+            if !main_hwnd.is_null() {
+                InvalidateRect(main_hwnd, std::ptr::null(), 0);
             }
         }
     }
@@ -3301,7 +3118,9 @@ impl State {
         if !self.smoke {
             self.settings.save();
         }
-        InvalidateRect(hwnd, std::ptr::null(), 0);
+        if !hwnd.is_null() {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
     }
     /// Frosted glass: while the panel shows with a see-through style, capture what is behind it a
     /// few times a second and blur it. Wisp's own window is not in the capture: a screen BitBlt
@@ -4222,20 +4041,30 @@ struct TextCache {
     masks: std::collections::HashMap<(usize, u32, i32, i32, Vec<u16>), (Vec<u8>, u32)>,
 }
 /// Draws `text` like `DrawTextW(dc, text, rect, flags)` with the DC's current font and text color,
-/// honoring the DC's clip box, but from a cached grayscale mask.
-unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u32) {
+/// honoring the DC's clip box, into an arbitrary premultiplied BGRA surface using a cached grayscale mask.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cached_text_into(
+    dc: Handle,
+    pixels: *mut u32,
+    stride: usize,
+    height: i32,
+    text_cache: &std::cell::RefCell<TextCache>,
+    ticks: u32,
+    text: &[u16],
+    rect: Rect,
+    flags: u32,
+) {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     if text.is_empty() || w <= 0 || h <= 0 || w > 4096 || h > 2048 {
         return;
     }
     let font = GetCurrentObject(dc, 6);
     let color = GetTextColor(dc);
-    let mut cache = s.text_cache.borrow_mut();
-    let now = s.ticks;
+    let mut cache = text_cache.borrow_mut();
     if cache.masks.len() > 192 {
         cache
             .masks
-            .retain(|_, (_, used)| now.wrapping_sub(*used) < 300);
+            .retain(|_, (_, used)| ticks.wrapping_sub(*used) < 300);
         if cache.masks.len() > 384 {
             cache.masks.clear();
         }
@@ -4243,31 +4072,59 @@ unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u3
     let key = (font as usize, flags, w, h, text.to_vec());
     if !cache.masks.contains_key(&key) {
         let mask = render_mask(font, text, w, h, flags);
-        cache.masks.insert(key.clone(), (mask, now));
+        cache.masks.insert(key.clone(), (mask, ticks));
     }
     let Some((mask, used)) = cache.masks.get_mut(&key) else {
         return;
     };
-    *used = now;
+    *used = ticks;
     let mut clip = Rect::default();
     if GetClipBox(dc, &mut clip) == 0 {
         return;
     }
-    blend_mask(s, mask, w, rect, clip, color);
+    blend_mask_into(pixels, stride, height, mask, w, rect, clip, color);
 }
-/// Blends a coverage mask (row length `w`, placed at `rect`) into the frame in `color`, within `clip`.
-unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, color: u32) {
+/// Draws `text` like `DrawTextW(dc, text, rect, flags)` with the DC's current font and text color,
+/// honoring the DC's clip box, but from a cached grayscale mask.
+unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u32) {
+    cached_text_into(
+        dc,
+        s.pixels,
+        s.stride,
+        (DIB_H * s.scale).ceil() as i32,
+        &s.text_cache,
+        s.ticks,
+        text,
+        rect,
+        flags,
+    );
+}
+/// Blends a coverage mask (row length `w`, placed at `rect`) into `pixels` in `color`, within `clip`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn blend_mask_into(
+    pixels: *mut u32,
+    stride: usize,
+    height: i32,
+    mask: &[u8],
+    w: i32,
+    rect: Rect,
+    clip: Rect,
+    color: u32,
+) {
     let (x0, x1) = (
         rect.left.max(clip.left).max(0),
-        rect.right.min(clip.right).min(s.stride as i32),
+        rect.right.min(clip.right).min(stride as i32),
     );
-    let (y0, y1) = (rect.top.max(clip.top).max(0), rect.bottom.min(clip.bottom));
+    let (y0, y1) = (
+        rect.top.max(clip.top).max(0),
+        rect.bottom.min(clip.bottom).min(height),
+    );
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let (r, g, b) = (color & 255, (color >> 8) & 255, (color >> 16) & 255);
     for y in y0..y1 {
-        let row = std::slice::from_raw_parts_mut(s.pixels.add(y as usize * s.stride), x1 as usize);
+        let row = std::slice::from_raw_parts_mut(pixels.add(y as usize * stride), x1 as usize);
         let src = &mask[((y - rect.top) * w) as usize..];
         for x in x0..x1 {
             let c = src[(x - rect.left) as usize] as u32;
@@ -4282,6 +4139,19 @@ unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, col
                 | mix(d & 255, b);
         }
     }
+}
+/// Blends a coverage mask (row length `w`, placed at `rect`) into the notch frame in `color`, within `clip`.
+unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, color: u32) {
+    blend_mask_into(
+        s.pixels,
+        s.stride,
+        (DIB_H * s.scale).ceil() as i32,
+        mask,
+        w,
+        rect,
+        clip,
+        color,
+    );
 }
 /// White-on-black rendering of one text box; its red channel is the coverage GDI would blend with.
 unsafe fn render_mask(font: Handle, text: &[u16], w: i32, h: i32, flags: u32) -> Vec<u8> {
@@ -7387,254 +7257,6 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
 // Apple Clock timer layout: progress ring with the countdown, phase picker, and Reset / Start pills.
 /// Settings, in the style of iOS / macOS dark mode: inset grouped cards with switches, a segmented
 /// control for the music player, and a footer with the version and Quit.
-unsafe fn settings_page(dc: Handle, s: &State, dx: f64, o: f64) {
-    if s.settings_subpage == 2 {
-        settings_updates_page(dc, s, dx, o);
-        return;
-    }
-    if s.settings_subpage == 1 {
-        settings_background_page(dc, s, dx, o);
-        return;
-    }
-
-    const CARD: u32 = 0x1e1c1c; // rgb(28,28,30), the grouped-card fill
-    text_opt(
-        dc, s, 3, "NOTCH", SECONDARY, 36., 44., 140., 16., false, o, dx,
-    );
-    text_opt(
-        dc, s, 3, "GENERAL", SECONDARY, 238., 44., 140., 16., false, o, dx,
-    );
-    round_opt(
-        s,
-        24.,
-        SET_CARD_Y,
-        SET_CARD_W,
-        4. * SET_ROW_H,
-        12.,
-        CARD,
-        o,
-        dx,
-    );
-    round_opt(
-        s,
-        226.,
-        SET_CARD_Y,
-        SET_CARD_W,
-        3. * SET_ROW_H,
-        12.,
-        CARD,
-        o,
-        dx,
-    );
-    for (k, &(label, _)) in SETTING_ROWS.iter().enumerate() {
-        let (cx, ry) = setting_row(k);
-        let (hot, pressed) = (s.hover == 5000 + k as i32, s.pressed == 5000 + k as i32);
-        if hot || pressed {
-            round_opt(
-                s,
-                cx + 4.,
-                ry + 3.,
-                SET_CARD_W - 8.,
-                SET_ROW_H - 6.,
-                8.,
-                if pressed {
-                    rgb(50, 50, 54)
-                } else {
-                    rgb(40, 40, 43)
-                },
-                o,
-                dx,
-            );
-        }
-        text_opt(
-            dc,
-            s,
-            2,
-            label,
-            WHITE,
-            cx + 12.,
-            ry,
-            SET_CARD_W - 12. - 34. - 18.,
-            SET_ROW_H,
-            false,
-            o,
-            dx,
-        );
-        // iOS switch: the track fills with system green and the knob slides across.
-        let t = s.switch_t[k].clamp(0., 1.);
-        let (tx, ty) = (cx + SET_CARD_W - 12. - 34., ry + (SET_ROW_H - 20.) / 2.);
-        pill_opt(
-            s,
-            tx,
-            ty,
-            34.,
-            20.,
-            blend_color(rgb(57, 57, 61), GREEN, t),
-            o,
-            dx,
-        );
-        pill_opt(
-            s,
-            tx + 2. + 14. * s.switch_t[k],
-            ty + 2.,
-            16.,
-            16.,
-            WHITE,
-            o,
-            dx,
-        );
-        let last = k == 3 || k == SETTING_ROWS.len() - 1;
-        if !last {
-            round_opt(
-                s,
-                cx + 12.,
-                ry + SET_ROW_H - 1.,
-                SET_CARD_W - 12.,
-                1.,
-                0.,
-                rgb(44, 44, 46),
-                o,
-                dx,
-            );
-        }
-    }
-    text_opt(
-        dc,
-        s,
-        3,
-        "Changes save automatically.",
-        SECONDARY,
-        238.,
-        SET_CARD_Y + 3. * SET_ROW_H + 6.,
-        SET_CARD_W - 12.,
-        16.,
-        false,
-        o,
-        dx,
-    );
-
-    // Appearance: Dedicated drilldown card
-    text_opt(
-        dc,
-        s,
-        3,
-        "APPEARANCE",
-        SECONDARY,
-        36.,
-        192.,
-        140.,
-        14.,
-        false,
-        o,
-        dx,
-    );
-    round_opt(s, 24., 208., 392., 48., 12., CARD, o, dx);
-
-    let hot = s.hover == 5250;
-    let pressed = s.pressed == 5250;
-    if hot || pressed {
-        round_opt(
-            s,
-            28.,
-            211.,
-            384.,
-            42.,
-            8.,
-            if pressed {
-                rgb(46, 46, 50)
-            } else {
-                rgb(38, 38, 42)
-            },
-            o,
-            dx,
-        );
-    }
-
-    text_opt(
-        dc,
-        s,
-        1,
-        "Background",
-        WHITE,
-        38.,
-        214.,
-        140.,
-        18.,
-        false,
-        o,
-        dx,
-    );
-
-    let style_str = match s.settings.bg_style {
-        0 => "Frost Glass",
-        1 => "Aura",
-        2 => "Slate",
-        3 => "OLED Black",
-        4 => "Custom Image",
-        _ => "Frost Glass",
-    };
-    let summary = format!("{} • {}% opacity", style_str, s.settings.bg_opacity);
-    text_opt(
-        dc, s, 3, &summary, SECONDARY, 38., 233., 260., 16., false, o, dx,
-    );
-
-    let btn_bg = if hot || pressed {
-        rgb(58, 58, 62)
-    } else {
-        rgb(42, 42, 46)
-    };
-    pill_opt(s, 314., 218., 92., 28., btn_bg, o, dx);
-    text_opt(
-        dc,
-        s,
-        2,
-        "Customize ›",
-        WHITE,
-        314.,
-        218.,
-        92.,
-        28.,
-        true,
-        o,
-        dx,
-    );
-
-    let update_bg = if s.hover == 5405 || s.pressed == 5405 {
-        rgb(44, 44, 46)
-    } else {
-        CARD
-    };
-    pill_opt(s, 238., 298., 84., 24., update_bg, o, dx);
-    text_opt(
-        dc, s, 2, "Updates", WHITE, 238., 298., 84., 24., true, o, dx,
-    );
-    // Footer: version on the left, Quit on the right.
-    text_opt(
-        dc,
-        s,
-        3,
-        concat!("Wisp ", env!("CARGO_PKG_VERSION")),
-        SECONDARY,
-        36.,
-        302.,
-        160.,
-        18.,
-        false,
-        o,
-        dx,
-    );
-    let (qx, qw) = (SET_W - 24. - 84., 84.);
-    let quit_bg = if s.pressed == 5200 {
-        rgb(54, 54, 58)
-    } else if s.hover == 5200 {
-        rgb(44, 44, 46)
-    } else {
-        CARD
-    };
-    pill_opt(s, qx, 298., qw, 24., quit_bg, o, dx);
-    text_opt(dc, s, 2, "Quit Wisp", WHITE, qx, 298., qw, 24., true, o, dx);
-}
-
 fn update_note_lines(notes: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for line in notes.lines() {
@@ -7651,486 +7273,6 @@ fn update_note_lines(notes: &str) -> Vec<String> {
         lines.push(wrapped);
     }
     lines
-}
-unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
-    let u = &s.updater;
-    text_opt(
-        dc, s, 1, "Updates", WHITE, 24., 38., 260., 24., false, o, dx,
-    );
-    text_opt(
-        dc,
-        s,
-        3,
-        &format!("v{}", env!("CARGO_PKG_VERSION")),
-        SECONDARY,
-        340.,
-        38.,
-        76.,
-        24.,
-        true,
-        o,
-        dx,
-    );
-    pill_opt(s, 24., 65., 392., 28., rgb(28, 28, 30), o, dx);
-    text_opt(
-        dc,
-        s,
-        2,
-        "Auto-check",
-        WHITE,
-        34.,
-        65.,
-        280.,
-        28.,
-        false,
-        o,
-        dx,
-    );
-    text_opt(
-        dc,
-        s,
-        2,
-        if u.auto { "On" } else { "Off" },
-        if u.auto { BLUE } else { SECONDARY },
-        350.,
-        65.,
-        54.,
-        28.,
-        true,
-        o,
-        dx,
-    );
-    let status = update_note_lines(&u.status);
-    for (i, line) in status.iter().take(2).enumerate() {
-        text_opt(
-            dc,
-            s,
-            2,
-            line,
-            WHITE,
-            24.,
-            120. + i as f64 * 18.,
-            392.,
-            18.,
-            false,
-            o,
-            dx,
-        );
-    }
-    if u.phase == updater::Phase::Downloading && u.progress.1 > 0 {
-        let fraction = u.progress.0 as f64 / u.progress.1 as f64;
-        round_opt(s, 24., 158., 392., 3., 1., rgb(40, 40, 44), o, dx);
-        round_opt(s, 24., 158., 392. * fraction, 3., 1., BLUE, o, dx);
-        text_opt(
-            dc,
-            s,
-            3,
-            &format!("{:.0}%", fraction * 100.),
-            SECONDARY,
-            350.,
-            140.,
-            66.,
-            18.,
-            true,
-            o,
-            dx,
-        );
-    }
-    let notes = u.release.as_ref().map(|r| r.notes.as_str()).unwrap_or("");
-    let lines = update_note_lines(notes);
-    for (i, line) in lines.iter().take(4).enumerate() {
-        text_opt(
-            dc,
-            s,
-            3,
-            line,
-            SECONDARY,
-            24.,
-            168. + i as f64 * 16.,
-            392.,
-            16.,
-            false,
-            o,
-            dx,
-        );
-    }
-    let label = match u.phase {
-        updater::Phase::Checking => "Checking...",
-        updater::Phase::Downloading => "Downloading...",
-        updater::Phase::Ready => "Restart & update",
-        updater::Phase::Available => "Download update",
-        updater::Phase::Error if u.release.is_some() => "Retry download",
-        _ => "Check for updates",
-    };
-    let enabled = u.action_enabled();
-    pill_opt(
-        s,
-        24.,
-        246.,
-        226.,
-        30.,
-        if enabled { BLUE } else { rgb(45, 45, 48) },
-        o,
-        dx,
-    );
-    text_opt(
-        dc,
-        s,
-        2,
-        label,
-        if enabled { WHITE } else { SECONDARY },
-        24.,
-        246.,
-        226.,
-        30.,
-        true,
-        o,
-        dx,
-    );
-    if u.phase == updater::Phase::Downloading {
-        pill_opt(s, 260., 246., 156., 30., rgb(28, 28, 30), o, dx);
-        text_opt(
-            dc, s, 2, "Cancel", WHITE, 260., 246., 156., 30., true, o, dx,
-        );
-    }
-    text_opt(
-        dc,
-        s,
-        2,
-        "< Settings",
-        BLUE,
-        24.,
-        284.,
-        100.,
-        24.,
-        false,
-        o,
-        dx,
-    );
-}
-
-unsafe fn settings_background_page(dc: Handle, s: &State, dx: f64, o: f64) {
-    const CARD: u32 = 0x1e1c1c; // rgb(28,28,30)
-
-    // Header bar: Back button on the left, Subpage Title next to it
-    let b_hot = s.hover == 5260;
-    let b_pressed = s.pressed == 5260;
-    let b_bg = if b_pressed {
-        rgb(54, 54, 58)
-    } else if b_hot {
-        rgb(42, 42, 46)
-    } else {
-        rgb(30, 28, 28)
-    };
-    let b_fg = if b_hot || b_pressed { WHITE } else { SECONDARY };
-    pill_opt(s, 24., 284., 92., 24., b_bg, o, dx);
-    text_opt(
-        dc,
-        s,
-        2,
-        "‹ Settings",
-        b_fg,
-        24.,
-        284.,
-        92.,
-        24.,
-        true,
-        o,
-        dx,
-    );
-
-    // Section 1: STYLE
-    text_opt(
-        dc, s, 3, "STYLE", SECONDARY, 36., 42., 120., 14., false, o, dx,
-    );
-    round_opt(s, 24., 58., 392., 36., 10., CARD, o, dx);
-    const STYLES: [&str; 5] = ["Frost", "Aura", "Slate", "OLED", "Image"];
-    for i in 0..5 {
-        let bx = 30. + i as f64 * 76.;
-        let hit = 5300 + i as i32;
-        let is_active = s.settings.bg_style == i as u32;
-        let hot = s.hover == hit;
-        let pressed = s.pressed == hit;
-        let bg = if is_active {
-            rgb(68, 68, 74)
-        } else if pressed {
-            rgb(46, 46, 50)
-        } else if hot {
-            rgb(38, 38, 42)
-        } else {
-            rgb(24, 24, 26)
-        };
-        let fg = if is_active || hot || pressed {
-            WHITE
-        } else {
-            SECONDARY
-        };
-        pill_opt(s, bx, 64., 72., 24., bg, o, dx);
-        text_opt(dc, s, 2, STYLES[i], fg, bx, 64., 72., 24., true, o, dx);
-    }
-
-    // Section 2: IMAGE & POSITION
-    text_opt(
-        dc,
-        s,
-        3,
-        "IMAGE & POSITION",
-        SECONDARY,
-        36.,
-        102.,
-        160.,
-        14.,
-        false,
-        o,
-        dx,
-    );
-    round_opt(s, 24., 118., 392., 64., 10., CARD, o, dx);
-
-    let has_image = s.bg_custom_pixels.is_some();
-    let btn_label = if has_image {
-        "Change Image..."
-    } else {
-        "Import Image..."
-    };
-    let imp_hot = s.hover == 5320;
-    let imp_pressed = s.pressed == 5320;
-    let imp_bg = if imp_pressed {
-        rgb(54, 54, 58)
-    } else if imp_hot {
-        rgb(44, 44, 48)
-    } else {
-        rgb(32, 32, 36)
-    };
-    pill_opt(s, 34., 124., 130., 24., imp_bg, o, dx);
-    text_opt(
-        dc, s, 2, btn_label, WHITE, 34., 124., 130., 24., true, o, dx,
-    );
-
-    if has_image {
-        let rst_hot = s.hover == 5321;
-        let rst_pressed = s.pressed == 5321;
-        let rst_bg = if rst_pressed {
-            rgb(54, 54, 58)
-        } else if rst_hot {
-            rgb(44, 44, 48)
-        } else {
-            rgb(32, 32, 36)
-        };
-        pill_opt(s, 172., 124., 60., 24., rst_bg, o, dx);
-        text_opt(
-            dc, s, 2, "Reset", SECONDARY, 172., 124., 60., 24., true, o, dx,
-        );
-
-        if s.settings.bg_style == 4 {
-            text_opt(
-                dc,
-                s,
-                3,
-                "● Active",
-                GREEN,
-                244.,
-                124.,
-                80.,
-                24.,
-                false,
-                o,
-                dx,
-            );
-        }
-    } else {
-        text_opt(
-            dc,
-            s,
-            3,
-            "PNG, JPG, BMP, WebP",
-            SECONDARY,
-            174.,
-            124.,
-            220.,
-            24.,
-            false,
-            o,
-            dx,
-        );
-    }
-
-    round_opt(s, 34., 152., 372., 1., 0., rgb(44, 44, 46), o, dx);
-
-    // Framing / Position
-    text_opt(
-        dc, s, 2, "Position", SECONDARY, 36., 156., 64., 22., false, o, dx,
-    );
-    const POSITIONS: [(&str, u32, i32); 3] =
-        [("Top", 1, 5330), ("Center", 0, 5331), ("Bottom", 2, 5332)];
-    for (idx, &(pos_label, pos_val, pos_hit)) in POSITIONS.iter().enumerate() {
-        let px = 110. + idx as f64 * 70.;
-        let is_active = s.settings.bg_pos == pos_val;
-        let hot = s.hover == pos_hit;
-        let pressed = s.pressed == pos_hit;
-        let bg = if is_active {
-            rgb(68, 68, 74)
-        } else if pressed {
-            rgb(46, 46, 50)
-        } else if hot {
-            rgb(38, 38, 42)
-        } else {
-            rgb(24, 24, 26)
-        };
-        let fg = if is_active || hot || pressed {
-            WHITE
-        } else {
-            SECONDARY
-        };
-        pill_opt(s, px, 156., 64., 22., bg, o, dx);
-        text_opt(dc, s, 2, pos_label, fg, px, 156., 64., 22., true, o, dx);
-    }
-
-    // Section 3: BLUR & OPACITY
-    text_opt(
-        dc,
-        s,
-        3,
-        "BLUR & OPACITY",
-        SECONDARY,
-        36.,
-        190.,
-        160.,
-        14.,
-        false,
-        o,
-        dx,
-    );
-    round_opt(s, 24., 206., 392., 64., 10., CARD, o, dx);
-
-    // Row 1: Blur slider line
-    text_opt(
-        dc, s, 2, "Blur", SECONDARY, 36., 210., 44., 22., false, o, dx,
-    );
-    const TRACK_X0: f64 = 86.;
-    const TRACK_X1: f64 = 352.;
-    let active = s.hover == 5340 || s.blur_drag;
-    let th = if active { 6. } else { 4. };
-    let cy = 221.;
-    let frac = (s.settings.bg_blur as f64 / 30.).clamp(0., 1.);
-    let thumb_x = TRACK_X0 + frac * (TRACK_X1 - TRACK_X0);
-
-    // Track background
-    pill_opt(
-        s,
-        TRACK_X0,
-        cy - th / 2.,
-        TRACK_X1 - TRACK_X0,
-        th,
-        rgb(52, 52, 55),
-        o,
-        dx,
-    );
-    // Filled track
-    if frac > 0.005 {
-        pill_opt(
-            s,
-            TRACK_X0,
-            cy - th / 2.,
-            (thumb_x - TRACK_X0).max(th),
-            th,
-            if active { WHITE } else { rgb(200, 200, 204) },
-            o,
-            dx,
-        );
-    }
-    // Draggable thumb knob
-    let knob_d = if active { 16. } else { 14. };
-    pill_opt(
-        s,
-        thumb_x - knob_d / 2.,
-        cy - knob_d / 2.,
-        knob_d,
-        knob_d,
-        WHITE,
-        o,
-        dx,
-    );
-
-    // Value indicator on the right
-    let val_str = if s.settings.bg_blur == 0 {
-        "None".to_string()
-    } else {
-        format!("{}px", s.settings.bg_blur)
-    };
-    text_opt(
-        dc,
-        s,
-        3,
-        &val_str,
-        if active { WHITE } else { SECONDARY },
-        360.,
-        210.,
-        46.,
-        22.,
-        true,
-        o,
-        dx,
-    );
-
-    round_opt(s, 34., 236., 372., 1., 0., rgb(44, 44, 46), o, dx);
-
-    // Row 2: Opacity
-    text_opt(
-        dc, s, 2, "Opacity", SECONDARY, 36., 242., 50., 22., false, o, dx,
-    );
-    const OPACITIES: [(u32, &str); 4] = [(70, "70%"), (80, "80%"), (90, "90%"), (100, "100%")];
-    for i in 0..4 {
-        let bx = 96. + i as f64 * 72.;
-        let hit = 5310 + i as i32;
-        let is_active = s.settings.bg_opacity == OPACITIES[i].0;
-        let hot = s.hover == hit;
-        let pressed = s.pressed == hit;
-        let bg = if is_active {
-            rgb(68, 68, 74)
-        } else if pressed {
-            rgb(46, 46, 50)
-        } else if hot {
-            rgb(38, 38, 42)
-        } else {
-            rgb(24, 24, 26)
-        };
-        let fg = if is_active || hot || pressed {
-            WHITE
-        } else {
-            SECONDARY
-        };
-        pill_opt(s, bx, 242., 66., 22., bg, o, dx);
-        text_opt(
-            dc,
-            s,
-            2,
-            OPACITIES[i].1,
-            fg,
-            bx,
-            242.,
-            66.,
-            22.,
-            true,
-            o,
-            dx,
-        );
-    }
-
-    // Subpage Footer note
-    text_opt(
-        dc,
-        s,
-        3,
-        "Changes save automatically.",
-        SECONDARY,
-        124.,
-        286.,
-        292.,
-        20.,
-        true,
-        o,
-        dx,
-    );
 }
 /// Helper to draw a single notification card (supports normal cards and animated dismissing cards).
 unsafe fn draw_notif_card(
@@ -8864,12 +8006,35 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 0.,
             );
         }
+        let (gx, gw) = gear_rect(cur_w);
+        let gear_hover = s.tab_hover == HEADER_SETTINGS;
+        let gear_open = s.settings_win.is_open();
+        if gear_hover || gear_open {
+            pill_opt(
+                s,
+                gx,
+                10.,
+                gw,
+                24.,
+                if gear_open {
+                    rgb(40, 40, 43)
+                } else {
+                    rgb(28, 28, 30)
+                },
+                rv,
+                0.,
+            );
+        }
         icon_opt(
             s,
             10,
-            s.tab_x(TAB_SETTINGS).0 + 8.,
+            gx + 8.,
             13.,
-            lit(TAB_SETTINGS),
+            if gear_hover || gear_open {
+                WHITE
+            } else {
+                SECONDARY
+            },
             rv,
             0.,
         );
@@ -8917,7 +8082,6 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 TAB_SHELF => shelf_page(dc, s, dx, o),
                 TAB_QUICK => quick_page(dc, s, dx, o),
                 TAB_NOTIF => notif_page(dc, s, dx, o),
-                TAB_SETTINGS => settings_page(dc, s, dx, o),
                 _ => {}
             }
         }
@@ -9453,8 +8617,37 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
         _ => {}
     }
 }
+pub(crate) const WM_SETTINGS_IMPORT_BG: u32 = 0x8009;
+
 unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize {
     let ptr = GetWindowLongPtrW(hwnd, -21) as *mut State;
+    if msg == WM_SETTINGS_IMPORT_BG && !ptr.is_null() {
+        let owner = {
+            let s = &mut *ptr;
+            if s.modal_dialog_open || s.smoke {
+                return 0;
+            }
+            s.modal_dialog_open = true;
+            let sw_hwnd = s.settings_win.hwnd();
+            if !sw_hwnd.is_null() {
+                sw_hwnd
+            } else {
+                hwnd
+            }
+        };
+        let picked = open_image_dialog(owner);
+        {
+            let s = &mut *ptr;
+            s.modal_dialog_open = false;
+            if let Some(path) = picked {
+                s.apply_imported_custom_bg(&path, hwnd);
+            }
+            if s.settings_win.is_open() {
+                settings_win::SettingsWindow::paint(s);
+            }
+        }
+        return 0;
+    }
     if !ptr.is_null() {
         let s = &mut *ptr;
         if s.shelf_alert.is_some() {
@@ -9519,7 +8712,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     s.expanded = true;
                     s.layout(hwnd);
                 }
-                if s.updater.poll() {
+                let updater_changed = s.updater.poll();
+                if updater_changed {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 s.ticks += 1;
@@ -9684,7 +8878,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let prev_mini = s.mini_t;
                 let prev_tab = s.tab_t;
                 let prev_lt = s.lyrics_t;
+                let was_settings_visible = s.settings_win.is_visible();
                 let animating = s.advance(dt);
+                let settings_sw_moving = s.settings_win_moving;
                 let resized = s.progress != prev_p
                     || s.panel_w != prev_w
                     || s.play_progress != prev_play
@@ -9700,11 +8896,18 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     }
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
+                if (s.settings_win.is_visible() || was_settings_visible)
+                    && (settings_sw_moving || updater_changed)
+                    && s.settings_win.is_visible()
+                {
+                    settings_win::SettingsWindow::paint(s);
+                }
                 // How fast the frame thread runs next (see the thread in main): vsync-locked while the notch
                 // itself moves, a cheaper timer at the display rate while only the waveform or a lyric line
                 // moves (or the panel is open), and ~10 ticks a second when nothing does.
                 let motion = s.smoke
                     || resized
+                    || settings_sw_moving
                     || s.tab_t != prev_tab
                     || s.lyrics_t != prev_lt
                     || s.is_dragging
@@ -9716,7 +8919,8 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     || s.media.playing
                     || s.notice.is_some()
                     || !s.notices.is_empty()
-                    || s.alert_until.is_some();
+                    || s.alert_until.is_some()
+                    || (s.settings_win.is_open() && s.updater.phase == updater::Phase::Downloading);
                 let pace_target = if motion {
                     PACE_MOTION
                 } else if ambient {
@@ -9885,10 +9089,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     s.set_volume_x(x);
                     changed = true;
                 }
-                if s.blur_drag {
-                    s.set_blur_x(x);
-                    changed = true;
-                }
                 if s.usable() {
                     let hit = if y < HEADER_H { s.header_hit(x, y) } else { -1 };
                     let bc_hover = hit == 12;
@@ -9918,15 +9118,13 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         || s.active_tab == TAB_POMO
                         || s.active_tab == TAB_QUICK
                         || s.active_tab == TAB_NOTIF
-                        || s.active_tab == TAB_SETTINGS
                     {
                         let hover = match s.active_tab {
                             TAB_CAL => s.cal_hit(x, y),
                             TAB_TODO => s.todo_hit(x, y),
                             TAB_POMO => pomo_hit(x, y),
                             TAB_QUICK => s.quick_hit(x, y),
-                            TAB_NOTIF => s.notif_hit(x, y),
-                            _ => s.settings_hit(x, y),
+                            _ => s.notif_hit(x, y),
                         };
                         if s.hover != hover {
                             s.hover = hover;
@@ -10167,8 +9365,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         s.quick_hit(x, y)
                     } else if s.active_tab == TAB_NOTIF {
                         s.notif_hit(x, y)
-                    } else if s.active_tab == TAB_SETTINGS {
-                        s.settings_hit(x, y)
                     } else if s.active_tab != TAB_SHELF {
                         -1
                     } else if s.shelf_items.is_empty() {
@@ -10228,11 +9424,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         SetCapture(hwnd);
                         s.set_volume_x(x);
                     }
-                    if pressed == 5340 && s.active_tab == TAB_SETTINGS && s.settings_subpage == 1 {
-                        s.blur_drag = true;
-                        SetCapture(hwnd);
-                        s.set_blur_x(x);
-                    }
                     if s.pressed != pressed {
                         s.pressed = pressed;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -10259,7 +9450,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     && !s.quick_editing
                     && !s.quick_add_mode
                     && !s.vol_drag
-                    && !s.blur_drag
                     && !s.is_dragging
                     && s.drag_source.is_none()
                     && s.quick_drag.is_none()
@@ -10351,18 +9541,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
-                if s.blur_drag {
-                    s.blur_drag = false;
-                    ReleaseCapture();
-                    if s.bg_custom_pixels.is_some() {
-                        s.reload_custom_bg();
-                    }
-                    if !s.smoke {
-                        s.settings.save();
-                    }
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
                 let had_capture = s.drag_source.is_some();
                 if had_capture {
                     ReleaseCapture();
@@ -10426,9 +9604,15 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                                 return 0;
                             }
+                            HEADER_SETTINGS => {
+                                if !s.modal_dialog_open {
+                                    settings_win::SettingsWindow::toggle(s);
+                                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                                }
+                                return 0;
+                            }
                             t if (0..TAB_COUNT as i32).contains(&t) => {
                                 s.active_tab = t as usize;
-                                s.settings_subpage = 0;
                                 if s.active_tab == TAB_NOTIF {
                                     s.notif_unread = false;
                                 }
@@ -10503,10 +9687,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     } else if s.active_tab == TAB_NOTIF {
                         let hit = s.notif_hit(x, y);
                         s.notif_click(hwnd, hit);
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                    } else if s.active_tab == TAB_SETTINGS {
-                        let hit = s.settings_hit(x, y);
-                        s.settings_click(hwnd, hit);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else if s.active_tab != TAB_SHELF {
                     } else if s.shelf_items.is_empty() {
@@ -10801,7 +9981,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                             s.wheel_acc = 0.;
                             if next != s.active_tab {
                                 s.active_tab = next;
-                                s.settings_subpage = 0;
                                 if s.active_tab == TAB_NOTIF {
                                     s.notif_unread = false;
                                 }
@@ -11100,13 +10279,6 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
-                if s.active_tab == TAB_SETTINGS && s.settings_subpage != 0 {
-                    s.settings_subpage = 0;
-                    s.hover = -1;
-                    s.pressed = -1;
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
                 s.expanded = false;
                 s.hover = -1;
                 s.pressed = -1;
@@ -11126,9 +10298,15 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 if let Some(tray) = &mut s.tray {
                     tray.refresh_theme();
                 }
+                if s.settings_win.is_open() {
+                    settings_win::SettingsWindow::paint(s);
+                }
                 return 0;
             }
             tray::CALLBACK => {
+                if s.modal_dialog_open {
+                    return 0;
+                }
                 let chosen = match &s.tray {
                     Some(tray) => {
                         s.menu_active = true;
@@ -11143,25 +10321,16 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         DestroyWindow(hwnd);
                     }
                     tray::item::SETTINGS => {
-                        // Open straight onto the Settings page; like the Pomodoro alert, it closes again after a
-                        // while unless the cursor is on it.
-                        s.autostart = settings::starts_with_windows();
-                        s.active_tab = TAB_SETTINGS;
-                        s.settings_subpage = 0;
-                        s.active_folder = None;
-                        if !s.expanded {
-                            s.expanded = true;
-                            s.layout(hwnd);
-                        }
-                        s.alert_until =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
-                        s.pace
-                            .store(PACE_MOTION, std::sync::atomic::Ordering::Relaxed);
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        settings_win::SettingsWindow::open(s);
                     }
                     _ => {}
                 }
                 return 0;
+            }
+            0x0010 => {
+                if s.modal_dialog_open {
+                    return 0;
+                }
             }
             m if s.tray.as_ref().is_some_and(|t| t.is_taskbar_created(m)) => {
                 if let Some(tray) = &s.tray {
@@ -11174,6 +10343,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             2 => {
+                s.settings_win.destroy();
                 s.tray = None;
                 RevokeDragDrop(hwnd);
                 OleUninitialize();
@@ -11491,12 +10661,12 @@ fn main() {
             cls_extra: 0,
             wnd_extra: 0,
             instance,
-            icon: null_mut(),
+            icon: tray::make_window_icon(32),
             cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
             background: null_mut(),
             menu: std::ptr::null(),
             name: class.as_ptr(),
-            small_icon: null_mut(),
+            small_icon: tray::make_window_icon(16),
         };
         if RegisterClassExW(&wc) == 0 {
             diagnostics::failure(
@@ -11874,16 +11044,29 @@ mod tests {
 
     #[test]
     fn updater_settings_targets_stay_inside_the_updates_page() {
-        let mut s = create_test_state();
-        assert_eq!(s.settings_hit(280., 310.), 5405);
-        assert_eq!(s.settings_hit(370., 310.), 5200);
-        assert_eq!(s.settings_hit(40., 274.), -1);
-        s.settings_subpage = 2;
-        assert_eq!(s.settings_hit(40., 75.), 5401);
-        assert_eq!(s.settings_hit(40., 260.), 5400);
-        assert_eq!(s.settings_hit(280., 260.), 5402);
-        assert_eq!(s.settings_hit(40., 295.), 5260);
-        assert_eq!(s.settings_hit(430., 75.), -1);
+        let ctx = settings_win::HitContext {
+            section: settings_win::SettingsSection::Updates,
+            has_custom_image: false,
+            bg_style: 3,
+            update_action_enabled: true,
+            update_downloading: false,
+        };
+        assert_eq!(
+            settings_win::hit_test(ctx, 350., settings_win::UPD_CARD_Y + 26.),
+            settings_win::HIT_UPD_AUTO
+        );
+        assert_eq!(
+            settings_win::hit_test(
+                ctx,
+                settings_win::UPD_ACTION_X + 60.,
+                settings_win::UPD_ACTION_Y + 15.
+            ),
+            settings_win::HIT_UPD_ACTION
+        );
+        assert_eq!(
+            settings_win::hit_test(ctx, settings_win::SET_WIN_W + 10., 75.),
+            settings_win::HIT_NONE
+        );
         let lines = update_note_lines("one two\nthree");
         assert_eq!(lines, vec!["one two", "three"]);
     }
@@ -12037,7 +11220,7 @@ mod tests {
         assert_eq!(s.quick_scroll_vel, 0.);
     }
 
-    fn create_test_state() -> State {
+    pub(crate) fn create_test_state() -> State {
         State {
             expanded: true,
             progress: 1.,
@@ -12071,6 +11254,7 @@ mod tests {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
             menu_active: false,
+            modal_dialog_open: false,
             last_minute: 0,
             shelf_items: Vec::new(),
             active_tab: TAB_SHELF,
@@ -12139,7 +11323,6 @@ mod tests {
             vol_level: -1.,
             vol_muted: false,
             vol_drag: false,
-            blur_drag: false,
             clyric_t: 0.,
             clyric_tv: 0.,
             lyric_w: COL_W,
@@ -12198,7 +11381,9 @@ mod tests {
             cover_w: 0.,
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
-            settings_subpage: 0,
+            main_hwnd: null_mut(),
+            settings_win: settings_win::SettingsWindow::new(),
+            settings_win_moving: false,
             updater: updater::Updater::default(),
             web_drop_rx: None,
             web_drop_status: String::new(),
@@ -12263,62 +11448,56 @@ mod tests {
     fn test_appearance_settings_and_hit_testing() {
         let mut state = create_test_state();
         state.smoke = true;
-        state.active_tab = TAB_SETTINGS;
-        state.tab_from = TAB_SETTINGS;
-        state.tab_to = TAB_SETTINGS;
-        state.panel_w = SET_W;
-        state.panel_h = SET_H;
 
-        // Main Settings page (settings_subpage == 0)
-        assert_eq!(state.settings_hit(100., 230.), 5250); // Appearance Customize row
-        assert_eq!(state.settings_hit(350., 305.), 5200); // Quit button
-        assert_eq!(state.settings_hit(10., 10.), -1);
+        // Sidebar Appearance & Quit targets
+        let main_ctx = settings_win::HitContext {
+            section: settings_win::SettingsSection::Notch,
+            has_custom_image: false,
+            bg_style: state.settings.bg_style,
+            update_action_enabled: true,
+            update_downloading: false,
+        };
+        assert_eq!(
+            settings_win::hit_test(
+                main_ctx,
+                80.,
+                settings_win::NAV_Y0 + 2. * settings_win::NAV_STEP + 16.
+            ),
+            settings_win::HIT_NAV_BASE + 2
+        );
+        assert_eq!(
+            settings_win::hit_test(main_ctx, 80., 390.),
+            settings_win::HIT_QUIT
+        );
+        assert_eq!(
+            settings_win::hit_test(main_ctx, -10., 10.),
+            settings_win::HIT_NONE
+        );
 
-        // Background Settings subpage (settings_subpage == 1)
-        let mut bg_state = state;
-        bg_state.settings_subpage = 1;
-
-        // Back button, bottom left (it used to sit on top of the header tabs)
-        assert_eq!(bg_state.settings_hit(50., 296.), 5260);
-        assert_eq!(bg_state.settings_hit(50., 20.), -1);
-
-        // Style pills (y = 64..88)
-        assert_eq!(bg_state.settings_hit(60., 75.), 5300); // Frost
-        assert_eq!(bg_state.settings_hit(130., 75.), 5301); // Aura
-        assert_eq!(bg_state.settings_hit(210., 75.), 5302); // Slate
-        assert_eq!(bg_state.settings_hit(280., 75.), 5303); // OLED
-        assert_eq!(bg_state.settings_hit(360., 75.), 5304); // Image
-
-        // Image button (y = 124..148)
-        assert_eq!(bg_state.settings_hit(80., 135.), 5320); // Import / Change Image
-        assert_eq!(bg_state.settings_hit(200., 135.), -1); // Reset is hidden when no image
-
-        // Position pills (y = 156..178)
-        assert_eq!(bg_state.settings_hit(140., 165.), 5330); // Top (pos 1)
-        assert_eq!(bg_state.settings_hit(210., 165.), 5331); // Center (pos 0)
-        assert_eq!(bg_state.settings_hit(280., 165.), 5332); // Bottom (pos 2)
-
-        // Blur slider line (y = 208..234, x = 76..364)
-        assert_eq!(bg_state.settings_hit(120., 220.), 5340);
-        assert_eq!(bg_state.settings_hit(219., 220.), 5340);
-        assert_eq!(bg_state.settings_hit(350., 220.), 5340);
-
-        // Test slider drag setting
-        bg_state.set_blur_x(86.);
-        assert_eq!(bg_state.settings.bg_blur, 0);
-        bg_state.set_blur_x(352.);
-        assert_eq!(bg_state.settings.bg_blur, 30);
-        bg_state.set_blur_x(219.);
-        assert_eq!(bg_state.settings.bg_blur, 15);
-
-        // Opacity pills (y = 242..264)
-        assert_eq!(bg_state.settings_hit(120., 250.), 5310); // 70%
-        assert_eq!(bg_state.settings_hit(190., 250.), 5311); // 80%
-        assert_eq!(bg_state.settings_hit(260., 250.), 5312); // 90%
-        assert_eq!(bg_state.settings_hit(330., 250.), 5313); // 100%
-
-        // Outside hits return -1
-        assert_eq!(bg_state.settings_hit(10., 10.), -1);
+        // Appearance section hit tests & blur mapping
+        let bg_ctx = settings_win::HitContext {
+            section: settings_win::SettingsSection::Appearance,
+            has_custom_image: false,
+            bg_style: 4,
+            update_action_enabled: true,
+            update_downloading: false,
+        };
+        let layout = settings_win::appearance_layout(false, 4);
+        assert_eq!(settings_win::blur_from_x(settings_win::BLUR_TRACK_X0), 0);
+        assert_eq!(settings_win::blur_from_x(settings_win::BLUR_TRACK_X1), 30);
+        assert_eq!(
+            settings_win::blur_from_x(
+                (settings_win::BLUR_TRACK_X0 + settings_win::BLUR_TRACK_X1) * 0.5
+            ),
+            15
+        );
+        for i in 0..4 {
+            let r = settings_win::opacity_pill_rect(layout.opacity_row_y, i);
+            assert_eq!(
+                settings_win::hit_test(bg_ctx, r.0 + r.2 * 0.5, r.1 + r.3 * 0.5),
+                settings_win::HIT_BG_OPACITY_BASE + i as i32
+            );
+        }
     }
 
     #[test]
@@ -12398,22 +11577,139 @@ mod tests {
         assert_eq!(TAB_SHELF, 4);
         assert_eq!(TAB_QUICK, 5);
         assert_eq!(TAB_NOTIF, 6);
-        assert_eq!(TAB_SETTINGS, 7);
-        assert_eq!(TAB_COUNT, 8);
+        assert_eq!(TAB_COUNT, 7);
 
         assert_eq!(page_w(TAB_NOTIF), NOTIF_W);
-        assert_eq!(page_w(TAB_SETTINGS), SET_W);
 
         let state = create_test_state();
         assert_eq!(state.page_h(TAB_NOTIF), NOTIF_H);
-        assert_eq!(state.page_h(TAB_SETTINGS), SET_H);
 
         let notif_tab = state.tab_x(TAB_NOTIF);
-        let settings_tab = state.tab_x(TAB_SETTINGS);
+        let gear_btn = gear_rect(state.panel_w_now());
         assert_eq!(notif_tab.1, 34.);
-        assert_eq!(settings_tab.1, 34.);
-        // Tab width is 34, plus 4px gap = 38px spacing between Notification Center and Settings
-        assert_eq!(notif_tab.0 + 34. + 4., settings_tab.0);
+        assert_eq!(gear_btn.1, 34.);
+        // Tab width is 34, plus 4px gap = 38px spacing between Notification Center and Gear button
+        assert_eq!(notif_tab.0 + 34. + 4., gear_btn.0);
+    }
+
+    #[test]
+    fn notch_header_gear_is_action_not_tab() {
+        assert_eq!(TAB_COUNT, 7);
+        let mut state = create_test_state();
+        state.active_tab = TAB_NOTIF;
+        state.tab_from = TAB_NOTIF;
+        state.tab_to = TAB_NOTIF;
+        state.panel_w = NOTIF_W;
+        let (gx, gw) = gear_rect(state.panel_w_now());
+        assert_eq!(state.header_hit(gx + gw * 0.5, 20.), HEADER_SETTINGS);
+        let (nx, nw) = state.tab_x(TAB_NOTIF);
+        assert_eq!(nx + nw + 4., gx);
+        assert_eq!(state.header_hit(nx + nw * 0.5, 20.), TAB_NOTIF as i32);
+    }
+
+    #[test]
+    fn settings_popup_leaves_notch_decoupled() {
+        let mut s = create_test_state();
+        s.smoke = true;
+        s.expanded = false;
+        s.active_tab = TAB_MUSIC;
+        s.updater.auto = true;
+        s.settings_win.snap_auto_switch(false);
+
+        unsafe {
+            settings_win::SettingsWindow::toggle(&mut s);
+        }
+        assert!(s.settings_win.is_open());
+        assert!(!s.expanded);
+        assert_eq!(s.active_tab, TAB_MUSIC);
+
+        // Advance should spring auto_switch_t toward 1.0 when open and return true
+        s.settings_win.snap_auto_switch(false);
+        assert!(s.advance(0.016));
+        assert!(s.settings_win.auto_switch_t() > 0.0);
+
+        // Reduced motion snaps immediately
+        s.reduced_motion = true;
+        s.advance(0.016);
+        assert_eq!(s.settings_win.auto_switch_t(), 1.0);
+
+        // Toggle closes again without disturbing notch state
+        unsafe {
+            settings_win::SettingsWindow::toggle(&mut s);
+        }
+        assert!(!s.settings_win.is_open());
+        assert!(!s.expanded);
+        assert_eq!(s.active_tab, TAB_MUSIC);
+    }
+
+    #[test]
+    fn notch_wheel_clamps_at_notif_and_gear_click_leaves_notch_decoupled() {
+        unsafe {
+            let class = wide("STATIC");
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            let mut s = create_test_state();
+            s.smoke = true;
+            s.scale = 1.0;
+            s.expanded = true;
+            s.progress = 1.0;
+            s.active_tab = TAB_NOTIF;
+            s.tab_from = TAB_NOTIF;
+            s.tab_to = TAB_NOTIF;
+            s.tab_t = 1.0;
+            s.panel_w = NOTIF_W;
+            s.panel_h = s.page_h(TAB_NOTIF);
+            assert!(s.usable());
+            SetWindowLongPtrW(hwnd, -21, &mut s as *mut State as isize);
+
+            // Scrolling forward past TAB_NOTIF clamps at TAB_NOTIF (6)
+            let wheel_down = ((-120i16 as u16) as usize) << 16;
+            procedure(hwnd, 0x020A, wheel_down, 0);
+            assert_eq!(s.active_tab, TAB_NOTIF);
+
+            // Clicking Gear header action toggles Settings popup without changing notch tab/expanded
+            let (gx, gw) = gear_rect(s.panel_w_now());
+            let click_x = (gx + gw * 0.5).round() as i16;
+            let click_y = 20i16;
+            let lparam = ((click_y as u16 as isize) << 16) | (click_x as u16 as isize);
+
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(s.settings_win.is_open());
+            assert_eq!(s.active_tab, TAB_NOTIF);
+            assert!(s.expanded);
+
+            // Second Gear click hides Settings popup
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(!s.settings_win.is_open());
+            assert_eq!(s.active_tab, TAB_NOTIF);
+            assert!(s.expanded);
+
+            // Modal dialog guard prevents Gear click from toggling Settings popup
+            s.modal_dialog_open = true;
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(!s.settings_win.is_open());
+            s.modal_dialog_open = false;
+
+            SetWindowLongPtrW(hwnd, -21, 0);
+            DestroyWindow(hwnd);
+        }
     }
 
     #[test]
