@@ -101,6 +101,19 @@ pub struct SettingsWindow {
     hover: i32,
     pressed: i32,
     blur_drag: bool,
+    open_t: f64,
+    open_v: f64,
+    nav_y: f64,
+    nav_v: f64,
+    section_t: f64,
+    section_v: f64,
+    section_dir: f64,
+    style_t: f64,
+    style_v: f64,
+    opacity_t: f64,
+    opacity_v: f64,
+    framing_t: f64,
+    framing_v: f64,
     auto_switch_t: f64,
     auto_switch_v: f64,
     pos: Option<(i32, i32)>,
@@ -123,6 +136,19 @@ impl SettingsWindow {
             hover: HIT_NONE,
             pressed: HIT_NONE,
             blur_drag: false,
+            open_t: 0.,
+            open_v: 0.,
+            nav_y: NAV_Y0,
+            nav_v: 0.,
+            section_t: 1.,
+            section_v: 0.,
+            section_dir: 1.,
+            style_t: 3.,
+            style_v: 0.,
+            opacity_t: 3.,
+            opacity_v: 0.,
+            framing_t: 1.,
+            framing_v: 0.,
             auto_switch_t: 0.,
             auto_switch_v: 0.,
             pos: None,
@@ -131,6 +157,10 @@ impl SettingsWindow {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.open || self.open_t > 0.004
     }
 
     pub fn hwnd(&self) -> Hwnd {
@@ -151,10 +181,20 @@ impl SettingsWindow {
                 }
             }
         }
+        if section != self.section {
+            self.section_dir = if (section as usize) > (self.section as usize) {
+                1.
+            } else {
+                -1.
+            };
+            self.section_t = 0.;
+            self.section_v = 0.;
+        }
         self.section = section;
         self.pressed = HIT_NONE;
     }
 
+    #[cfg(test)]
     pub fn auto_switch_t(&self) -> f64 {
         self.auto_switch_t
     }
@@ -164,14 +204,115 @@ impl SettingsWindow {
         self.auto_switch_v = 0.;
     }
 
-    pub fn advance(&mut self, auto_on: bool, reduced_motion: bool, dt: f64) -> bool {
-        advance_switch(
+    fn snap_visuals(&mut self, bg_style: u32, bg_opacity: u32, bg_pos: u32) {
+        self.nav_y = NAV_Y0 + self.section as usize as f64 * NAV_STEP;
+        self.nav_v = 0.;
+        self.section_t = 1.;
+        self.section_v = 0.;
+        self.style_t = style_index(bg_style);
+        self.style_v = 0.;
+        self.opacity_t = opacity_index(bg_opacity);
+        self.opacity_v = 0.;
+        self.framing_t = framing_index(bg_pos);
+        self.framing_v = 0.;
+    }
+
+    pub fn advance(
+        &mut self,
+        auto_on: bool,
+        bg_style: u32,
+        bg_opacity: u32,
+        bg_pos: u32,
+        reduced_motion: bool,
+        dt: f64,
+    ) -> bool {
+        let mut moving = advance_switch(
             &mut self.auto_switch_t,
             &mut self.auto_switch_v,
             auto_on,
             reduced_motion,
             dt,
-        )
+        );
+        let open_goal = if self.open { 1. } else { 0. };
+        let nav_goal = NAV_Y0 + self.section as usize as f64 * NAV_STEP;
+        let style_goal = style_index(bg_style);
+        let opacity_goal = opacity_index(bg_opacity);
+        let framing_goal = framing_index(bg_pos);
+
+        if reduced_motion {
+            if self.open_t != open_goal || self.open_v != 0. {
+                self.open_t = open_goal;
+                self.open_v = 0.;
+                moving = true;
+            }
+            if self.nav_y != nav_goal || self.nav_v != 0. {
+                self.nav_y = nav_goal;
+                self.nav_v = 0.;
+                moving = true;
+            }
+            if self.section_t != 1. || self.section_v != 0. {
+                self.section_t = 1.;
+                self.section_v = 0.;
+                moving = true;
+            }
+            if self.style_t != style_goal || self.style_v != 0. {
+                self.style_t = style_goal;
+                self.style_v = 0.;
+                moving = true;
+            }
+            if self.opacity_t != opacity_goal || self.opacity_v != 0. {
+                self.opacity_t = opacity_goal;
+                self.opacity_v = 0.;
+                moving = true;
+            }
+            if self.framing_t != framing_goal || self.framing_v != 0. {
+                self.framing_t = framing_goal;
+                self.framing_v = 0.;
+                moving = true;
+            }
+        } else {
+            moving |= crate::spring(&mut self.open_t, &mut self.open_v, open_goal, 24., 0.88, dt);
+            if self.is_visible() {
+                moving |= crate::spring(&mut self.nav_y, &mut self.nav_v, nav_goal, 24., 0.85, dt);
+                moving |=
+                    crate::spring(&mut self.section_t, &mut self.section_v, 1., 22., 0.88, dt);
+                moving |= crate::spring(
+                    &mut self.style_t,
+                    &mut self.style_v,
+                    style_goal,
+                    24.,
+                    0.85,
+                    dt,
+                );
+                moving |= crate::spring(
+                    &mut self.opacity_t,
+                    &mut self.opacity_v,
+                    opacity_goal,
+                    24.,
+                    0.85,
+                    dt,
+                );
+                moving |= crate::spring(
+                    &mut self.framing_t,
+                    &mut self.framing_v,
+                    framing_goal,
+                    24.,
+                    0.85,
+                    dt,
+                );
+            }
+        }
+
+        if !self.open && self.open_t <= 0.004 {
+            self.open_t = 0.;
+            self.open_v = 0.;
+            if !self.hwnd.is_null() {
+                unsafe {
+                    ShowWindow(self.hwnd, 0);
+                }
+            }
+        }
+        moving
     }
 
     unsafe fn work_area_for(pt: Option<(i32, i32)>) -> (i32, i32, i32, i32) {
@@ -293,15 +434,29 @@ impl SettingsWindow {
     pub unsafe fn open(state: &mut State) {
         if state.smoke {
             state.settings_win.open = true;
+            state.settings_win.open_t = 1.;
+            state.settings_win.open_v = 0.;
             state.settings_win.snap_auto_switch(state.updater.auto);
+            state.settings_win.snap_visuals(
+                state.settings.bg_style,
+                state.settings.bg_opacity,
+                state.settings.bg_pos,
+            );
             return;
         }
+        let was_visible = state.settings_win.is_visible();
         state.autostart = settings::starts_with_windows();
         state.snap_switches();
         state.settings_win.snap_auto_switch(state.updater.auto);
+        state.settings_win.snap_visuals(
+            state.settings.bg_style,
+            state.settings.bg_opacity,
+            state.settings.bg_pos,
+        );
         if !Self::ensure_window(state) {
             return;
         }
+        let reduced = state.reduced_motion;
         let sw = &mut state.settings_win;
         let work = Self::work_area_for(sw.pos.map(|p| window_anchor_point(p, sw.w_px, sw.h_px)));
         let (x, y) = match sw.pos {
@@ -316,6 +471,13 @@ impl SettingsWindow {
         };
         sw.pos = Some((x, y));
         sw.open = true;
+        if reduced {
+            sw.open_t = 1.;
+            sw.open_v = 0.;
+        } else if !was_visible {
+            sw.open_t = 0.01;
+            sw.open_v = 0.;
+        }
         sw.hover = HIT_NONE;
         sw.pressed = HIT_NONE;
         let win_hwnd = sw.hwnd;
@@ -323,6 +485,7 @@ impl SettingsWindow {
         Self::paint(state);
         ShowWindow(win_hwnd, 5);
         SetForegroundWindow(win_hwnd);
+        state.pace.store(PACE_MOTION, Ordering::Relaxed);
         if !state.main_hwnd.is_null() {
             InvalidateRect(state.main_hwnd, std::ptr::null(), 0);
         }
@@ -330,12 +493,44 @@ impl SettingsWindow {
 
     pub unsafe fn toggle(state: &mut State) {
         if state.settings_win.open {
-            state.settings_win.hide();
+            Self::hide_with_motion(state);
             if !state.main_hwnd.is_null() {
                 InvalidateRect(state.main_hwnd, std::ptr::null(), 0);
             }
         } else {
             Self::open(state);
+        }
+    }
+
+    pub unsafe fn hide_with_motion(state: &mut State) {
+        let reduced = state.reduced_motion || state.smoke;
+        if reduced {
+            state.settings_win.hide();
+        } else {
+            state.settings_win.begin_hide();
+            state.pace.store(PACE_MOTION, Ordering::Relaxed);
+        }
+    }
+
+    pub unsafe fn begin_hide(&mut self) {
+        if self.blur_drag {
+            self.blur_drag = false;
+            if !self.hwnd.is_null() {
+                ReleaseCapture();
+            }
+        }
+        if !self.hwnd.is_null() && self.open_t >= 0.999 {
+            let mut r = Rect::default();
+            if GetWindowRect(self.hwnd, &mut r) != 0 {
+                self.pos = Some((r.left, r.top));
+            }
+        }
+        self.open = false;
+        self.hover = HIT_NONE;
+        self.pressed = HIT_NONE;
+        if self.hwnd.is_null() {
+            self.open_t = 0.;
+            self.open_v = 0.;
         }
     }
 
@@ -347,13 +542,17 @@ impl SettingsWindow {
             }
         }
         if !self.hwnd.is_null() {
-            let mut r = Rect::default();
-            if GetWindowRect(self.hwnd, &mut r) != 0 {
-                self.pos = Some((r.left, r.top));
+            if self.open_t >= 0.999 {
+                let mut r = Rect::default();
+                if GetWindowRect(self.hwnd, &mut r) != 0 {
+                    self.pos = Some((r.left, r.top));
+                }
             }
             ShowWindow(self.hwnd, 0);
         }
         self.open = false;
+        self.open_t = 0.;
+        self.open_v = 0.;
         self.hover = HIT_NONE;
         self.pressed = HIT_NONE;
     }
@@ -396,7 +595,7 @@ impl SettingsWindow {
         let main_hwnd = state.main_hwnd;
         match hit {
             HIT_CLOSE => {
-                state.settings_win.hide();
+                Self::hide_with_motion(state);
                 if !main_hwnd.is_null() {
                     InvalidateRect(main_hwnd, std::ptr::null(), 0);
                 }
@@ -558,19 +757,6 @@ impl SettingsWindow {
             );
         };
 
-        let draw_switch = |tx: f64, ty: f64, t_raw: f64| {
-            let t = t_raw.clamp(0., 1.);
-            r.round(
-                tx,
-                ty,
-                36.,
-                20.,
-                10.,
-                blend_color(rgb(57, 57, 61), GREEN, t),
-            );
-            r.round(tx + 2. + 16. * t, ty + 2., 16., 16., 8., WHITE);
-        };
-
         // 1. Rounded window base (#141416) + top titlebar & left sidebar (#0e0e10)
         r.round(0., 0., SET_WIN_W, SET_WIN_H, 14., WIN_BG);
         // Sidebar rounded bottom-left + titlebar rounded top corners via layered fills
@@ -623,30 +809,43 @@ impl SettingsWindow {
         r.stroke(&[(cx - 4., cy - 4.), (cx + 4., cy + 4.)], false, 1.6, ccol);
         r.stroke(&[(cx + 4., cy - 4.), (cx - 4., cy + 4.)], false, 1.6, ccol);
 
-        // 3. Left sidebar: 4 categories + version + neutral Quit Wisp
+        // 3. Left sidebar: hover pills, gliding blue active pill, 4 categories + footer
+        for i in 0..NAV_LABELS.len() {
+            let ny = NAV_Y0 + i as f64 * NAV_STEP;
+            let hit = HIT_NAV_BASE + i as i32;
+            let active = sw.section as usize == i;
+            if !active && (sw.pressed == hit || sw.hover == hit) {
+                r.round(
+                    NAV_X,
+                    ny,
+                    NAV_W,
+                    NAV_H,
+                    8.,
+                    if sw.pressed == hit {
+                        rgb(36, 36, 40)
+                    } else {
+                        CARD_BG
+                    },
+                );
+            }
+        }
+        r.round(NAV_X, sw.nav_y, NAV_W, NAV_H, 8., BLUE);
         for (i, label) in NAV_LABELS.iter().enumerate() {
             let ny = NAV_Y0 + i as f64 * NAV_STEP;
             let hit = HIT_NAV_BASE + i as i32;
             let active = sw.section as usize == i;
             let hot = sw.hover == hit;
-            let bg = if active {
-                Some(BLUE)
-            } else if sw.pressed == hit {
-                Some(rgb(36, 36, 40))
-            } else if hot {
-                Some(CARD_BG)
+            let proximity = (1. - ((sw.nav_y - ny).abs() / NAV_STEP)).clamp(0., 1.);
+            let fg = if hot {
+                WHITE
             } else {
-                None
+                blend_color(SECONDARY, WHITE, proximity)
             };
-            if let Some(col) = bg {
-                r.round(NAV_X, ny, NAV_W, NAV_H, 8., col);
-            }
-            let fg = if active || hot { WHITE } else { SECONDARY };
             draw_sidebar_icon(r, i, NAV_X + 10., ny + 9., fg);
             draw_text(
                 if active { 7 } else { 2 },
                 label,
-                if active { WHITE } else { fg },
+                fg,
                 NAV_X + 34.,
                 ny + 7.,
                 NAV_W - 42.,
@@ -677,11 +876,39 @@ impl SettingsWindow {
         r.round(QUIT_X, QUIT_Y, QUIT_W, QUIT_H, 8., quit_bg);
         draw_text(2, "Quit Wisp", WHITE, QUIT_X, QUIT_Y, QUIT_W, QUIT_H, true);
 
-        // 4. Right content pane
+        // 4. Right content pane (directional slide + fade on section switch, zero extra surfaces)
+        let content_a = sw.section_t.clamp(0., 1.);
+        let content_dy = (1. - content_a) * 8. * sw.section_dir;
+        let cf = |c: u32| blend_color(WIN_BG, c, content_a);
+        let cy_off = |y: f64| y + content_dy;
+        let draw_c_text = |font_idx: usize,
+                           text: &str,
+                           color: u32,
+                           x: f64,
+                           y: f64,
+                           w: f64,
+                           h: f64,
+                           center: bool| {
+            draw_text(font_idx, text, cf(color), x, cy_off(y), w, h, center);
+        };
+        let draw_c_switch = |tx: f64, ty: f64, t_raw: f64| {
+            let t = t_raw.clamp(0., 1.);
+            let sy = cy_off(ty);
+            r.round(
+                tx,
+                sy,
+                36.,
+                20.,
+                10.,
+                cf(blend_color(rgb(57, 57, 61), GREEN, t)),
+            );
+            r.round(tx + 2. + 16. * t, sy + 2., 16., 16., 8., cf(WHITE));
+        };
+
         match sw.section {
             SettingsSection::Notch => {
-                draw_text(0, "Notch", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
-                draw_text(
+                draw_c_text(0, "Notch", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_c_text(
                     3,
                     "How the dynamic notch expands, hides, and shows live info.",
                     SECONDARY,
@@ -691,7 +918,7 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "BEHAVIOR",
                     SECONDARY,
@@ -703,11 +930,11 @@ impl SettingsWindow {
                 );
                 r.round(
                     CONTENT_X,
-                    SWITCH_CARD_Y,
+                    cy_off(SWITCH_CARD_Y),
                     CONTENT_W,
                     4. * SWITCH_ROW_H,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
                 );
                 for (k, &(title, sub)) in NOTCH_ROWS.iter().enumerate() {
                     let ry = SWITCH_CARD_Y + k as f64 * SWITCH_ROW_H;
@@ -715,18 +942,18 @@ impl SettingsWindow {
                     if sw.hover == hit || sw.pressed == hit {
                         r.round(
                             CONTENT_X + 4.,
-                            ry + 4.,
+                            cy_off(ry + 4.),
                             CONTENT_W - 8.,
                             SWITCH_ROW_H - 8.,
                             8.,
-                            if sw.pressed == hit {
+                            cf(if sw.pressed == hit {
                                 rgb(50, 50, 54)
                             } else {
                                 rgb(38, 38, 42)
-                            },
+                            }),
                         );
                     }
-                    draw_text(
+                    draw_c_text(
                         7,
                         title,
                         WHITE,
@@ -736,7 +963,7 @@ impl SettingsWindow {
                         18.,
                         false,
                     );
-                    draw_text(
+                    draw_c_text(
                         3,
                         sub,
                         SECONDARY,
@@ -746,7 +973,7 @@ impl SettingsWindow {
                         16.,
                         false,
                     );
-                    draw_switch(
+                    draw_c_switch(
                         CONTENT_X + CONTENT_W - 50.,
                         ry + (SWITCH_ROW_H - 20.) / 2.,
                         state.switch_t[k],
@@ -754,15 +981,15 @@ impl SettingsWindow {
                     if k < 3 {
                         r.round(
                             CONTENT_X + 14.,
-                            ry + SWITCH_ROW_H - 1.,
+                            cy_off(ry + SWITCH_ROW_H - 1.),
                             CONTENT_W - 14.,
                             1.,
                             0.,
-                            ROW_SEP,
+                            cf(ROW_SEP),
                         );
                     }
                 }
-                draw_text(
+                draw_c_text(
                     3,
                     "Changes save automatically.",
                     TERTIARY,
@@ -774,8 +1001,8 @@ impl SettingsWindow {
                 );
             }
             SettingsSection::General => {
-                draw_text(0, "General", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
-                draw_text(
+                draw_c_text(0, "General", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_c_text(
                     3,
                     "Clock format, motion preference, and Windows startup.",
                     SECONDARY,
@@ -785,7 +1012,7 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "SYSTEM & DISPLAY",
                     SECONDARY,
@@ -797,11 +1024,11 @@ impl SettingsWindow {
                 );
                 r.round(
                     CONTENT_X,
-                    SWITCH_CARD_Y,
+                    cy_off(SWITCH_CARD_Y),
                     CONTENT_W,
                     3. * SWITCH_ROW_H,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
                 );
                 for (k, &(title, sub)) in GENERAL_ROWS.iter().enumerate() {
                     let idx = 4 + k;
@@ -810,18 +1037,18 @@ impl SettingsWindow {
                     if sw.hover == hit || sw.pressed == hit {
                         r.round(
                             CONTENT_X + 4.,
-                            ry + 4.,
+                            cy_off(ry + 4.),
                             CONTENT_W - 8.,
                             SWITCH_ROW_H - 8.,
                             8.,
-                            if sw.pressed == hit {
+                            cf(if sw.pressed == hit {
                                 rgb(50, 50, 54)
                             } else {
                                 rgb(38, 38, 42)
-                            },
+                            }),
                         );
                     }
-                    draw_text(
+                    draw_c_text(
                         7,
                         title,
                         WHITE,
@@ -831,7 +1058,7 @@ impl SettingsWindow {
                         18.,
                         false,
                     );
-                    draw_text(
+                    draw_c_text(
                         3,
                         sub,
                         SECONDARY,
@@ -841,7 +1068,7 @@ impl SettingsWindow {
                         16.,
                         false,
                     );
-                    draw_switch(
+                    draw_c_switch(
                         CONTENT_X + CONTENT_W - 50.,
                         ry + (SWITCH_ROW_H - 20.) / 2.,
                         state.switch_t[idx],
@@ -849,27 +1076,17 @@ impl SettingsWindow {
                     if k < 2 {
                         r.round(
                             CONTENT_X + 14.,
-                            ry + SWITCH_ROW_H - 1.,
+                            cy_off(ry + SWITCH_ROW_H - 1.),
                             CONTENT_W - 14.,
                             1.,
                             0.,
-                            ROW_SEP,
+                            cf(ROW_SEP),
                         );
                     }
                 }
-                draw_text(
-                    3,
-                    "Data is stored locally in %APPDATA%\\Wisp.",
-                    TERTIARY,
-                    CONTENT_X + 4.,
-                    SWITCH_CARD_Y + 3. * SWITCH_ROW_H + 10.,
-                    CONTENT_W,
-                    16.,
-                    false,
-                );
             }
             SettingsSection::Appearance => {
-                draw_text(
+                draw_c_text(
                     0,
                     "Appearance",
                     WHITE,
@@ -879,7 +1096,7 @@ impl SettingsWindow {
                     22.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "Panel backdrop theme, frost blur, and opacity. Closed notch stays pure black.",
                     SECONDARY,
@@ -889,7 +1106,7 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "BACKGROUND STYLE",
                     SECONDARY,
@@ -901,43 +1118,55 @@ impl SettingsWindow {
                 );
                 r.round(
                     CONTENT_X,
-                    STYLE_CARD_Y,
+                    cy_off(STYLE_CARD_Y),
                     CONTENT_W,
                     STYLE_CARD_H,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
+                );
+                // Hover fills behind the gliding active style tile highlight
+                for i in 0..BG_STYLE_NAMES.len() {
+                    let tr = style_tile_rect(i);
+                    let hit = HIT_BG_STYLE_BASE + i as i32;
+                    let active = state.settings.bg_style == i as u32;
+                    if !active && (sw.hover == hit || sw.pressed == hit) {
+                        r.round(tr.0, cy_off(tr.1), tr.2, tr.3, 8., cf(rgb(36, 36, 40)));
+                    }
+                }
+                let tr0 = style_tile_rect(0);
+                let tr1 = style_tile_rect(1);
+                let style_x = tr0.0 + sw.style_t.clamp(0., 4.) * (tr1.0 - tr0.0);
+                r.round(
+                    style_x,
+                    cy_off(tr0.1),
+                    tr0.2,
+                    tr0.3,
+                    8.,
+                    cf(rgb(44, 44, 48)),
+                );
+                r.stroke_round(
+                    style_x + 0.5,
+                    cy_off(tr0.1) + 0.5,
+                    tr0.2 - 1.,
+                    tr0.3 - 1.,
+                    8.,
+                    1.4,
+                    cf(BLUE),
                 );
                 for (i, &name) in BG_STYLE_NAMES.iter().enumerate() {
                     let tr = style_tile_rect(i);
                     let hit = HIT_BG_STYLE_BASE + i as i32;
                     let active = state.settings.bg_style == i as u32;
                     let hot = sw.hover == hit;
-                    if active || hot || sw.pressed == hit {
-                        r.round(
-                            tr.0,
-                            tr.1,
-                            tr.2,
-                            tr.3,
-                            8.,
-                            if active {
-                                rgb(44, 44, 48)
-                            } else {
-                                rgb(36, 36, 40)
-                            },
-                        );
-                    }
-                    if active {
-                        r.stroke_round(tr.0 + 0.5, tr.1 + 0.5, tr.2 - 1., tr.3 - 1., 8., 1.4, BLUE);
-                    }
                     r.round(
                         tr.0 + 6.,
-                        tr.1 + 5.,
+                        cy_off(tr.1 + 5.),
                         tr.2 - 12.,
                         24.,
                         5.,
-                        BG_SWATCH_COLORS[i],
+                        cf(BG_SWATCH_COLORS[i]),
                     );
-                    draw_text(
+                    draw_c_text(
                         3,
                         name,
                         if active || hot { WHITE } else { SECONDARY },
@@ -953,15 +1182,15 @@ impl SettingsWindow {
                 let layout = appearance_layout(has_img, state.settings.bg_style);
                 r.round(
                     CONTENT_X,
-                    OPT_CARD_Y,
+                    cy_off(OPT_CARD_Y),
                     CONTENT_W,
                     layout.total_h,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
                 );
 
                 if let Some(ry) = layout.image_row_y {
-                    draw_text(
+                    draw_c_text(
                         2,
                         "Custom image",
                         WHITE,
@@ -979,8 +1208,15 @@ impl SettingsWindow {
                     } else {
                         rgb(42, 42, 46)
                     };
-                    r.round(choose_r.0, choose_r.1, choose_r.2, choose_r.3, 12., c_bg);
-                    draw_text(
+                    r.round(
+                        choose_r.0,
+                        cy_off(choose_r.1),
+                        choose_r.2,
+                        choose_r.3,
+                        12.,
+                        cf(c_bg),
+                    );
+                    draw_c_text(
                         3,
                         if has_img { "Change..." } else { "Choose..." },
                         WHITE,
@@ -998,21 +1234,21 @@ impl SettingsWindow {
                         } else {
                             rgb(42, 42, 46)
                         };
-                        r.round(rr.0, rr.1, rr.2, rr.3, 12., r_bg);
-                        draw_text(3, "Reset", SECONDARY, rr.0, rr.1, rr.2, rr.3, true);
+                        r.round(rr.0, cy_off(rr.1), rr.2, rr.3, 12., cf(r_bg));
+                        draw_c_text(3, "Reset", SECONDARY, rr.0, rr.1, rr.2, rr.3, true);
                     }
                     r.round(
                         CONTENT_X + 14.,
-                        ry + OPT_ROW_H - 1.,
+                        cy_off(ry + OPT_ROW_H - 1.),
                         CONTENT_W - 14.,
                         1.,
                         0.,
-                        ROW_SEP,
+                        cf(ROW_SEP),
                     );
                 }
 
                 if let Some(ry) = layout.framing_row_y {
-                    draw_text(
+                    draw_c_text(
                         2,
                         "Framing",
                         WHITE,
@@ -1023,19 +1259,25 @@ impl SettingsWindow {
                         false,
                     );
                     const POS: [(&str, u32); 3] = [("Top", 1), ("Center", 0), ("Bottom", 2)];
-                    for (i, &(lbl, val)) in POS.iter().enumerate() {
+                    for i in 0..POS.len() {
                         let pr = framing_pill_rect(ry, i);
                         let hit = HIT_BG_POS_BASE + i as i32;
-                        let active = state.settings.bg_pos == val;
-                        let bg = if active {
-                            rgb(62, 62, 68)
-                        } else if sw.hover == hit || sw.pressed == hit {
+                        let bg = if sw.hover == hit || sw.pressed == hit {
                             rgb(44, 44, 48)
                         } else {
                             WIN_BG
                         };
-                        r.round(pr.0, pr.1, pr.2, pr.3, 12., bg);
-                        draw_text(
+                        r.round(pr.0, cy_off(pr.1), pr.2, pr.3, 12., cf(bg));
+                    }
+                    let fp0 = framing_pill_rect(ry, 0);
+                    let fp1 = framing_pill_rect(ry, 1);
+                    let fx = fp0.0 + sw.framing_t.clamp(0., 2.) * (fp1.0 - fp0.0);
+                    r.round(fx, cy_off(fp0.1), fp0.2, fp0.3, 12., cf(rgb(62, 62, 68)));
+                    for (i, &(lbl, val)) in POS.iter().enumerate() {
+                        let pr = framing_pill_rect(ry, i);
+                        let hit = HIT_BG_POS_BASE + i as i32;
+                        let active = state.settings.bg_pos == val;
+                        draw_c_text(
                             3,
                             lbl,
                             if active || sw.hover == hit {
@@ -1052,16 +1294,16 @@ impl SettingsWindow {
                     }
                     r.round(
                         CONTENT_X + 14.,
-                        ry + OPT_ROW_H - 1.,
+                        cy_off(ry + OPT_ROW_H - 1.),
                         CONTENT_W - 14.,
                         1.,
                         0.,
-                        ROW_SEP,
+                        cf(ROW_SEP),
                     );
                 }
 
                 if let Some(ry) = layout.blur_row_y {
-                    draw_text(
+                    draw_c_text(
                         2,
                         "Blur radius",
                         WHITE,
@@ -1076,7 +1318,7 @@ impl SettingsWindow {
                     } else {
                         format!("{} px", state.settings.bg_blur)
                     };
-                    draw_text(
+                    draw_c_text(
                         3,
                         &readout,
                         SECONDARY,
@@ -1088,7 +1330,7 @@ impl SettingsWindow {
                     );
                     let active = sw.hover == HIT_BG_BLUR || sw.blur_drag;
                     let th = if active { 6. } else { 4. };
-                    let track_y = ry + 36.;
+                    let track_y = cy_off(ry + 36.);
                     let frac = (state.settings.bg_blur as f64 / 30.).clamp(0., 1.);
                     let thumb_x = BLUR_TRACK_X0 + frac * (BLUR_TRACK_X1 - BLUR_TRACK_X0);
                     r.round(
@@ -1097,7 +1339,7 @@ impl SettingsWindow {
                         BLUR_TRACK_X1 - BLUR_TRACK_X0,
                         th,
                         th / 2.,
-                        rgb(52, 52, 55),
+                        cf(rgb(52, 52, 55)),
                     );
                     if frac > 0.005 {
                         r.round(
@@ -1106,7 +1348,7 @@ impl SettingsWindow {
                             (thumb_x - BLUR_TRACK_X0).max(th),
                             th,
                             th / 2.,
-                            BLUE,
+                            cf(BLUE),
                         );
                     }
                     let knob = if active { 16. } else { 14. };
@@ -1116,21 +1358,21 @@ impl SettingsWindow {
                         knob,
                         knob,
                         knob / 2.,
-                        WHITE,
+                        cf(WHITE),
                     );
                     r.round(
                         CONTENT_X + 14.,
-                        ry + BLUR_ROW_H - 1.,
+                        cy_off(ry + BLUR_ROW_H - 1.),
                         CONTENT_W - 14.,
                         1.,
                         0.,
-                        ROW_SEP,
+                        cf(ROW_SEP),
                     );
                 }
 
                 // Opacity row (always present)
                 let oy = layout.opacity_row_y;
-                draw_text(
+                draw_c_text(
                     2,
                     "Opacity",
                     WHITE,
@@ -1142,19 +1384,25 @@ impl SettingsWindow {
                 );
                 const OPS: [(u32, &str); 4] =
                     [(70, "70%"), (80, "80%"), (90, "90%"), (100, "100%")];
-                for (i, &(val, lbl)) in OPS.iter().enumerate() {
+                for i in 0..OPS.len() {
                     let pr = opacity_pill_rect(oy, i);
                     let hit = HIT_BG_OPACITY_BASE + i as i32;
-                    let active = state.settings.bg_opacity == val;
-                    let bg = if active {
-                        rgb(62, 62, 68)
-                    } else if sw.hover == hit || sw.pressed == hit {
+                    let bg = if sw.hover == hit || sw.pressed == hit {
                         rgb(44, 44, 48)
                     } else {
                         WIN_BG
                     };
-                    r.round(pr.0, pr.1, pr.2, pr.3, 12., bg);
-                    draw_text(
+                    r.round(pr.0, cy_off(pr.1), pr.2, pr.3, 12., cf(bg));
+                }
+                let op0 = opacity_pill_rect(oy, 0);
+                let op1 = opacity_pill_rect(oy, 1);
+                let ox = op0.0 + sw.opacity_t.clamp(0., 3.) * (op1.0 - op0.0);
+                r.round(ox, cy_off(op0.1), op0.2, op0.3, 12., cf(rgb(62, 62, 68)));
+                for (i, &(val, lbl)) in OPS.iter().enumerate() {
+                    let pr = opacity_pill_rect(oy, i);
+                    let hit = HIT_BG_OPACITY_BASE + i as i32;
+                    let active = state.settings.bg_opacity == val;
+                    draw_c_text(
                         3,
                         lbl,
                         if active || sw.hover == hit {
@@ -1172,10 +1420,10 @@ impl SettingsWindow {
             }
             SettingsSection::Updates => {
                 let u = &state.updater;
-                draw_text(0, "Updates", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
-                draw_text(
+                draw_c_text(0, "Updates", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_c_text(
                     3,
-                    "HTTPS + SHA-256 verified stable releases from GitHub.",
+                    "Keep Wisp up to date with the latest official releases.",
                     SECONDARY,
                     CONTENT_X,
                     79.,
@@ -1185,27 +1433,27 @@ impl SettingsWindow {
                 );
                 r.round(
                     CONTENT_X,
-                    UPD_CARD_Y,
+                    cy_off(UPD_CARD_Y),
                     CONTENT_W,
                     UPD_AUTO_H + UPD_BODY_H,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
                 );
                 if sw.hover == HIT_UPD_AUTO || sw.pressed == HIT_UPD_AUTO {
                     r.round(
                         CONTENT_X + 4.,
-                        UPD_CARD_Y + 4.,
+                        cy_off(UPD_CARD_Y + 4.),
                         CONTENT_W - 8.,
                         UPD_AUTO_H - 8.,
                         8.,
-                        if sw.pressed == HIT_UPD_AUTO {
+                        cf(if sw.pressed == HIT_UPD_AUTO {
                             rgb(50, 50, 54)
                         } else {
                             rgb(38, 38, 42)
-                        },
+                        }),
                     );
                 }
-                draw_text(
+                draw_c_text(
                     7,
                     "Check automatically",
                     WHITE,
@@ -1215,7 +1463,7 @@ impl SettingsWindow {
                     18.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "Check once daily on startup (nothing installs automatically)",
                     SECONDARY,
@@ -1225,25 +1473,25 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
-                draw_switch(
+                draw_c_switch(
                     CONTENT_X + CONTENT_W - 50.,
                     UPD_CARD_Y + (UPD_AUTO_H - 20.) / 2.,
                     sw.auto_switch_t,
                 );
                 r.round(
                     CONTENT_X + 14.,
-                    UPD_CARD_Y + UPD_AUTO_H - 1.,
+                    cy_off(UPD_CARD_Y + UPD_AUTO_H - 1.),
                     CONTENT_W - 14.,
                     1.,
                     0.,
-                    ROW_SEP,
+                    cf(ROW_SEP),
                 );
 
                 // Status + version + progress + release notes + buttons
                 let body_y = UPD_CARD_Y + UPD_AUTO_H;
                 let status_lines = update_note_lines(&u.status);
                 for (i, line) in status_lines.iter().take(2).enumerate() {
-                    draw_text(
+                    draw_c_text(
                         7,
                         line,
                         WHITE,
@@ -1254,7 +1502,7 @@ impl SettingsWindow {
                         false,
                     );
                 }
-                draw_text(
+                draw_c_text(
                     3,
                     concat!("Current version: Wisp ", env!("CARGO_PKG_VERSION")),
                     SECONDARY,
@@ -1268,21 +1516,21 @@ impl SettingsWindow {
                     let frac = (u.progress.0 as f64 / u.progress.1 as f64).clamp(0., 1.);
                     r.round(
                         CONTENT_X + 14.,
-                        body_y + 66.,
+                        cy_off(body_y + 66.),
                         CONTENT_W - 74.,
                         4.,
                         2.,
-                        rgb(44, 44, 48),
+                        cf(rgb(44, 44, 48)),
                     );
                     r.round(
                         CONTENT_X + 14.,
-                        body_y + 66.,
+                        cy_off(body_y + 66.),
                         (CONTENT_W - 74.) * frac,
                         4.,
                         2.,
-                        BLUE,
+                        cf(BLUE),
                     );
-                    draw_text(
+                    draw_c_text(
                         3,
                         &format!("{:.0}%", frac * 100.),
                         SECONDARY,
@@ -1298,7 +1546,7 @@ impl SettingsWindow {
                         .take(UPD_NOTE_LINES)
                         .enumerate()
                     {
-                        draw_text(
+                        draw_c_text(
                             3,
                             line,
                             SECONDARY,
@@ -1328,13 +1576,13 @@ impl SettingsWindow {
                 };
                 r.round(
                     UPD_ACTION_X,
-                    UPD_ACTION_Y,
+                    cy_off(UPD_ACTION_Y),
                     UPD_ACTION_W,
                     UPD_ACTION_H,
                     15.,
-                    act_bg,
+                    cf(act_bg),
                 );
-                draw_text(
+                draw_c_text(
                     2,
                     action_lbl,
                     if enabled { WHITE } else { SECONDARY },
@@ -1354,13 +1602,13 @@ impl SettingsWindow {
                     };
                     r.round(
                         UPD_CANCEL_X,
-                        UPD_ACTION_Y,
+                        cy_off(UPD_ACTION_Y),
                         UPD_CANCEL_W,
                         UPD_ACTION_H,
                         15.,
-                        cancel_bg,
+                        cf(cancel_bg),
                     );
-                    draw_text(
+                    draw_c_text(
                         2,
                         "Cancel",
                         WHITE,
@@ -1375,13 +1623,13 @@ impl SettingsWindow {
                 // Card 2: Troubleshooting log info (non-interactive)
                 r.round(
                     CONTENT_X,
-                    UPD_LOG_CARD_Y,
+                    cy_off(UPD_LOG_CARD_Y),
                     CONTENT_W,
                     UPD_LOG_CARD_H,
                     12.,
-                    CARD_BG,
+                    cf(CARD_BG),
                 );
-                draw_text(
+                draw_c_text(
                     7,
                     "Troubleshooting log",
                     WHITE,
@@ -1391,7 +1639,7 @@ impl SettingsWindow {
                     18.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "%APPDATA%\\Wisp\\wisp.log (stays local)",
                     SECONDARY,
@@ -1401,7 +1649,7 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
-                draw_text(
+                draw_c_text(
                     3,
                     "Local only",
                     TERTIARY,
@@ -1425,11 +1673,27 @@ impl SettingsWindow {
             rgb(42, 42, 46),
         );
 
-        let mut wr = Rect::default();
-        GetWindowRect(sw.hwnd, &mut wr);
-        let dst = Point {
-            x: wr.left,
-            y: wr.top,
+        let open_a = sw.open_t.clamp(0., 1.);
+        let slide_px = ((1. - open_a) * 10. * scale).round() as i32;
+        let dst = if open_a >= 0.999 {
+            let mut wr = Rect::default();
+            GetWindowRect(sw.hwnd, &mut wr);
+            Point {
+                x: wr.left,
+                y: wr.top,
+            }
+        } else if let Some((bx, by)) = sw.pos {
+            Point {
+                x: bx,
+                y: by - slide_px,
+            }
+        } else {
+            let mut wr = Rect::default();
+            GetWindowRect(sw.hwnd, &mut wr);
+            Point {
+                x: wr.left,
+                y: wr.top - slide_px,
+            }
         };
         let size = Size {
             x: sw.w_px,
@@ -1439,7 +1703,7 @@ impl SettingsWindow {
         let blend = Blend {
             op: 0,
             flags: 0,
-            alpha: 255,
+            alpha: (open_a * 255.).round() as u8,
             format: 1,
         };
         UpdateLayeredWindow(sw.hwnd, null_mut(), &dst, &size, sw.dc, &src, 0, &blend, 2);
@@ -1499,7 +1763,7 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             if s.modal_dialog_open {
                 return 0;
             }
-            s.settings_win.hide();
+            SettingsWindow::hide_with_motion(s);
             if !s.main_hwnd.is_null() {
                 InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
             }
@@ -1526,7 +1790,7 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
                 if s.modal_dialog_open {
                     return 0;
                 }
-                s.settings_win.hide();
+                SettingsWindow::hide_with_motion(s);
                 if !s.main_hwnd.is_null() {
                     InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
                 }
@@ -1535,6 +1799,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             DefWindowProcW(hwnd, msg, w, l)
         }
         0x0200 => {
+            if !s.settings_win.open {
+                return 0;
+            }
             let mut tracking = MouseTracking {
                 size: size_of::<MouseTracking>() as u32,
                 flags: 2,
@@ -1579,6 +1846,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             0
         }
         0x0201 => {
+            if !s.settings_win.open {
+                return 0;
+            }
             let x = (l as i16) as f64 / s.scale;
             let y = ((l >> 16) as i16) as f64 / s.scale;
             let hit = hit_test(SettingsWindow::hit_context(s), x, y);
@@ -1607,6 +1877,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             0
         }
         0x0202 => {
+            if !s.settings_win.open && !s.settings_win.blur_drag {
+                return 0;
+            }
             let x = (l as i16) as f64 / s.scale;
             let y = ((l >> 16) as i16) as f64 / s.scale;
             let hit = hit_test(SettingsWindow::hit_context(s), x, y);
@@ -1975,6 +2248,27 @@ pub fn clamp_window_pos(
     let max_x = (right - win_w).max(left);
     let max_y = (bottom - win_h).max(top);
     (x.clamp(left, max_x), y.clamp(top, max_y))
+}
+
+fn style_index(bg_style: u32) -> f64 {
+    bg_style.min(4) as f64
+}
+
+fn opacity_index(bg_opacity: u32) -> f64 {
+    match bg_opacity {
+        70 => 0.,
+        80 => 1.,
+        90 => 2.,
+        _ => 3.,
+    }
+}
+
+fn framing_index(bg_pos: u32) -> f64 {
+    match bg_pos {
+        1 => 0.,
+        0 => 1.,
+        _ => 2.,
+    }
 }
 
 pub fn advance_switch(
@@ -2392,5 +2686,42 @@ mod tests {
             SetWindowLongPtrW(hwnd, -21, 0);
             DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn settings_window_springs_animate_open_nav_section_and_segmented_controls() {
+        let mut w = SettingsWindow::new();
+        w.open = true;
+        w.open_t = 0.01;
+        w.set_section(SettingsSection::Appearance);
+        assert_eq!(w.section_t, 0.);
+        assert_eq!(w.section_dir, 1.);
+
+        // Springs advance smoothly toward targets when reduced_motion is false
+        assert!(w.advance(true, 0, 80, 2, false, 0.016));
+        assert!(w.open_t > 0.01 && w.open_t < 1.);
+        assert!(w.nav_y > NAV_Y0 && w.nav_y < NAV_Y0 + 2. * NAV_STEP);
+        assert!(w.section_t > 0. && w.section_t < 1.);
+        assert!(w.style_t < 3. && w.style_t > 0.);
+        assert!(w.opacity_t < 3. && w.opacity_t > 1.);
+        assert!(w.framing_t > 1. && w.framing_t < 2.);
+
+        // Reduced motion snaps every spring immediately
+        assert!(w.advance(true, 0, 80, 2, true, 0.016));
+        assert_eq!(w.open_t, 1.);
+        assert_eq!(w.nav_y, NAV_Y0 + 2. * NAV_STEP);
+        assert_eq!(w.section_t, 1.);
+        assert_eq!(w.style_t, 0.);
+        assert_eq!(w.opacity_t, 1.);
+        assert_eq!(w.framing_t, 2.);
+
+        // Closing animation glides down until invisible
+        w.open = false;
+        assert!(w.is_visible());
+        for _ in 0..80 {
+            w.advance(true, 0, 80, 2, false, 0.016);
+        }
+        assert!(!w.is_visible());
+        assert_eq!(w.open_t, 0.);
     }
 }

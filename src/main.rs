@@ -1063,6 +1063,7 @@ struct State {
     settings: settings::Settings,
     pub(crate) main_hwnd: Hwnd,
     pub(crate) settings_win: settings_win::SettingsWindow,
+    settings_win_moving: bool,
     updater: updater::Updater,
     web_drop_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     web_drop_status: String,
@@ -1382,6 +1383,7 @@ impl State {
             settings: loaded_settings,
             main_hwnd: hwnd,
             settings_win: settings_win::SettingsWindow::new(),
+            settings_win_moving: false,
             updater: updater::Updater::new(!smoke),
             web_drop_rx: None,
             web_drop_status: String::new(),
@@ -2755,9 +2757,15 @@ impl State {
                 dt,
             )
         };
-        let settings_auto_animating =
-            self.settings_win
-                .advance(self.updater.auto, self.reduced_motion, dt);
+        let settings_win_animating = self.settings_win.advance(
+            self.updater.auto,
+            self.settings.bg_style,
+            self.settings.bg_opacity,
+            self.settings.bg_pos,
+            self.reduced_motion,
+            dt,
+        );
+        self.settings_win_moving = settings_animating || settings_win_animating;
         let quick_animating = self.advance_quick_motion(dt);
         geom_animating
             || play_animating
@@ -2771,7 +2779,7 @@ impl State {
             || notice_animating
             || mini_animating
             || settings_animating
-            || settings_auto_animating
+            || settings_win_animating
             || agenda_animating
             || notif_enter_animating
             || notif_scroll_animating
@@ -8870,11 +8878,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 let prev_mini = s.mini_t;
                 let prev_tab = s.tab_t;
                 let prev_lt = s.lyrics_t;
-                let prev_sw = s.switch_t;
-                let prev_auto = s.settings_win.auto_switch_t();
+                let was_settings_visible = s.settings_win.is_visible();
                 let animating = s.advance(dt);
-                let settings_sw_moving =
-                    s.switch_t != prev_sw || s.settings_win.auto_switch_t() != prev_auto;
+                let settings_sw_moving = s.settings_win_moving;
                 let resized = s.progress != prev_p
                     || s.panel_w != prev_w
                     || s.play_progress != prev_play
@@ -8890,7 +8896,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     }
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
-                if s.settings_win.is_open() && (settings_sw_moving || updater_changed) {
+                if (s.settings_win.is_visible() || was_settings_visible)
+                    && (settings_sw_moving || updater_changed)
+                    && s.settings_win.is_visible()
+                {
                     settings_win::SettingsWindow::paint(s);
                 }
                 // How fast the frame thread runs next (see the thread in main): vsync-locked while the notch
@@ -11374,6 +11383,7 @@ mod tests {
             settings: settings::Settings::default(),
             main_hwnd: null_mut(),
             settings_win: settings_win::SettingsWindow::new(),
+            settings_win_moving: false,
             updater: updater::Updater::default(),
             web_drop_rx: None,
             web_drop_status: String::new(),
