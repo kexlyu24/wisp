@@ -128,6 +128,7 @@ extern "system" {
         flags: u32,
     ) -> i32;
     fn SendMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
+    pub(crate) fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn RegisterClassExW(class: *const WindowClass) -> u16;
     fn CreateWindowExW(
@@ -941,6 +942,7 @@ struct State {
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pace: std::sync::Arc<std::sync::atomic::AtomicU8>,
     menu_active: bool,
+    pub(crate) modal_dialog_open: bool,
     last_minute: u16,
     shelf_items: Vec<ShelfItem>,
     active_tab: usize,
@@ -1230,6 +1232,7 @@ impl State {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
             menu_active: false,
+            modal_dialog_open: false,
             last_minute: now.minute,
             shelf_items,
             active_tab: 0,
@@ -2986,29 +2989,27 @@ impl State {
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
     }
-    pub(crate) unsafe fn import_custom_bg(&mut self, owner: Hwnd, main_hwnd: Hwnd) {
-        if let Some(file_path) = open_image_dialog(owner) {
-            let h = (DIB_H * self.scale).ceil() as usize;
-            if let Some(prepared) = prepare_custom_bg(
-                &file_path,
-                self.stride,
-                h,
-                self.settings.bg_blur,
-                self.settings.bg_pos,
-                self.settings.bg_opacity,
-            ) {
-                if let Some(dest) = tasks::data_path("background.png") {
-                    let _ = std::fs::copy(&file_path, dest);
-                }
-                self.bg_custom_pixels = Some(prepared);
-                self.settings.bg_style = 4;
-                self.apply_settings();
-                if !self.smoke {
-                    self.settings.save();
-                }
-                if !main_hwnd.is_null() {
-                    InvalidateRect(main_hwnd, std::ptr::null(), 0);
-                }
+    pub(crate) unsafe fn apply_imported_custom_bg(&mut self, file_path: &str, main_hwnd: Hwnd) {
+        let h = (DIB_H * self.scale).ceil() as usize;
+        if let Some(prepared) = prepare_custom_bg(
+            file_path,
+            self.stride,
+            h,
+            self.settings.bg_blur,
+            self.settings.bg_pos,
+            self.settings.bg_opacity,
+        ) {
+            if let Some(dest) = tasks::data_path("background.png") {
+                let _ = std::fs::copy(file_path, dest);
+            }
+            self.bg_custom_pixels = Some(prepared);
+            self.settings.bg_style = 4;
+            self.apply_settings();
+            if !self.smoke {
+                self.settings.save();
+            }
+            if !main_hwnd.is_null() {
+                InvalidateRect(main_hwnd, std::ptr::null(), 0);
             }
         }
     }
@@ -8608,8 +8609,37 @@ unsafe fn icon_with(s: &State, r: &render::Renderer, index: usize, x: f64, y: f6
         _ => {}
     }
 }
+pub(crate) const WM_SETTINGS_IMPORT_BG: u32 = 0x8009;
+
 unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize {
     let ptr = GetWindowLongPtrW(hwnd, -21) as *mut State;
+    if msg == WM_SETTINGS_IMPORT_BG && !ptr.is_null() {
+        let owner = {
+            let s = &mut *ptr;
+            if s.modal_dialog_open || s.smoke {
+                return 0;
+            }
+            s.modal_dialog_open = true;
+            let sw_hwnd = s.settings_win.hwnd();
+            if !sw_hwnd.is_null() {
+                sw_hwnd
+            } else {
+                hwnd
+            }
+        };
+        let picked = open_image_dialog(owner);
+        {
+            let s = &mut *ptr;
+            s.modal_dialog_open = false;
+            if let Some(path) = picked {
+                s.apply_imported_custom_bg(&path, hwnd);
+            }
+            if s.settings_win.is_open() {
+                settings_win::SettingsWindow::paint(s);
+            }
+        }
+        return 0;
+    }
     if !ptr.is_null() {
         let s = &mut *ptr;
         if s.shelf_alert.is_some() {
@@ -9566,8 +9596,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                 return 0;
                             }
                             HEADER_SETTINGS => {
-                                settings_win::SettingsWindow::toggle(s);
-                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                                if !s.modal_dialog_open {
+                                    settings_win::SettingsWindow::toggle(s);
+                                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                                }
                                 return 0;
                             }
                             t if (0..TAB_COUNT as i32).contains(&t) => {
@@ -10263,6 +10295,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             tray::CALLBACK => {
+                if s.modal_dialog_open {
+                    return 0;
+                }
                 let chosen = match &s.tray {
                     Some(tray) => {
                         s.menu_active = true;
@@ -10282,6 +10317,11 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     _ => {}
                 }
                 return 0;
+            }
+            0x0010 => {
+                if s.modal_dialog_open {
+                    return 0;
+                }
             }
             m if s.tray.as_ref().is_some_and(|t| t.is_taskbar_created(m)) => {
                 if let Some(tray) = &s.tray {
@@ -11205,6 +11245,7 @@ mod tests {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pace: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PACE_MOTION)),
             menu_active: false,
+            modal_dialog_open: false,
             last_minute: 0,
             shelf_items: Vec::new(),
             active_tab: TAB_SHELF,
@@ -11589,6 +11630,76 @@ mod tests {
         assert!(!s.settings_win.is_open());
         assert!(!s.expanded);
         assert_eq!(s.active_tab, TAB_MUSIC);
+    }
+
+    #[test]
+    fn notch_wheel_clamps_at_notif_and_gear_click_leaves_notch_decoupled() {
+        unsafe {
+            let class = wide("STATIC");
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            let mut s = create_test_state();
+            s.smoke = true;
+            s.scale = 1.0;
+            s.expanded = true;
+            s.progress = 1.0;
+            s.active_tab = TAB_NOTIF;
+            s.tab_from = TAB_NOTIF;
+            s.tab_to = TAB_NOTIF;
+            s.tab_t = 1.0;
+            s.panel_w = NOTIF_W;
+            s.panel_h = s.page_h(TAB_NOTIF);
+            assert!(s.usable());
+            SetWindowLongPtrW(hwnd, -21, &mut s as *mut State as isize);
+
+            // Scrolling forward past TAB_NOTIF clamps at TAB_NOTIF (6)
+            let wheel_down = ((-120i16 as u16) as usize) << 16;
+            procedure(hwnd, 0x020A, wheel_down, 0);
+            assert_eq!(s.active_tab, TAB_NOTIF);
+
+            // Clicking Gear header action toggles Settings popup without changing notch tab/expanded
+            let (gx, gw) = gear_rect(s.panel_w_now());
+            let click_x = (gx + gw * 0.5).round() as i16;
+            let click_y = 20i16;
+            let lparam = ((click_y as u16 as isize) << 16) | (click_x as u16 as isize);
+
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(s.settings_win.is_open());
+            assert_eq!(s.active_tab, TAB_NOTIF);
+            assert!(s.expanded);
+
+            // Second Gear click hides Settings popup
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(!s.settings_win.is_open());
+            assert_eq!(s.active_tab, TAB_NOTIF);
+            assert!(s.expanded);
+
+            // Modal dialog guard prevents Gear click from toggling Settings popup
+            s.modal_dialog_open = true;
+            procedure(hwnd, 0x0201, 0, lparam);
+            procedure(hwnd, 0x0202, 0, lparam);
+            assert!(!s.settings_win.is_open());
+            s.modal_dialog_open = false;
+
+            SetWindowLongPtrW(hwnd, -21, 0);
+            DestroyWindow(hwnd);
+        }
     }
 
     #[test]

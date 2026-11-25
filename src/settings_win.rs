@@ -13,10 +13,11 @@ use crate::{
     BeginPaint, BitmapInfo, Blend, CreateCompatibleDC, CreateDIBSection, CreateWindowExW,
     DefWindowProcW, DeleteDC, DeleteObject, DestroyWindow, EndPaint, GetModuleHandleW,
     GetWindowLongPtrW, GetWindowRect, Handle, Hwnd, InvalidateRect, LoadCursorW, MouseTracking,
-    Paint, Point, Rect, RegisterClassExW, ReleaseCapture, SelectObject, SendMessageW, SetBkMode,
-    SetCapture, SetForegroundWindow, SetTextColor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    Size, State, SystemParametersInfoW, TrackMouseEvent, UpdateLayeredWindow, WindowClass, BLUE,
-    GREEN, PACE_MOTION, SECONDARY, SETTING_ROWS, TERTIARY, WHITE,
+    Paint, Point, PostMessageW, Rect, RegisterClassExW, ReleaseCapture, SelectObject, SendMessageW,
+    SetBkMode, SetCapture, SetForegroundWindow, SetTextColor, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, Size, State, SystemParametersInfoW, TrackMouseEvent, UpdateLayeredWindow,
+    WindowClass, BLUE, GREEN, PACE_MOTION, SECONDARY, SETTING_ROWS, TERTIARY, WHITE,
+    WM_SETTINGS_IMPORT_BG,
 };
 
 #[repr(C)]
@@ -130,6 +131,10 @@ impl SettingsWindow {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn hwnd(&self) -> Hwnd {
+        self.hwnd
     }
 
     #[cfg(test)]
@@ -298,7 +303,7 @@ impl SettingsWindow {
             return;
         }
         let sw = &mut state.settings_win;
-        let work = Self::work_area_for(sw.pos);
+        let work = Self::work_area_for(sw.pos.map(|p| window_anchor_point(p, sw.w_px, sw.h_px)));
         let (x, y) = match sw.pos {
             Some((px, py)) => clamp_window_pos(px, py, sw.w_px, sw.h_px, work),
             None => clamp_window_pos(
@@ -389,7 +394,6 @@ impl SettingsWindow {
 
     pub unsafe fn handle_click(state: &mut State, hit: i32) {
         let main_hwnd = state.main_hwnd;
-        let win_hwnd = state.settings_win.hwnd;
         match hit {
             HIT_CLOSE => {
                 state.settings_win.hide();
@@ -401,7 +405,7 @@ impl SettingsWindow {
             HIT_QUIT => {
                 state.settings_win.hide();
                 if !main_hwnd.is_null() {
-                    DestroyWindow(main_hwnd);
+                    PostMessageW(main_hwnd, 0x0010, 0, 0);
                 }
                 return;
             }
@@ -417,8 +421,8 @@ impl SettingsWindow {
             h if (HIT_BG_STYLE_BASE..HIT_BG_STYLE_BASE + 5).contains(&h) => {
                 let style = (h - HIT_BG_STYLE_BASE) as u32;
                 if style == 4 && state.bg_custom_pixels.is_none() {
-                    if !state.smoke {
-                        state.import_custom_bg(win_hwnd, main_hwnd);
+                    if !state.smoke && !main_hwnd.is_null() {
+                        PostMessageW(main_hwnd, WM_SETTINGS_IMPORT_BG, 0, 0);
                     }
                 } else {
                     state.settings.bg_style = style;
@@ -446,8 +450,8 @@ impl SettingsWindow {
                 }
             }
             HIT_BG_CHOOSE => {
-                if !state.smoke {
-                    state.import_custom_bg(win_hwnd, main_hwnd);
+                if !state.smoke && !main_hwnd.is_null() {
+                    PostMessageW(main_hwnd, WM_SETTINGS_IMPORT_BG, 0, 0);
                 }
             }
             HIT_BG_RESET => {
@@ -484,8 +488,9 @@ impl SettingsWindow {
                 match state.updater.phase {
                     updater::Phase::Ready => match state.updater.install() {
                         Ok(()) => {
+                            state.settings_win.hide();
                             if !main_hwnd.is_null() {
-                                DestroyWindow(main_hwnd);
+                                PostMessageW(main_hwnd, 0x0010, 0, 0);
                             }
                             return;
                         }
@@ -539,7 +544,7 @@ impl SettingsWindow {
                 right: px(x + w),
                 bottom: px(y + h),
             };
-            let flags = 0x20 | 0x4 | 0x8000 | if center { 1 } else { 0 };
+            let flags = TEXT_DRAW_FLAGS | if center { 1 } else { 0 };
             cached_text_into(
                 sw.dc,
                 sw.pixels,
@@ -1243,9 +1248,9 @@ impl SettingsWindow {
                         line,
                         WHITE,
                         CONTENT_X + 14.,
-                        body_y + 10. + i as f64 * 18.,
+                        body_y + 8. + i as f64 * 16.,
                         CONTENT_W - 28.,
-                        18.,
+                        16.,
                         false,
                     );
                 }
@@ -1254,7 +1259,7 @@ impl SettingsWindow {
                     concat!("Current version: Wisp ", env!("CARGO_PKG_VERSION")),
                     SECONDARY,
                     CONTENT_X + 14.,
-                    body_y + 46.,
+                    body_y + 42.,
                     CONTENT_W - 28.,
                     16.,
                     false,
@@ -1263,7 +1268,7 @@ impl SettingsWindow {
                     let frac = (u.progress.0 as f64 / u.progress.1 as f64).clamp(0., 1.);
                     r.round(
                         CONTENT_X + 14.,
-                        body_y + 68.,
+                        body_y + 66.,
                         CONTENT_W - 74.,
                         4.,
                         2.,
@@ -1271,7 +1276,7 @@ impl SettingsWindow {
                     );
                     r.round(
                         CONTENT_X + 14.,
-                        body_y + 68.,
+                        body_y + 66.,
                         (CONTENT_W - 74.) * frac,
                         4.,
                         2.,
@@ -1282,19 +1287,23 @@ impl SettingsWindow {
                         &format!("{:.0}%", frac * 100.),
                         SECONDARY,
                         CONTENT_X + CONTENT_W - 56.,
-                        body_y + 62.,
+                        body_y + 60.,
                         42.,
                         16.,
                         true,
                     );
                 } else if let Some(rel) = &u.release {
-                    for (i, line) in update_note_lines(&rel.notes).iter().take(2).enumerate() {
+                    for (i, line) in update_note_lines(&rel.notes)
+                        .iter()
+                        .take(UPD_NOTE_LINES)
+                        .enumerate()
+                    {
                         draw_text(
                             3,
                             line,
                             SECONDARY,
                             CONTENT_X + 14.,
-                            body_y + 66. + i as f64 * 16.,
+                            body_y + 62. + i as f64 * 16.,
                             CONTENT_W - 28.,
                             16.,
                             false,
@@ -1364,13 +1373,20 @@ impl SettingsWindow {
                 }
 
                 // Card 2: Troubleshooting log info (non-interactive)
-                r.round(CONTENT_X, 328., CONTENT_W, 54., 12., CARD_BG);
+                r.round(
+                    CONTENT_X,
+                    UPD_LOG_CARD_Y,
+                    CONTENT_W,
+                    UPD_LOG_CARD_H,
+                    12.,
+                    CARD_BG,
+                );
                 draw_text(
                     7,
                     "Troubleshooting log",
                     WHITE,
                     CONTENT_X + 14.,
-                    337.,
+                    UPD_LOG_CARD_Y + 9.,
                     260.,
                     18.,
                     false,
@@ -1380,7 +1396,7 @@ impl SettingsWindow {
                     "%APPDATA%\\Wisp\\wisp.log (stays local)",
                     SECONDARY,
                     CONTENT_X + 14.,
-                    357.,
+                    UPD_LOG_CARD_Y + 29.,
                     300.,
                     16.,
                     false,
@@ -1390,7 +1406,7 @@ impl SettingsWindow {
                     "Local only",
                     TERTIARY,
                     CONTENT_X + CONTENT_W - 80.,
-                    346.,
+                    UPD_LOG_CARD_Y + 18.,
                     66.,
                     18.,
                     true,
@@ -1480,6 +1496,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
     match msg {
         0x0010 => {
             // WM_CLOSE -> hide instead of quitting Wisp
+            if s.modal_dialog_open {
+                return 0;
+            }
             s.settings_win.hide();
             if !s.main_hwnd.is_null() {
                 InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
@@ -1504,6 +1523,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
         0x0100 => {
             // WM_KEYDOWN: Escape hides Settings popup
             if w == 0x1B {
+                if s.modal_dialog_open {
+                    return 0;
+                }
                 s.settings_win.hide();
                 if !s.main_hwnd.is_null() {
                     InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
@@ -1542,8 +1564,16 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             0
         }
         0x02A3 => {
+            let mut changed = false;
             if s.settings_win.hover != HIT_NONE {
                 s.settings_win.hover = HIT_NONE;
+                changed = true;
+            }
+            if !s.settings_win.blur_drag && s.settings_win.pressed != HIT_NONE {
+                s.settings_win.pressed = HIT_NONE;
+                changed = true;
+            }
+            if changed {
                 SettingsWindow::paint(s);
             }
             0
@@ -1570,13 +1600,20 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
                 return 0;
             }
             s.settings_win.pressed = hit;
+            if hit != HIT_NONE {
+                SetCapture(hwnd);
+            }
             SettingsWindow::paint(s);
             0
         }
         0x0202 => {
+            let x = (l as i16) as f64 / s.scale;
+            let y = ((l >> 16) as i16) as f64 / s.scale;
+            let hit = hit_test(SettingsWindow::hit_context(s), x, y);
             if s.settings_win.blur_drag {
                 s.settings_win.blur_drag = false;
                 s.settings_win.pressed = HIT_NONE;
+                s.settings_win.hover = hit;
                 ReleaseCapture();
                 if s.bg_custom_pixels.is_some() {
                     s.reload_custom_bg();
@@ -1591,10 +1628,11 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
                 SettingsWindow::paint(s);
                 return 0;
             }
-            let x = (l as i16) as f64 / s.scale;
-            let y = ((l >> 16) as i16) as f64 / s.scale;
-            let hit = hit_test(SettingsWindow::hit_context(s), x, y);
             let pressed = std::mem::replace(&mut s.settings_win.pressed, HIT_NONE);
+            s.settings_win.hover = hit;
+            if pressed != HIT_NONE {
+                ReleaseCapture();
+            }
             if hit != HIT_NONE && hit == pressed {
                 SettingsWindow::handle_click(s, hit);
             } else if s.settings_win.is_open() {
@@ -1603,10 +1641,11 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
             0
         }
         0x0215 => {
-            // WM_CAPTURECHANGED: clean up blur drag if capture was stolen
+            // WM_CAPTURECHANGED: clean up blur drag or button press if capture was stolen
             if s.settings_win.blur_drag {
                 s.settings_win.blur_drag = false;
                 s.settings_win.pressed = HIT_NONE;
+                s.settings_win.hover = HIT_NONE;
                 if s.bg_custom_pixels.is_some() {
                     s.reload_custom_bg();
                 }
@@ -1618,6 +1657,12 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize
                     InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
                 }
                 SettingsWindow::paint(s);
+            } else if s.settings_win.pressed != HIT_NONE || s.settings_win.hover != HIT_NONE {
+                s.settings_win.pressed = HIT_NONE;
+                s.settings_win.hover = HIT_NONE;
+                if s.settings_win.is_open() {
+                    SettingsWindow::paint(s);
+                }
             }
             0
         }
@@ -1661,15 +1706,20 @@ pub const BLUR_ROW_H: f64 = 54.;
 pub const BLUR_TRACK_X0: f64 = CONTENT_X + 14.;
 pub const BLUR_TRACK_X1: f64 = CONTENT_X + CONTENT_W - 14.;
 
+pub const TEXT_DRAW_FLAGS: u32 = 0x20 | 0x4 | 0x0800 | 0x8000;
+
 pub const UPD_CARD_Y: f64 = 114.;
 pub const UPD_AUTO_H: f64 = 52.;
-pub const UPD_BODY_H: f64 = 148.;
+pub const UPD_BODY_H: f64 = 172.;
+pub const UPD_NOTE_LINES: usize = 4;
 pub const UPD_ACTION_X: f64 = CONTENT_X + 14.;
-pub const UPD_ACTION_Y: f64 = 272.;
+pub const UPD_ACTION_Y: f64 = 298.;
 pub const UPD_ACTION_W: f64 = 160.;
 pub const UPD_ACTION_H: f64 = 30.;
 pub const UPD_CANCEL_X: f64 = 372.;
 pub const UPD_CANCEL_W: f64 = 88.;
+pub const UPD_LOG_CARD_Y: f64 = 350.;
+pub const UPD_LOG_CARD_H: f64 = 54.;
 
 pub const HIT_NONE: i32 = -1;
 pub const HIT_TITLEBAR: i32 = 1;
@@ -1910,6 +1960,10 @@ pub fn blur_from_x(x: f64) -> u32 {
     (frac * 30.).round() as u32
 }
 
+pub fn window_anchor_point(pos: (i32, i32), w_px: i32, h_px: i32) -> (i32, i32) {
+    (pos.0 + w_px / 2, pos.1 + h_px / 2)
+}
+
 pub fn clamp_window_pos(
     x: i32,
     y: i32,
@@ -2036,14 +2090,33 @@ mod tests {
             HIT_NONE
         );
 
-        // Frost shows Blur slider row
-        let frost = HitContext {
-            bg_style: 0,
-            ..oled
-        };
-        let frost_layout = appearance_layout(frost.has_custom_image, frost.bg_style);
-        let blur_y = frost_layout.blur_row_y.expect("Frost shows blur slider");
-        assert_eq!(hit_test(frost, 300., blur_y + 34.), HIT_BG_BLUR);
+        // Frost/Aura/Slate without custom image hide Image & Framing rows and show Blur slider
+        for style in [0u32, 1, 2] {
+            let glass = HitContext {
+                bg_style: style,
+                has_custom_image: false,
+                ..oled
+            };
+            let glass_layout = appearance_layout(glass.has_custom_image, glass.bg_style);
+            assert!(glass_layout.image_row_y.is_none());
+            assert!(glass_layout.framing_row_y.is_none());
+            let blur_y = glass_layout
+                .blur_row_y
+                .expect("Frost/Aura/Slate show blur slider");
+            assert_eq!(hit_test(glass, 300., blur_y + 34.), HIT_BG_BLUR);
+            for probe_y in [OPT_CARD_Y + 22., OPT_CARD_Y + 66., OPT_CARD_Y + 110.] {
+                for probe_x in [
+                    CONTENT_X + CONTENT_W - 140.,
+                    CONTENT_X + CONTENT_W - 108.,
+                    CONTENT_X + CONTENT_W - 44.,
+                ] {
+                    let h = hit_test(glass, probe_x, probe_y);
+                    assert_ne!(h, HIT_BG_CHOOSE);
+                    assert_ne!(h, HIT_BG_RESET);
+                    assert!(!(HIT_BG_POS_BASE..HIT_BG_POS_BASE + 3).contains(&h));
+                }
+            }
+        }
 
         // Image without custom image: Choose visible, Reset hidden, Framing visible, Blur visible
         let img_empty = HitContext {
@@ -2213,6 +2286,111 @@ mod tests {
             assert!(!s.settings_win.is_open());
             assert_eq!(s.active_tab, 0);
             assert!(!s.expanded);
+        }
+    }
+
+    #[test]
+    fn window_anchor_point_uses_center_for_multimonitor_selection() {
+        assert_eq!(window_anchor_point((-10, 200), 620, 420), (300, 410));
+        assert_eq!(window_anchor_point((-700, 100), 620, 420), (-390, 310));
+    }
+
+    #[test]
+    fn text_draw_flags_include_dt_noprefix_and_updates_fits_four_note_lines() {
+        assert_ne!(TEXT_DRAW_FLAGS & 0x0800, 0);
+        assert_eq!(UPD_NOTE_LINES, 4);
+        assert!(UPD_CARD_Y + UPD_AUTO_H + UPD_BODY_H < UPD_LOG_CARD_Y);
+        assert!(UPD_LOG_CARD_Y + UPD_LOG_CARD_H < SET_WIN_H);
+    }
+
+    #[test]
+    fn settings_proc_handles_close_escape_mouseleave_outside_release_and_capture_loss() {
+        unsafe {
+            let class = wide("STATIC");
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            let mut s = crate::tests::create_test_state();
+            s.smoke = true;
+            s.scale = 1.0;
+            s.settings_win.open = true;
+            SetWindowLongPtrW(hwnd, -21, &mut s as *mut State as isize);
+
+            let pack =
+                |x: i16, y: i16| -> isize { ((y as u16 as isize) << 16) | (x as u16 as isize) };
+
+            // WM_CLOSE hides popup and returns 0
+            assert_eq!(settings_proc(hwnd, 0x0010, 0, 0), 0);
+            assert!(!s.settings_win.is_open());
+
+            // Esc hides popup
+            s.settings_win.open = true;
+            assert_eq!(settings_proc(hwnd, 0x0100, 0x1B, 0), 0);
+            assert!(!s.settings_win.is_open());
+
+            // Modal dialog guard blocks WM_CLOSE and Esc from hiding owner HWND
+            s.settings_win.open = true;
+            s.modal_dialog_open = true;
+            assert_eq!(settings_proc(hwnd, 0x0010, 0, 0), 0);
+            assert!(s.settings_win.is_open());
+            assert_eq!(settings_proc(hwnd, 0x0100, 0x1B, 0), 0);
+            assert!(s.settings_win.is_open());
+            s.modal_dialog_open = false;
+
+            // WM_LBUTTONDOWN + WM_MOUSELEAVE clears both hover and pressed
+            let nav_l = pack(80, (NAV_Y0 + NAV_STEP + 16.) as i16);
+            settings_proc(hwnd, 0x0200, 0, nav_l);
+            settings_proc(hwnd, 0x0201, 0, nav_l);
+            assert_eq!(s.settings_win.pressed, HIT_NAV_BASE + 1);
+            settings_proc(hwnd, 0x02A3, 0, 0);
+            assert_eq!(s.settings_win.hover, HIT_NONE);
+            assert_eq!(s.settings_win.pressed, HIT_NONE);
+
+            // Press close button then release outside: clears pressed & hover without hiding
+            let close_l = pack(596, 20);
+            settings_proc(hwnd, 0x0200, 0, close_l);
+            settings_proc(hwnd, 0x0201, 0, close_l);
+            assert_eq!(s.settings_win.pressed, HIT_CLOSE);
+            settings_proc(hwnd, 0x0202, 0, pack(-20, -20));
+            assert!(s.settings_win.is_open());
+            assert_eq!(s.settings_win.pressed, HIT_NONE);
+            assert_eq!(s.settings_win.hover, HIT_NONE);
+
+            // Blur slider drag release outside clears blur_drag, pressed, and hover
+            s.settings_win.set_section(SettingsSection::Appearance);
+            s.settings.bg_style = 0;
+            let blur_y = appearance_layout(false, 0).blur_row_y.unwrap() + 34.;
+            settings_proc(hwnd, 0x0201, 0, pack(300, blur_y as i16));
+            assert!(s.settings_win.blur_drag);
+            settings_proc(hwnd, 0x0202, 0, pack(-50, blur_y as i16));
+            assert!(!s.settings_win.blur_drag);
+            assert_eq!(s.settings_win.pressed, HIT_NONE);
+            assert_eq!(s.settings_win.hover, HIT_NONE);
+            assert!(s.settings.bg_blur <= 30);
+
+            // WM_CAPTURECHANGED during blur_drag clears blur_drag, pressed, and hover
+            settings_proc(hwnd, 0x0201, 0, pack(300, blur_y as i16));
+            assert!(s.settings_win.blur_drag);
+            settings_proc(hwnd, 0x0215, 0, 0);
+            assert!(!s.settings_win.blur_drag);
+            assert_eq!(s.settings_win.pressed, HIT_NONE);
+            assert_eq!(s.settings_win.hover, HIT_NONE);
+
+            SetWindowLongPtrW(hwnd, -21, 0);
+            DestroyWindow(hwnd);
         }
     }
 }
