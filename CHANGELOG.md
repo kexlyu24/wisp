@@ -9,6 +9,7 @@ All notable changes to Wisp in this development checkpoint are documented in thi
 - **Windows CI & automated draft Releases**: `.github/workflows/rust.yml` runs unit tests, release builds, and the smoke test on `windows-latest`; `.github/workflows/release.yml` builds tagged releases and drafts a GitHub Release with the portable ZIP, `wisp-windows-x64.exe`, and (for stable tags) `wisp-update.json` (#31, #35).
 
 ### Improved
+- **Quick Access smooth spring scrolling**: scrolling through more than 6 shortcuts now glides continuously on a spring (`reduced_motion` snaps immediately) with smoothstep top/bottom edge fades, a continuous right-edge scrollbar pill, and proper row-bound clamping (#37).
 - **Quick Access drag-and-reorder**: replaced thread-local motion with per-card springs (`QuickCardMotion`) integrated into `State::advance` with `reduced_motion` support and `PACE_MOTION` frame pacing, adding live neighbor slot-shift preview, a drop-slot placeholder, subtle lift elevation, and smooth post-drop/cancel settle (#34).
 
 ### Changed
