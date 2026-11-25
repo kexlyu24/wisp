@@ -2,6 +2,28 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
+## [0.2.2] - 2026-11-25
+
+### Added
+- **High-resolution Quick Access icons**: resolves shortcuts via direct path, `SearchPathW`, App Paths registry (`HKCU`/`HKLM`), and `FOLDERID_AppsFolder` (`ms-settings:*`), extracts 96–256 px icons via `IShellItemImageFactory::GetImage` with `SHDefExtractIconW`/`SHGetFileInfoW` fallbacks (including 1-bit mask alpha recovery for legacy icons), and downscales in premultiplied RGBA with Catmull-Rom filtering (#34).
+- **Windows CI & automated draft Releases**: `.github/workflows/rust.yml` runs unit tests, release builds, and the smoke test on `windows-latest`; `.github/workflows/release.yml` builds tagged releases and drafts a GitHub Release with the portable ZIP, `wisp-windows-x64.exe`, and (for stable tags) `wisp-update.json` (#31, #35).
+
+### Improved
+- **Quick Access drag-and-reorder**: replaced thread-local motion with per-card springs (`QuickCardMotion`) integrated into `State::advance` with `reduced_motion` support and `PACE_MOTION` frame pacing, adding live neighbor slot-shift preview, a drop-slot placeholder, subtle lift elevation, and smooth post-drop/cancel settle (#34).
+
+### Changed
+- **In-app updater (HTTPS + SHA-256)**: migrated from Ed25519 signature verification (`update-public-key.hex` and `wisp-update.json.sig`) to HTTPS + SHA-256 verification (`wisp-windows-x64.exe` and `wisp-update.json`) with official GitHub release URL pinning, manifest version/size/SHA-256 checks, and x64 PE validation. Manual checks no longer have a cooldown and are disabled only while a check or download is running (#34, #35).
+
+### Fixed
+- **Quick Access edge cases**: fixed the `< 6` items draw loop bug, pointer capture release on drag cancel (Escape, tab switch, search, collapse, `WM_MOUSELEAVE`), mouse-wheel guarding during drag, and scroll clamping after deleting items (#34).
+- **8.3 short `%TEMP%` test compatibility**: fixed `test_file_data_object_carries_paths` so it passes on environments whose `%TEMP%` uses Windows 8.3 short paths (#31).
+
+### Known limitations
+- Clients running `0.2.1` (which require Ed25519 `.sig` assets) or `0.2.0` and older cannot auto-update to `0.2.2`; download the `0.2.2` ZIP once to switch to the HTTPS + SHA-256 updater.
+- WhatsApp Web image drops are not supported (blob URLs / virtual-file data).
+- The updater's replace and rollback paths should be exercised end to end on Windows before relying on them in production.
+- Apple Music's volume adapter only detects the app; it does not change the volume yet.
+
 ## [0.2.1] - 2026-11-23
 
 ### Added

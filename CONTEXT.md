@@ -23,7 +23,7 @@ An original, animated "dynamic notch" for Windows 10 and 11, inspired by Apple's
 - **Minimal mode:** when the closed notch would cover real content, such as browser tabs, it shrinks to a sliver.
 - **Supported players:** Spotify, Spotifast, Apple Music (detection only for volume), the SoundCloud app, and Chrome or Edge (YouTube and so on).
 
-Current version: **0.2.1**. Releases: <https://github.com/kexlyu24/wisp/releases>.
+Current version: **0.2.2**. Releases: <https://github.com/kexlyu24/wisp/releases>.
 
 ## People
 

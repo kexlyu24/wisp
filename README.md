@@ -74,8 +74,8 @@ a request to that image host, without importing browser cookies.
 
 Settings → Updates provides stable-release checks, release notes, HTTPS downloads verified with SHA-256
 and explicit Restart & update. No browser or account is required. Update packages
-must be published by the maintainer; 0.2.1 is the first release with them, so
-update from 0.2.0 or older by downloading the zip once. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
+must be published by the maintainer; 0.2.2 switches from Ed25519 signatures to
+HTTPS + SHA-256, so update from 0.2.1 or older by downloading the zip once. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
 recovery limitations and the user-run verification checklist.
 
 ## Text editing

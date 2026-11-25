@@ -1,4 +1,4 @@
-WISP 0.2.1 FOR WINDOWS
+WISP 0.2.2 FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
