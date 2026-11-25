@@ -1,21 +1,19 @@
-//! Signed, opt-in portable updates. The UI never blocks on network or disk work.
+//! HTTPS + SHA-256, opt-in portable updates. The UI never blocks on network or disk work.
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn updater_cooldown_blocks_repeated_attempts_after_failures() {
+    fn updater_blocks_only_inflight_actions() {
         let mut u = Updater::default();
-        assert_eq!(u.cooldown_at(100), 0);
-        u.last_check = 100;
-        u.phase = Phase::Error;
-        assert_eq!(u.cooldown_at(100), 60);
-        assert_eq!(u.cooldown_at(159), 1);
-        assert_eq!(u.cooldown_at(160), 0);
-        assert_eq!(u.cooldown_at(99), 60);
-        u.phase = Phase::Checking;
-        assert!(!u.action_enabled());
-        u.phase = Phase::Downloading;
-        assert!(!u.action_enabled());
+        u.last_check = now();
+        for phase in [Phase::Idle, Phase::Error] {
+            u.phase = phase;
+            assert!(u.action_enabled());
+        }
+        for phase in [Phase::Checking, Phase::Downloading] {
+            u.phase = phase;
+            assert!(!u.action_enabled());
+        }
     }
     #[test]
     fn updater_versions_compare_numerically_and_reject_prerelease() {
@@ -25,15 +23,18 @@ mod tests {
         }
     }
     #[test]
-    fn updater_rejects_unsigned_or_modified_manifest() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let key = SigningKey::from_bytes(&[7; 32]);
+    fn updater_manifest_requires_matching_version_size_and_hash() {
         let bytes = br#"{"version":"1.2.3","size":4096,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-        let sig = hex(&key.sign(bytes).to_bytes());
-        assert!(manifest(bytes, &sig, &key.verifying_key().to_bytes(), "v1.2.3").is_ok());
-        assert!(manifest(bytes, &sig, &key.verifying_key().to_bytes(), "v1.2.4").is_err());
-        assert!(manifest(b"{}", &sig, &key.verifying_key().to_bytes(), "v1.2.3").is_err());
-        assert!(manifest(bytes, "", &key.verifying_key().to_bytes(), "v1.2.3").is_err());
+        assert!(manifest(bytes, "v1.2.3").is_ok());
+        assert!(manifest(bytes, "v1.2.4").is_err());
+        assert!(manifest(b"{}", "v1.2.3").is_err());
+        for bad in [
+            serde_json::json!({"version":"1.2.3","size":4095,"sha256":"a".repeat(64)}),
+            serde_json::json!({"version":"1.2.3","size":4096,"sha256":"z".repeat(64)}),
+            serde_json::json!({"version":"1.2.3","size":4096,"sha256":"aa"}),
+        ] {
+            assert!(manifest(&serde_json::to_vec(&bad).unwrap(), "v1.2.3").is_err());
+        }
     }
     #[test]
     fn updater_rejects_untrusted_asset_locations() {
@@ -70,7 +71,6 @@ mod tests {
     }
 }
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::windows::process::CommandExt;
@@ -91,8 +91,6 @@ const API: &str = "https://api.github.com/repos/kexlyu24/wisp/releases/latest";
 const MAX_EXE: u64 = 100 * 1024 * 1024;
 const EXE: &str = "wisp-windows-x64.exe";
 const MANIFEST: &str = "wisp-update.json";
-const SIGNATURE: &str = "wisp-update.json.sig";
-const PUBLIC_KEY: &str = include_str!("../update-public-key.hex");
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -126,7 +124,7 @@ fn hex(b: &[u8]) -> String {
 fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     let s = s.trim();
     if s.len() != N * 2 || !s.is_ascii() {
-        return Err("Invalid signature or hash encoding".into());
+        return Err("Invalid hash encoding".into());
     }
     let mut out = [0; N];
     for (i, b) in out.iter_mut().enumerate() {
@@ -140,11 +138,7 @@ struct Manifest {
     size: u64,
     sha256: String,
 }
-fn manifest(bytes: &[u8], sig: &str, key: &[u8; 32], tag: &str) -> Result<Manifest> {
-    VerifyingKey::from_bytes(key)
-        .map_err(err)?
-        .verify_strict(bytes, &Signature::from_bytes(&unhex::<64>(sig)?))
-        .map_err(|_| "Update signature is not trusted".to_string())?;
+fn manifest(bytes: &[u8], tag: &str) -> Result<Manifest> {
     let doc: Value = serde_json::from_slice(bytes).map_err(err)?;
     let m = Manifest {
         version: doc["version"].as_str().ok_or("Missing version")?.into(),
@@ -192,7 +186,6 @@ pub struct Release {
     pub notes: String,
     url: String,
     manifest_url: String,
-    signature_url: String,
 }
 pub enum Event {
     Checked(Option<Release>),
@@ -224,7 +217,7 @@ impl Default for Updater {
     fn default() -> Self {
         Self {
             phase: Phase::Idle,
-            status: "Check for a newer stable version.".into(),
+            status: "Check for updates.".into(),
             release: None,
             auto: true,
             progress: (0, 0),
@@ -267,33 +260,18 @@ impl Updater {
         self.auto = !self.auto;
         self.save();
     }
-    pub fn cooldown_at(&self, timestamp: u64) -> u64 {
-        if self.last_check == 0 {
-            0
-        } else {
-            60u64.saturating_sub(timestamp.saturating_sub(self.last_check))
-        }
-    }
     pub fn action_enabled(&self) -> bool {
-        match self.phase {
-            Phase::Checking | Phase::Downloading => false,
-            Phase::Idle => self.cooldown_at(now()) == 0,
-            Phase::Error if self.release.is_none() => self.cooldown_at(now()) == 0,
-            _ => true,
-        }
-    }
-    pub fn cooldown(&self) -> u64 {
-        self.cooldown_at(now())
+        !matches!(self.phase, Phase::Checking | Phase::Downloading)
     }
     pub fn check(&mut self) {
-        if !self.action_enabled() || self.cooldown() > 0 {
+        if !self.action_enabled() {
             return;
         }
         crate::diagnostics::info("updater", "Stable release check started");
         self.last_check = now();
         self.save();
         self.phase = Phase::Checking;
-        self.status = "Checking GitHub Releases...".into();
+        self.status = "Checking...".into();
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let (tx, rx) = mpsc::channel();
@@ -313,9 +291,9 @@ impl Updater {
         if self.phase == Phase::Downloading {
             return;
         }
-        crate::diagnostics::info("updater", "Signed update download started");
+        crate::diagnostics::info("updater", "Update download started");
         self.phase = Phase::Downloading;
-        self.status = "Downloading and verifying update...".into();
+        self.status = "Downloading...".into();
         self.progress = (0, 0);
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
@@ -345,7 +323,7 @@ impl Updater {
             match event {
                 Event::Checked(Some(r)) => {
                     crate::diagnostics::info("updater", "New stable release available");
-                    self.status = format!("Wisp {} is available.", r.tag);
+                    self.status = format!("Version {} available", r.tag);
                     self.release = Some(r);
                     self.phase = Phase::Available;
                 }
@@ -353,17 +331,17 @@ impl Updater {
                     crate::diagnostics::info("updater", "Installed version is up to date");
                     self.phase = Phase::Idle;
                     self.release = None;
-                    self.status = "You have the latest stable version.".into();
+                    self.status = "You're up to date".into();
                 }
                 Event::Progress(n, total) => self.progress = (n, total),
                 Event::Ready(p) => {
                     crate::diagnostics::info(
                         "updater",
-                        "Update signature and payload verified; ready to install",
+                        "Update size and SHA-256 verified; ready to install",
                     );
                     self.phase = Phase::Ready;
                     self.staged = Some(p);
-                    self.status = "Verified. Restart when you are ready.".into();
+                    self.status = "Ready to install".into();
                 }
                 Event::Failed(e) => {
                     crate::diagnostics::error(
@@ -427,7 +405,7 @@ fn check_release(cancel: &AtomicBool) -> Result<Option<Release>> {
         let a = assets
             .iter()
             .find(|a| a["name"] == name)
-            .ok_or("Latest release does not have signed updater files yet.")?;
+            .ok_or("Latest release does not have updater files yet.")?;
         asset_url(
             a["browser_download_url"]
                 .as_str()
@@ -446,14 +424,11 @@ fn check_release(cancel: &AtomicBool) -> Result<Option<Release>> {
             .collect(),
         url: asset(EXE)?,
         manifest_url: asset(MANIFEST)?,
-        signature_url: asset(SIGNATURE)?,
     }))
 }
 fn download_release(r: &Release, cancel: &AtomicBool, tx: &mpsc::Sender<Event>) -> Result<PathBuf> {
     let bytes = get(&r.manifest_url, 16384, cancel, |_, _| {})?;
-    let sig = get(&r.signature_url, 256, cancel, |_, _| {})?;
-    let signature = std::str::from_utf8(&sig).map_err(err)?;
-    let m = manifest(&bytes, signature, &unhex::<32>(PUBLIC_KEY)?, &r.tag)?;
+    let m = manifest(&bytes, &r.tag)?;
     let exe = get(&r.url, m.size, cancel, |n, _| {
         let _ = tx.send(Event::Progress(n, m.size));
     })?;
@@ -467,7 +442,6 @@ fn download_release(r: &Release, cancel: &AtomicBool, tx: &mpsc::Sender<Event>) 
     fs::create_dir_all(&dir).map_err(err)?;
     let result = (|| {
         fs::write(dir.join(MANIFEST), &bytes).map_err(err)?;
-        fs::write(dir.join(SIGNATURE), &sig).map_err(err)?;
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -678,9 +652,7 @@ extern "system" {
     fn CloseHandle(handle: *mut c_void) -> i32;
 }
 fn verified_stage(dir: &Path) -> Result<Manifest> {
-    if fs::metadata(dir.join(MANIFEST)).map_err(err)?.len() > 16384
-        || fs::metadata(dir.join(SIGNATURE)).map_err(err)?.len() > 256
-    {
+    if fs::metadata(dir.join(MANIFEST)).map_err(err)?.len() > 16384 {
         return Err("Update metadata exceeds size limit".into());
     }
     let bytes = fs::read(dir.join(MANIFEST)).map_err(err)?;
@@ -689,12 +661,7 @@ fn verified_stage(dir: &Path) -> Result<Manifest> {
     }
     let doc: Value = serde_json::from_slice(&bytes).map_err(err)?;
     let tag = doc["version"].as_str().ok_or("Missing version")?;
-    let m = manifest(
-        &bytes,
-        &fs::read_to_string(dir.join(SIGNATURE)).map_err(err)?,
-        &unhex::<32>(PUBLIC_KEY)?,
-        tag,
-    )?;
+    let m = manifest(&bytes, tag)?;
     let exe = dir.join(EXE);
     if fs::metadata(&exe).map_err(err)?.len() > MAX_EXE {
         return Err("Update too large".into());

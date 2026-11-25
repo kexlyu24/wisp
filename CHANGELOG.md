@@ -2,6 +2,31 @@
 
 All notable changes to Wisp in this development checkpoint are documented in this file.
 
+## [0.2.2] - 2026-11-26
+
+### Added
+- **Standalone Settings popup window** (by `@kexlyu24`, #38): moved Settings out of the notch (`TAB_SETTINGS` removed; notch now cycles 7 pages) into a standalone `620×420` Apple dark-mode floating popup (`src/settings_win.rs`) with a 4-category sidebar (**Notch**, **General**, **Appearance**, **Updates**), version + neutral **Quit Wisp** footer, draggable titlebar with center-anchored multi-monitor clamping, smooth spring animations (open/close fade + glide, gliding sidebar capsule, directional section transitions, and gliding Appearance segmented controls), right-aligned compact Updates action button, and full decoupling from notch expand/collapse.
+- **Official Wisp brand icons** (by `@kexlyu24`, #38): added official logo and icon assets under `assets/icons/`, updated `README.md` with the Wisp logo, embedded multi-resolution `wisp.ico` into `wisp.exe` via `build.rs`, updated the system tray icon with theme-aware embedded Wisp marks (purple W on dark taskbars, notch+W on light taskbars), set window class icons, and added the Wisp mark to the Settings popup titlebar.
+- **High-resolution Quick Access icons** (by `@levialavender`, #34): resolves shortcuts via direct path, `SearchPathW`, App Paths registry (`HKCU`/`HKLM`), and `FOLDERID_AppsFolder` (`ms-settings:*`), extracts 96–256 px icons via `IShellItemImageFactory::GetImage` with `SHDefExtractIconW`/`SHGetFileInfoW` fallbacks (including 1-bit mask alpha recovery for legacy icons), and downscales in premultiplied RGBA with Catmull-Rom filtering.
+- **Windows CI & automated draft Releases** (by `@kexlyu24`, #31, #35): `.github/workflows/rust.yml` runs unit tests, release builds, and the smoke test on `windows-latest`; `.github/workflows/release.yml` builds tagged releases and drafts a GitHub Release with the portable ZIP, `wisp-windows-x64.exe`, and (for stable tags) `wisp-update.json`.
+
+### Improved
+- **Quick Access smooth spring scrolling** (by `@kexlyu24`, #37): scrolling through more than 6 shortcuts now glides continuously on a spring (`reduced_motion` snaps immediately) with smoothstep top/bottom edge fades, a continuous right-edge scrollbar pill, and proper row-bound clamping.
+- **Quick Access drag-and-reorder** (by `@levialavender`, #34): replaced thread-local motion with per-card springs (`QuickCardMotion`) integrated into `State::advance` with `reduced_motion` support and `PACE_MOTION` frame pacing, adding live neighbor slot-shift preview, a drop-slot placeholder, subtle lift elevation, and smooth post-drop/cancel settle.
+
+### Changed
+- **In-app updater (HTTPS + SHA-256)** (by `@levialavender`, #34; release workflow by `@kexlyu24`, #35): migrated from Ed25519 signature verification (`update-public-key.hex` and `wisp-update.json.sig`) to HTTPS + SHA-256 verification (`wisp-windows-x64.exe` and `wisp-update.json`) with official GitHub release URL pinning, manifest version/size/SHA-256 checks, and x64 PE validation. Manual checks no longer have a cooldown and are disabled only while a check or download is running.
+
+### Fixed
+- **Quick Access edge cases** (by `@levialavender`, #34): fixed the `< 6` items draw loop bug, pointer capture release on drag cancel (Escape, tab switch, search, collapse, `WM_MOUSELEAVE`), mouse-wheel guarding during drag, and scroll clamping after deleting items.
+- **8.3 short `%TEMP%` test compatibility** (by `@kexlyu24`, #31): fixed `test_file_data_object_carries_paths` so it passes on environments whose `%TEMP%` uses Windows 8.3 short paths.
+
+### Known limitations
+- Clients running `0.2.1` (which require Ed25519 `.sig` assets) or `0.2.0` and older cannot auto-update to `0.2.2`; download the `0.2.2` ZIP once to switch to the HTTPS + SHA-256 updater.
+- WhatsApp Web image drops are not supported (blob URLs / virtual-file data).
+- The updater's replace and rollback paths should be exercised end to end on Windows before relying on them in production.
+- Apple Music's volume adapter only detects the app; it does not change the volume yet.
+
 ## [0.2.1] - 2026-11-23
 
 ### Added

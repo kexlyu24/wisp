@@ -18,12 +18,13 @@ An original, animated "dynamic notch" for Windows 10 and 11, inspired by Apple's
 | Shelf | Drop files (or browser images) on it, drag them back out, group them into folders |
 | Quick Access | Search and launch apps or your own shortcuts |
 | Notifications | Recent Windows notifications |
-| Settings | Switches, the background theme, updates, Quit |
+
+- **Settings popup:** clicking the notch header gear icon or tray **Settings…** opens a standalone 620×420 Apple dark-mode floating popup (`Notch`, `General`, `Appearance`, `Updates`, plus `Quit Wisp`).
 
 - **Minimal mode:** when the closed notch would cover real content, such as browser tabs, it shrinks to a sliver.
 - **Supported players:** Spotify, Spotifast, Apple Music (detection only for volume), the SoundCloud app, and Chrome or Edge (YouTube and so on).
 
-Current version: **0.2.1**. Releases: <https://github.com/kexlyu24/wisp/releases>.
+Current version: **0.2.2**. Releases: <https://github.com/kexlyu24/wisp/releases>.
 
 ## People
 
@@ -45,8 +46,10 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 | `src/tasks.rs` | To-do, Pomodoro, Calendar and Quick Access state (Win32-free, unit tested) |
 | `src/todo_input.rs` | Shared single-line text editing (caret, selection, clipboard) |
 | `src/settings.rs` | `settings.txt` and Start with Windows |
-| `src/tray.rs` | Tray icon and menu |
-| `src/updater.rs` | Signed in-app updates from GitHub Releases |
+| `src/settings_win.rs` | Standalone 620×420 Settings popup window (layout, hit-testing, GDI+ paint, Win32 lifecycle) |
+| `src/tray.rs` | Tray icon (embedded Wisp brand icons) and menu |
+| `build.rs` | Compiles `assets/icons/wisp.rc` (`wisp.ico`) into `wisp.exe` via `windres` |
+| `src/updater.rs` | In-app updates from GitHub Releases (HTTPS + SHA-256 verified) |
 | `src/web_drop.rs` | Downloading and validating images dropped from a browser |
 | `src/diagnostics.rs` | Local, privacy-safe log (`wisp.log`) |
 
@@ -59,7 +62,7 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 - **Spotifast volume uses `spotifast volume` / `mute`.** These commands work even while it is minimized, and its UI doesn't. They run one at a time, and Wisp never touches Spotifast's internal files.
 - **Lyrics fall back to NetEase** only when LRCLIB has no synced lyrics, and only on an exact title, artist and length match. NetEase requests are sent without cookies, because its cookie makes search return unrelated songs.
 - **The default look is pure black (OLED).** Frost, Aura and Slate are real frosted glass: Wisp captures the screen behind the panel (its own layered window is never in the capture), blurs it, and tints it. The closed notch is always black.
-- **Updates are Ed25519-signed.** The private key stays on the owner's PC; CI builds releases but never signs them.
+- **Updates use HTTPS + SHA-256 verification.** Wisp pins downloads to official GitHub Releases URLs and verifies manifest version, size, SHA-256, and x64 PE headers before staging and installing (replacing the earlier Ed25519 signing flow; see `docs/UPDATES.md`).
 - **Only events you typed** appear in the calendar. Wisp never imports or invents agenda items.
 - **The "Music Player" picker** that used to be on the Settings page was removed in an earlier PR. Following a player is automatic, or set by `Settings::player`.
 
@@ -70,7 +73,7 @@ feat/… or fix/…  ──PR──▶  dev  ──PR at release──▶  main 
 ```
 
 - **CI** (`.github/workflows/rust.yml`) runs the tests, the release build and the smoke test on Windows for every push and PR to `main` and `dev`.
-- **Releases** (`.github/workflows/release.yml`) build a draft from a version tag. The owner signs the updater files with `scripts/sign-release.py` and publishes.
+- **Releases** (`.github/workflows/release.yml`) build a draft from a version tag with the zip, bare exe, and (for stable tags) `wisp-update.json`. The owner reviews the draft, adds release notes, and publishes.
 - **`UNRELEASED.md`** is the owner's git-ignored notes on changes since the last release. `CHANGELOG.md` is the public history.
 
 ## Open questions
