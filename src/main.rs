@@ -869,16 +869,22 @@ struct QuickCardMotion {
     vx: f64,
     vy: f64,
 }
+const QUICK_Y0: f64 = 86.;
+const QUICK_ROWS: usize = 3;
 const QUICK_CARD_W: f64 = 190.;
 const QUICK_CARD_H: f64 = 44.;
 const QUICK_CARD_GAP_X: f64 = 12.;
 const QUICK_CARD_GAP_Y: f64 = 8.;
+const QUICK_ROW_STEP: f64 = QUICK_CARD_H + QUICK_CARD_GAP_Y;
+fn quick_max_scroll(count: usize) -> usize {
+    count.div_ceil(2).saturating_sub(QUICK_ROWS)
+}
 fn quick_card_pos(slot: usize) -> (f64, f64) {
     let col = slot % 2;
     let row = slot / 2;
     (
         24. + col as f64 * (QUICK_CARD_W + QUICK_CARD_GAP_X),
-        86. + row as f64 * (QUICK_CARD_H + QUICK_CARD_GAP_Y),
+        QUICK_Y0 + row as f64 * QUICK_ROW_STEP,
     )
 }
 fn quick_preview_slot(idx: usize, from: usize, to: Option<usize>) -> usize {
@@ -965,6 +971,8 @@ struct State {
     quick_input: String,
     quick_editing: bool,
     quick_scroll: usize,
+    quick_scroll_pos: f64,
+    quick_scroll_vel: f64,
     quick_drag: Option<(usize, f64, f64, bool)>,
     quick_pointer: (f64, f64),
     quick_drag_hover: Option<usize>,
@@ -1260,6 +1268,8 @@ impl State {
             quick_input: String::new(),
             quick_editing: false,
             quick_scroll: 0,
+            quick_scroll_pos: 0.,
+            quick_scroll_vel: 0.,
             quick_drag: None,
             quick_pointer: (0., 0.),
             quick_drag_hover: None,
@@ -1989,7 +1999,7 @@ impl State {
             }
             return -1;
         }
-        let start_idx = self.quick_scroll * 2;
+        let start_idx = self.quick_scroll.min(quick_max_scroll(filtered.len())) * 2;
         for k in 0..6 {
             let item_idx = start_idx + k;
             if item_idx >= filtered.len() {
@@ -2047,6 +2057,8 @@ impl State {
                 self.quick_input.clear();
                 self.input_editors[1] = todo_input::Editor::with_limit(80);
                 self.quick_scroll = 0;
+                self.quick_scroll_pos = 0.;
+                self.quick_scroll_vel = 0.;
             }
             6002 => {
                 self.quick_add_mode = !self.quick_add_mode;
@@ -2101,12 +2113,7 @@ impl State {
                         .position(|it| it.name == target_name && it.command == target_cmd)
                     {
                         self.quick_items.remove(pos);
-                        let max_scroll = if self.quick_items.len() > 6 {
-                            self.quick_items.len().saturating_sub(1) / 2
-                        } else {
-                            0
-                        };
-                        self.quick_scroll = self.quick_scroll.min(max_scroll);
+                        self.clamp_quick_scroll(false);
                         self.sync_quick_motion(true);
                         if !self.smoke {
                             tasks::save_quick_items(&self.quick_items);
@@ -2750,6 +2757,23 @@ impl State {
                 dt,
             )
         };
+        self.clamp_quick_scroll(false);
+        let quick_scroll_animating = if self.reduced_motion {
+            let moving =
+                self.quick_scroll_pos != self.quick_scroll as f64 || self.quick_scroll_vel != 0.;
+            self.quick_scroll_pos = self.quick_scroll as f64;
+            self.quick_scroll_vel = 0.;
+            moving
+        } else {
+            spring(
+                &mut self.quick_scroll_pos,
+                &mut self.quick_scroll_vel,
+                self.quick_scroll as f64,
+                22.,
+                0.86,
+                dt,
+            )
+        };
         let quick_animating = self.advance_quick_motion(dt);
         geom_animating
             || play_animating
@@ -2770,15 +2794,23 @@ impl State {
             || dismissing_animating
             || notif_bell_animating
             || notif_badge_animating
+            || quick_scroll_animating
             || quick_animating
+    }
+    fn clamp_quick_scroll(&mut self, snap: bool) {
+        let filtered_len = tasks::filter_quick_items(&self.quick_items, &self.quick_input).len();
+        self.quick_scroll = self.quick_scroll.min(quick_max_scroll(filtered_len));
+        if snap {
+            self.quick_scroll_pos = self.quick_scroll as f64;
+            self.quick_scroll_vel = 0.;
+        }
     }
     fn sync_quick_motion(&mut self, snap: bool) {
         let len = self.quick_items.len();
-        let start_idx = self.quick_scroll * 2;
         if snap || self.quick_motion.len() != len {
             self.quick_motion = (0..len)
                 .map(|i| {
-                    let (x, y) = quick_card_pos(i.saturating_sub(start_idx));
+                    let (x, y) = quick_card_pos(i);
                     QuickCardMotion {
                         x,
                         y,
@@ -2821,13 +2853,11 @@ impl State {
                 dt,
             )
         };
-        let start_idx = self.quick_scroll * 2;
-        let end_idx = (start_idx + 6).min(self.quick_motion.len());
         let mut cards_moving = false;
-        for i in start_idx..end_idx {
+        for i in 0..self.quick_motion.len() {
             let (tx, ty, omega, zeta) = if let Some((from, sx, sy, _)) = active_drag {
                 if i == from {
-                    let (bx, by) = quick_card_pos(from.saturating_sub(start_idx));
+                    let (bx, by) = quick_card_pos(from);
                     (
                         bx + (self.quick_pointer.0 - sx),
                         by + (self.quick_pointer.1 - sy),
@@ -2836,11 +2866,11 @@ impl State {
                     )
                 } else {
                     let slot = quick_preview_slot(i, from, self.quick_drag_hover);
-                    let (bx, by) = quick_card_pos(slot.saturating_sub(start_idx));
+                    let (bx, by) = quick_card_pos(slot);
                     (bx, by, 24., 0.85)
                 }
             } else {
-                let (bx, by) = quick_card_pos(i.saturating_sub(start_idx));
+                let (bx, by) = quick_card_pos(i);
                 (bx, by, 24., 0.85)
             };
             let m = &mut self.quick_motion[i];
@@ -7205,6 +7235,7 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
     }
 
     let start_idx = s.quick_scroll * 2;
+    let scroll_offset_y = s.quick_scroll_pos * QUICK_ROW_STEP;
     let unfiltered = s.quick_input.trim().is_empty();
     let dragged = s
         .quick_drag
@@ -7214,7 +7245,8 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
     if unfiltered && dragged.is_some() {
         if let Some(slot) = s.quick_drag_hover {
             if slot >= start_idx && slot < start_idx + 6 {
-                let (tx, ty) = quick_card_pos(slot - start_idx);
+                let (tx, gy) = quick_card_pos(slot);
+                let ty = gy - scroll_offset_y;
                 round_opt(
                     s,
                     tx,
@@ -7229,23 +7261,47 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
             }
         }
     }
-    let mut order: Vec<usize> = (0..6).collect();
-    order.sort_by_key(|k| Some(start_idx + *k) == top_card);
-    for k in order {
-        let item_idx = start_idx + k;
-        if item_idx >= filtered.len() {
-            continue;
+    let total_rows = filtered.len().div_ceil(2);
+    let first_row = (s.quick_scroll_pos.floor() as isize - 1).max(0) as usize;
+    let last_row = (s.quick_scroll_pos.ceil() as usize + QUICK_ROWS).min(total_rows);
+    let vis_start = (first_row * 2).min(filtered.len());
+    let vis_end = (last_row * 2).min(filtered.len());
+    let mut order: Vec<usize> = (vis_start..vis_end).collect();
+    if let Some(tc) = top_card {
+        if tc < filtered.len() && !order.contains(&tc) {
+            order.push(tc);
         }
-        let (cx, cy) = if unfiltered && item_idx < s.quick_motion.len() {
+    }
+    order.sort_by_key(|idx| Some(*idx) == top_card);
+    let bottom_row_y = QUICK_Y0 + (QUICK_ROWS - 1) as f64 * QUICK_ROW_STEP;
+    let bottom_clip_y = QUICK_H - QUICK_CARD_H;
+    for item_idx in order {
+        let (cx, gy) = if unfiltered && item_idx < s.quick_motion.len() {
             (s.quick_motion[item_idx].x, s.quick_motion[item_idx].y)
         } else {
-            quick_card_pos(k)
+            quick_card_pos(item_idx)
         };
+        let cy = gy - scroll_offset_y;
         let hit_launch = 8000 + item_idx as i32;
         let hit_del = 7000 + item_idx as i32;
         let card_hover = dragged.is_none() && s.hover == hit_launch;
         let del_hover = dragged.is_none() && s.hover == hit_del;
         let lifted = Some(item_idx) == top_card && s.quick_drag_lift > 0.01;
+        let edge_fade = if lifted {
+            1.0
+        } else if cy < QUICK_Y0 {
+            let t = ((cy - 74.) / (QUICK_Y0 - 74.)).clamp(0., 1.);
+            t * t * (3. - 2. * t)
+        } else if cy > bottom_row_y {
+            let t = ((bottom_clip_y - cy) / (bottom_clip_y - bottom_row_y)).clamp(0., 1.);
+            t * t * (3. - 2. * t)
+        } else {
+            1.0
+        };
+        let card_o = o * edge_fade;
+        if card_o <= 0.001 {
+            continue;
+        }
         if lifted {
             round_opt(
                 s,
@@ -7255,7 +7311,7 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 QUICK_CARD_H,
                 10.,
                 rgb(0, 0, 0),
-                o * 0.42 * s.quick_drag_lift,
+                card_o * 0.42 * s.quick_drag_lift,
                 dx,
             );
         }
@@ -7266,9 +7322,9 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
         } else {
             rgb(28, 28, 30)
         };
-        round_opt(s, cx, cy, QUICK_CARD_W, QUICK_CARD_H, 10., bg, o, dx);
+        round_opt(s, cx, cy, QUICK_CARD_W, QUICK_CARD_H, 10., bg, card_o, dx);
 
-        draw_quick_icon(s, &filtered[item_idx].command, cx + 7., cy + 7., o, dx);
+        draw_quick_icon(s, &filtered[item_idx].command, cx + 7., cy + 7., card_o, dx);
         let text_w = if card_hover || del_hover {
             QUICK_CARD_W - 74.
         } else {
@@ -7285,7 +7341,7 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
             text_w,
             18.,
             false,
-            o,
+            card_o,
             dx,
         );
         if card_hover || del_hover {
@@ -7301,7 +7357,7 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 16.,
                 16.,
                 del_bg,
-                o,
+                card_o,
                 dx,
             );
             text_opt(
@@ -7315,10 +7371,17 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
                 16.,
                 16.,
                 true,
-                o,
+                card_o,
                 dx,
             );
         }
+    }
+    if total_rows > QUICK_ROWS {
+        let track = QUICK_ROW_STEP * QUICK_ROWS as f64 - QUICK_CARD_GAP_Y;
+        let h = (track * QUICK_ROWS as f64 / total_rows as f64).max(14.);
+        let scroll_ratio = (s.quick_scroll_pos / (total_rows - QUICK_ROWS) as f64).clamp(0., 1.);
+        let y = QUICK_Y0 + (track - h) * scroll_ratio;
+        pill_opt(s, QUICK_W - 12., y, 3., h, rgb(72, 72, 76), o, dx);
     }
 }
 // Apple Clock timer layout: progress ring with the countdown, phase picker, and Reset / Start pills.
@@ -10700,17 +10763,21 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 if s.quick_drag.is_some() {
                     return 0;
                 }
-                if msg == 0x020a && s.usable() && s.active_tab == TAB_QUICK && y >= 80. {
+                if msg == 0x020a
+                    && s.usable()
+                    && s.active_tab == TAB_QUICK
+                    && !s.quick_add_mode
+                    && y >= 80.
+                {
                     let filtered_len =
                         tasks::filter_quick_items(&s.quick_items, &s.quick_input).len();
-                    if filtered_len > 6 {
-                        let max_scroll = (filtered_len.saturating_sub(1)) / 2;
+                    let max_scroll = quick_max_scroll(filtered_len);
+                    if max_scroll > 0 {
                         s.quick_scroll = if delta < 0. {
                             (s.quick_scroll + 1).min(max_scroll)
                         } else {
                             s.quick_scroll.saturating_sub(1)
                         };
-                        s.sync_quick_motion(true);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         return 0;
                     }
@@ -11555,7 +11622,8 @@ mod tests {
         // so start from the long form.
         let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let temp = temp.to_string_lossy();
-        let dir = std::path::PathBuf::from(temp.trim_start_matches(r"\\?\")).join("wisp-dragout-test");
+        let dir =
+            std::path::PathBuf::from(temp.trim_start_matches(r"\\?\")).join("wisp-dragout-test");
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let a = dir.join("a.txt");
@@ -11929,6 +11997,46 @@ mod tests {
         assert_eq!(s.quick_drag_lift, 1.);
     }
 
+    #[test]
+    fn quick_scroll_spring_animates_clamps_and_respects_reduced_motion() {
+        assert_eq!(quick_max_scroll(0), 0);
+        assert_eq!(quick_max_scroll(6), 0);
+        assert_eq!(quick_max_scroll(7), 1);
+        assert_eq!(quick_max_scroll(8), 1);
+        assert_eq!(quick_max_scroll(9), 2);
+        assert_eq!(quick_max_scroll(10), 2);
+
+        let mut s = create_test_state();
+        s.active_tab = TAB_QUICK;
+        s.tab_to = TAB_QUICK;
+        s.panel_w = QUICK_W;
+        s.panel_h = QUICK_H;
+        while s.quick_items.len() < 10 {
+            s.quick_items.push(tasks::QuickItem {
+                name: format!("App {}", s.quick_items.len()),
+                command: "notepad".into(),
+            });
+        }
+
+        s.quick_scroll = 2;
+        s.quick_scroll_pos = 0.;
+        s.quick_scroll_vel = 0.;
+        assert!(s.advance(0.016));
+        assert!(s.quick_scroll_pos > 0. && s.quick_scroll_pos < 2.);
+
+        // Clamping when list shrinks
+        s.quick_items.truncate(7);
+        s.clamp_quick_scroll(false);
+        assert_eq!(s.quick_scroll, 1);
+
+        // Reduced motion snaps immediately
+        s.reduced_motion = true;
+        s.quick_scroll_pos = 0.;
+        s.advance(0.016);
+        assert_eq!(s.quick_scroll_pos, 1.);
+        assert_eq!(s.quick_scroll_vel, 0.);
+    }
+
     fn create_test_state() -> State {
         State {
             expanded: true,
@@ -11983,6 +12091,8 @@ mod tests {
             quick_input: String::new(),
             quick_editing: false,
             quick_scroll: 0,
+            quick_scroll_pos: 0.,
+            quick_scroll_vel: 0.,
             quick_drag: None,
             quick_pointer: (0., 0.),
             quick_drag_hover: None,
