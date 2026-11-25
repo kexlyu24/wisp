@@ -6,6 +6,7 @@ mod media;
 mod notify;
 mod render;
 mod settings;
+mod settings_win;
 mod tasks;
 mod todo_input;
 mod tray;
