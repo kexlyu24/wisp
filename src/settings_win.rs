@@ -1431,11 +1431,28 @@ impl SettingsWindow {
                     16.,
                     false,
                 );
+                let body_y = UPD_CARD_Y + UPD_AUTO_H;
+                let downloading = u.phase == updater::Phase::Downloading;
+                let notes_vec: Vec<String> = if !downloading {
+                    u.release
+                        .as_ref()
+                        .map(|rel| {
+                            update_note_lines(&rel.notes)
+                                .into_iter()
+                                .take(UPD_NOTE_LINES)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let (card1_h, log_card_y) = updates_card_heights(downloading, notes_vec.len());
+
                 r.round(
                     CONTENT_X,
                     cy_off(UPD_CARD_Y),
                     CONTENT_W,
-                    UPD_AUTO_H + UPD_BODY_H,
+                    card1_h,
                     12.,
                     cf(CARD_BG),
                 );
@@ -1487,77 +1504,28 @@ impl SettingsWindow {
                     cf(ROW_SEP),
                 );
 
-                // Status + version + progress + release notes + buttons
-                let body_y = UPD_CARD_Y + UPD_AUTO_H;
-                let status_lines = update_note_lines(&u.status);
-                for (i, line) in status_lines.iter().take(2).enumerate() {
-                    draw_c_text(
-                        7,
-                        line,
-                        WHITE,
-                        CONTENT_X + 14.,
-                        body_y + 8. + i as f64 * 16.,
-                        CONTENT_W - 28.,
-                        16.,
-                        false,
-                    );
-                }
+                // Row 2: Status + Current version on left, primary action button on right
+                let status_w = UPD_ACTION_X - (CONTENT_X + 14.) - 10.;
+                draw_c_text(
+                    7,
+                    &u.status,
+                    WHITE,
+                    CONTENT_X + 14.,
+                    body_y + 11.,
+                    status_w,
+                    18.,
+                    false,
+                );
                 draw_c_text(
                     3,
                     concat!("Current version: Wisp ", env!("CARGO_PKG_VERSION")),
                     SECONDARY,
                     CONTENT_X + 14.,
-                    body_y + 42.,
-                    CONTENT_W - 28.,
+                    body_y + 31.,
+                    status_w,
                     16.,
                     false,
                 );
-                if u.phase == updater::Phase::Downloading && u.progress.1 > 0 {
-                    let frac = (u.progress.0 as f64 / u.progress.1 as f64).clamp(0., 1.);
-                    r.round(
-                        CONTENT_X + 14.,
-                        cy_off(body_y + 66.),
-                        CONTENT_W - 74.,
-                        4.,
-                        2.,
-                        cf(rgb(44, 44, 48)),
-                    );
-                    r.round(
-                        CONTENT_X + 14.,
-                        cy_off(body_y + 66.),
-                        (CONTENT_W - 74.) * frac,
-                        4.,
-                        2.,
-                        cf(BLUE),
-                    );
-                    draw_c_text(
-                        3,
-                        &format!("{:.0}%", frac * 100.),
-                        SECONDARY,
-                        CONTENT_X + CONTENT_W - 56.,
-                        body_y + 60.,
-                        42.,
-                        16.,
-                        true,
-                    );
-                } else if let Some(rel) = &u.release {
-                    for (i, line) in update_note_lines(&rel.notes)
-                        .iter()
-                        .take(UPD_NOTE_LINES)
-                        .enumerate()
-                    {
-                        draw_c_text(
-                            3,
-                            line,
-                            SECONDARY,
-                            CONTENT_X + 14.,
-                            body_y + 62. + i as f64 * 16.,
-                            CONTENT_W - 28.,
-                            16.,
-                            false,
-                        );
-                    }
-                }
                 let action_lbl = match u.phase {
                     updater::Phase::Checking => "Checking...",
                     updater::Phase::Downloading => "Downloading...",
@@ -1579,7 +1547,7 @@ impl SettingsWindow {
                     cy_off(UPD_ACTION_Y),
                     UPD_ACTION_W,
                     UPD_ACTION_H,
-                    15.,
+                    UPD_ACTION_H / 2.,
                     cf(act_bg),
                 );
                 draw_c_text(
@@ -1592,7 +1560,52 @@ impl SettingsWindow {
                     UPD_ACTION_H,
                     true,
                 );
-                if u.phase == updater::Phase::Downloading {
+
+                // Optional Row 3: Download progress + Cancel OR release notes
+                let extra_y = body_y + UPD_STATUS_H;
+                if downloading {
+                    r.round(
+                        CONTENT_X + 14.,
+                        cy_off(extra_y - 1.),
+                        CONTENT_W - 14.,
+                        1.,
+                        0.,
+                        cf(ROW_SEP),
+                    );
+                    let frac = if u.progress.1 > 0 {
+                        (u.progress.0 as f64 / u.progress.1 as f64).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+                    let bar_w = UPD_CANCEL_X - (CONTENT_X + 14.) - 58.;
+                    r.round(
+                        CONTENT_X + 14.,
+                        cy_off(extra_y + 19.),
+                        bar_w,
+                        4.,
+                        2.,
+                        cf(rgb(44, 44, 48)),
+                    );
+                    if frac > 0.005 {
+                        r.round(
+                            CONTENT_X + 14.,
+                            cy_off(extra_y + 19.),
+                            bar_w * frac,
+                            4.,
+                            2.,
+                            cf(BLUE),
+                        );
+                    }
+                    draw_c_text(
+                        3,
+                        &format!("{:.0}%", frac * 100.),
+                        SECONDARY,
+                        CONTENT_X + 14. + bar_w + 6.,
+                        extra_y + 13.,
+                        44.,
+                        16.,
+                        true,
+                    );
                     let cancel_bg = if sw.pressed == HIT_UPD_CANCEL {
                         rgb(54, 54, 58)
                     } else if sw.hover == HIT_UPD_CANCEL {
@@ -1602,10 +1615,10 @@ impl SettingsWindow {
                     };
                     r.round(
                         UPD_CANCEL_X,
-                        cy_off(UPD_ACTION_Y),
+                        cy_off(UPD_CANCEL_Y),
                         UPD_CANCEL_W,
-                        UPD_ACTION_H,
-                        15.,
+                        UPD_CANCEL_H,
+                        UPD_CANCEL_H / 2.,
                         cf(cancel_bg),
                     );
                     draw_c_text(
@@ -1613,17 +1626,38 @@ impl SettingsWindow {
                         "Cancel",
                         WHITE,
                         UPD_CANCEL_X,
-                        UPD_ACTION_Y,
+                        UPD_CANCEL_Y,
                         UPD_CANCEL_W,
-                        UPD_ACTION_H,
+                        UPD_CANCEL_H,
                         true,
                     );
+                } else if !notes_vec.is_empty() {
+                    r.round(
+                        CONTENT_X + 14.,
+                        cy_off(extra_y - 1.),
+                        CONTENT_W - 14.,
+                        1.,
+                        0.,
+                        cf(ROW_SEP),
+                    );
+                    for (i, line) in notes_vec.iter().enumerate() {
+                        draw_c_text(
+                            3,
+                            line,
+                            SECONDARY,
+                            CONTENT_X + 14.,
+                            extra_y + 9. + i as f64 * 16.,
+                            CONTENT_W - 28.,
+                            16.,
+                            false,
+                        );
+                    }
                 }
 
                 // Card 2: Troubleshooting log info (non-interactive)
                 r.round(
                     CONTENT_X,
-                    cy_off(UPD_LOG_CARD_Y),
+                    cy_off(log_card_y),
                     CONTENT_W,
                     UPD_LOG_CARD_H,
                     12.,
@@ -1634,7 +1668,7 @@ impl SettingsWindow {
                     "Troubleshooting log",
                     WHITE,
                     CONTENT_X + 14.,
-                    UPD_LOG_CARD_Y + 9.,
+                    log_card_y + 9.,
                     260.,
                     18.,
                     false,
@@ -1644,7 +1678,7 @@ impl SettingsWindow {
                     "%APPDATA%\\Wisp\\wisp.log (stays local)",
                     SECONDARY,
                     CONTENT_X + 14.,
-                    UPD_LOG_CARD_Y + 29.,
+                    log_card_y + 29.,
                     300.,
                     16.,
                     false,
@@ -1654,7 +1688,7 @@ impl SettingsWindow {
                     "Local only",
                     TERTIARY,
                     CONTENT_X + CONTENT_W - 80.,
-                    UPD_LOG_CARD_Y + 18.,
+                    log_card_y + 18.,
                     66.,
                     18.,
                     true,
@@ -1983,16 +2017,30 @@ pub const TEXT_DRAW_FLAGS: u32 = 0x20 | 0x4 | 0x0800 | 0x8000;
 
 pub const UPD_CARD_Y: f64 = 114.;
 pub const UPD_AUTO_H: f64 = 52.;
-pub const UPD_BODY_H: f64 = 172.;
+pub const UPD_STATUS_H: f64 = 58.;
 pub const UPD_NOTE_LINES: usize = 4;
-pub const UPD_ACTION_X: f64 = CONTENT_X + 14.;
-pub const UPD_ACTION_Y: f64 = 298.;
-pub const UPD_ACTION_W: f64 = 160.;
-pub const UPD_ACTION_H: f64 = 30.;
-pub const UPD_CANCEL_X: f64 = 372.;
-pub const UPD_CANCEL_W: f64 = 88.;
-pub const UPD_LOG_CARD_Y: f64 = 350.;
+pub const UPD_ACTION_W: f64 = 142.;
+pub const UPD_ACTION_H: f64 = 28.;
+pub const UPD_ACTION_X: f64 = CONTENT_X + CONTENT_W - 14. - UPD_ACTION_W;
+pub const UPD_ACTION_Y: f64 = UPD_CARD_Y + UPD_AUTO_H + (UPD_STATUS_H - UPD_ACTION_H) / 2.;
+pub const UPD_CANCEL_W: f64 = 80.;
+pub const UPD_CANCEL_H: f64 = 26.;
+pub const UPD_CANCEL_X: f64 = CONTENT_X + CONTENT_W - 14. - UPD_CANCEL_W;
+pub const UPD_CANCEL_Y: f64 = UPD_CARD_Y + UPD_AUTO_H + UPD_STATUS_H + 8.;
 pub const UPD_LOG_CARD_H: f64 = 54.;
+
+pub fn updates_card_heights(downloading: bool, note_lines: usize) -> (f64, f64) {
+    let extra = if downloading {
+        42.
+    } else if note_lines > 0 {
+        18. + (note_lines.min(UPD_NOTE_LINES) as f64) * 16.
+    } else {
+        0.
+    };
+    let card1_h = UPD_AUTO_H + UPD_STATUS_H + extra;
+    let log_card_y = UPD_CARD_Y + card1_h + 12.;
+    (card1_h, log_card_y)
+}
 
 pub const HIT_NONE: i32 = -1;
 pub const HIT_TITLEBAR: i32 = 1;
@@ -2218,7 +2266,7 @@ pub fn hit_test(ctx: HitContext, x: f64, y: f64) -> i32 {
                 && in_rect(
                     x,
                     y,
-                    (UPD_CANCEL_X, UPD_ACTION_Y, UPD_CANCEL_W, UPD_ACTION_H),
+                    (UPD_CANCEL_X, UPD_CANCEL_Y, UPD_CANCEL_W, UPD_CANCEL_H),
                 )
             {
                 return HIT_UPD_CANCEL;
@@ -2465,11 +2513,11 @@ mod tests {
         let idle = ctx(SettingsSection::Updates);
         assert_eq!(hit_test(idle, 350., UPD_CARD_Y + 26.), HIT_UPD_AUTO);
         assert_eq!(
-            hit_test(idle, UPD_ACTION_X + 60., UPD_ACTION_Y + 15.),
+            hit_test(idle, UPD_ACTION_X + 60., UPD_ACTION_Y + 14.),
             HIT_UPD_ACTION
         );
         assert_eq!(
-            hit_test(idle, UPD_CANCEL_X + 40., UPD_ACTION_Y + 15.),
+            hit_test(idle, UPD_CANCEL_X + 40., UPD_CANCEL_Y + 13.),
             HIT_NONE
         );
 
@@ -2479,11 +2527,11 @@ mod tests {
             ..idle
         };
         assert_eq!(
-            hit_test(downloading, UPD_ACTION_X + 60., UPD_ACTION_Y + 15.),
+            hit_test(downloading, UPD_ACTION_X + 60., UPD_ACTION_Y + 14.),
             HIT_NONE
         );
         assert_eq!(
-            hit_test(downloading, UPD_CANCEL_X + 40., UPD_ACTION_Y + 15.),
+            hit_test(downloading, UPD_CANCEL_X + 40., UPD_CANCEL_Y + 13.),
             HIT_UPD_CANCEL
         );
     }
@@ -2593,8 +2641,15 @@ mod tests {
     fn text_draw_flags_include_dt_noprefix_and_updates_fits_four_note_lines() {
         assert_ne!(TEXT_DRAW_FLAGS & 0x0800, 0);
         assert_eq!(UPD_NOTE_LINES, 4);
-        assert!(UPD_CARD_Y + UPD_AUTO_H + UPD_BODY_H < UPD_LOG_CARD_Y);
-        assert!(UPD_LOG_CARD_Y + UPD_LOG_CARD_H < SET_WIN_H);
+        let (idle_h, idle_log_y) = updates_card_heights(false, 0);
+        assert_eq!(idle_h, UPD_AUTO_H + UPD_STATUS_H);
+        assert!(UPD_CARD_Y + idle_h < idle_log_y);
+        let (notes_h, notes_log_y) = updates_card_heights(false, UPD_NOTE_LINES);
+        assert!(UPD_CARD_Y + notes_h < notes_log_y);
+        assert!(notes_log_y + UPD_LOG_CARD_H < SET_WIN_H);
+        let (dl_h, dl_log_y) = updates_card_heights(true, 0);
+        assert!(UPD_CARD_Y + dl_h < dl_log_y);
+        assert!(dl_log_y + UPD_LOG_CARD_H < SET_WIN_H);
     }
 
     #[test]
