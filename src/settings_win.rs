@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    blend_color, cached_text_into, render, rgb, settings, update_note_lines, updater, wide,
+    blend_color, cached_text_into, render, rgb, settings, tray, update_note_lines, updater, wide,
     BeginPaint, BitmapInfo, Blend, CreateCompatibleDC, CreateDIBSection, CreateWindowExW,
     DefWindowProcW, DeleteDC, DeleteObject, DestroyWindow, EndPaint, GetModuleHandleW,
     GetWindowLongPtrW, GetWindowRect, Handle, Hwnd, InvalidateRect, LoadCursorW, MouseTracking,
@@ -98,6 +98,8 @@ pub struct SettingsWindow {
     w_px: i32,
     h_px: i32,
     renderer: Option<render::Renderer>,
+    title_icon: Vec<u32>,
+    title_icon_px: i32,
     hover: i32,
     pressed: i32,
     blur_drag: bool,
@@ -133,6 +135,8 @@ impl SettingsWindow {
             w_px: 0,
             h_px: 0,
             renderer: None,
+            title_icon: Vec::new(),
+            title_icon_px: 0,
             hover: HIT_NONE,
             pressed: HIT_NONE,
             blur_drag: false,
@@ -356,12 +360,12 @@ impl SettingsWindow {
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance,
-                icon: null_mut(),
+                icon: tray::make_window_icon(32),
                 cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
                 background: null_mut(),
                 menu: std::ptr::null(),
                 name: class.as_ptr(),
-                small_icon: null_mut(),
+                small_icon: tray::make_window_icon(16),
             };
             if RegisterClassExW(&wc) == 0 {
                 CLASS_REGISTERED.store(false, Ordering::Release);
@@ -416,6 +420,8 @@ impl SettingsWindow {
         }
         let original = SelectObject(dc, bitmap);
         let renderer = Some(render::Renderer::new(pixels.cast(), stride, h_px, scale));
+        let title_icon_px = (20. * scale).round().max(16.) as i32;
+        let title_icon = tray::titlebar_mark_bgra(title_icon_px as u32).unwrap_or_default();
         SetWindowLongPtrW(hwnd, -21, (state as *mut State) as isize);
         let sw = &mut state.settings_win;
         sw.hwnd = hwnd;
@@ -427,6 +433,8 @@ impl SettingsWindow {
         sw.w_px = w_px;
         sw.h_px = h_px;
         sw.renderer = renderer;
+        sw.title_icon = title_icon;
+        sw.title_icon_px = title_icon_px;
         sw.pos = Some((x, y));
         true
     }
@@ -783,10 +791,19 @@ impl SettingsWindow {
             DIVIDER,
         );
 
-        // 2. Titlebar: Wisp pill emblem, "Wisp Settings", circular Close button
-        r.round(16., 15., 20., 10., 5., WHITE);
-        r.ellipse(31.5, 20., 2., 2., SIDEBAR_BG);
-        draw_text(7, "Wisp Settings", WHITE, 44., 10., 180., 20., false);
+        // 2. Titlebar: Wisp brand mark, "Wisp Settings", circular Close button
+        if !sw.title_icon.is_empty() && sw.title_icon_px > 0 {
+            blit_premul_icon(
+                sw.pixels,
+                sw.stride,
+                sw.h_px,
+                &sw.title_icon,
+                sw.title_icon_px,
+                px(14.),
+                px(10.),
+            );
+        }
+        draw_text(7, "Wisp Settings", WHITE, 40., 10., 180., 20., false);
 
         let close_hot = sw.hover == HIT_CLOSE || sw.pressed == HIT_CLOSE;
         if close_hot {
@@ -1748,6 +1765,49 @@ impl Drop for SettingsWindow {
     fn drop(&mut self) {
         unsafe {
             self.destroy();
+        }
+    }
+}
+
+unsafe fn blit_premul_icon(
+    dst: *mut u32,
+    dst_stride: usize,
+    dst_h: i32,
+    icon: &[u32],
+    icon_size: i32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    for sy in 0..icon_size {
+        let dy = dst_y + sy;
+        if dy < 0 || dy >= dst_h {
+            continue;
+        }
+        for sx in 0..icon_size {
+            let dx = dst_x + sx;
+            if dx < 0 || dx >= dst_stride as i32 {
+                continue;
+            }
+            let src = icon[(sy * icon_size + sx) as usize];
+            let sa = src >> 24;
+            if sa == 0 {
+                continue;
+            }
+            let idx = dy as usize * dst_stride + dx as usize;
+            if sa == 255 {
+                *dst.add(idx) = src;
+            } else {
+                let bg = *dst.add(idx);
+                let inv = 255 - sa;
+                let out_b = (src & 0xff) + (((bg & 0xff) * inv + 127) / 255);
+                let out_g = ((src >> 8) & 0xff) + ((((bg >> 8) & 0xff) * inv + 127) / 255);
+                let out_r = ((src >> 16) & 0xff) + ((((bg >> 16) & 0xff) * inv + 127) / 255);
+                let out_a = sa + (((bg >> 24) * inv + 127) / 255);
+                *dst.add(idx) = (out_a.min(255) << 24)
+                    | (out_r.min(255) << 16)
+                    | (out_g.min(255) << 8)
+                    | out_b.min(255);
+            }
         }
     }
 }

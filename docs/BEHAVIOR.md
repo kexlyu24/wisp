@@ -74,7 +74,7 @@ A native file holding shelf inspired by Apple Dynamic Island and macOS notch she
 - **Header Navigation & Tabs**:
   - **Now Playing** (music note), **Calendar** (calendar icon), and **Shelf** (tray icon, with an item-count badge) are separate pages.
   - **No menus on the notch**: everything is reached from the header tabs, the drop zone (click to add files) and the header Clear button.
-  - **Tray icon**: Wisp sits in the notification area as a small Dynamic Island glyph (white on a dark taskbar, black on a light one; it follows theme changes). Click or right-click it for its menu: **Settings…**, which opens and focuses the standalone Settings popup window without opening or holding the notch, and **Quit Wisp**. On Windows 10 new tray icons start in the hidden overflow (the ^ arrow); drag the icon onto the taskbar to keep it visible. The icon is added back if Explorer restarts.
+  - **Tray icon**: Wisp sits in the notification area with its Wisp brand icon (notch+W icon on a light taskbar, vibrant purple W mark on a dark taskbar; it follows theme changes). Click or right-click it for its menu: **Settings…**, which opens and focuses the standalone Settings popup window without opening or holding the notch, and **Quit Wisp**. On Windows 10 new tray icons start in the hidden overflow (the ^ arrow); drag the icon onto the taskbar to keep it visible. The icon is added back if Explorer restarts.
   - **Clear**: Header action button to quickly clear all stored items from the shelf.
 - **Empty Drop Zone**: a quiet rounded drop zone with a tray icon, "Drop files here" and "or click to choose files"; clicking anywhere in it opens the native Windows file dialog (`GetOpenFileNameW`).
 - **Interactive File Cards**:

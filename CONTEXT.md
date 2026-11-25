@@ -47,7 +47,8 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 | `src/todo_input.rs` | Shared single-line text editing (caret, selection, clipboard) |
 | `src/settings.rs` | `settings.txt` and Start with Windows |
 | `src/settings_win.rs` | Standalone 620×420 Settings popup window (layout, hit-testing, GDI+ paint, Win32 lifecycle) |
-| `src/tray.rs` | Tray icon and menu |
+| `src/tray.rs` | Tray icon (embedded Wisp brand icons) and menu |
+| `build.rs` | Compiles `assets/icons/wisp.rc` (`wisp.ico`) into `wisp.exe` via `windres` |
 | `src/updater.rs` | In-app updates from GitHub Releases (HTTPS + SHA-256 verified) |
 | `src/web_drop.rs` | Downloading and validating images dropped from a browser |
 | `src/diagnostics.rs` | Local, privacy-safe log (`wisp.log`) |

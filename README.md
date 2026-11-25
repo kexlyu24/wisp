@@ -1,6 +1,6 @@
 <div align="center">
 
-# Wisp
+<img src="assets/icons/wisp-logo.png" alt="Wisp" width="180">
 
 **A Dynamic Island–style notch for Windows, inspired by Apple's design.**
 

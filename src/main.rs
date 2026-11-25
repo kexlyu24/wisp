@@ -10661,12 +10661,12 @@ fn main() {
             cls_extra: 0,
             wnd_extra: 0,
             instance,
-            icon: null_mut(),
+            icon: tray::make_window_icon(32),
             cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
             background: null_mut(),
             menu: std::ptr::null(),
             name: class.as_ptr(),
-            small_icon: null_mut(),
+            small_icon: tray::make_window_icon(16),
         };
         if RegisterClassExW(&wc) == 0 {
             diagnostics::failure(
