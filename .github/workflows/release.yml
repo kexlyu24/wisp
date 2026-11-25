@@ -1,9 +1,9 @@
 name: Release
 
 # Pushing a version tag (v0.2.2, or a hotfix like v0.2.2hf) builds Wisp on Windows and attaches
-# the zip and the bare exe to a *draft* GitHub Release. The updater files (wisp-update.json and
-# its .sig) are signed afterwards on the owner's PC with scripts/sign-release.py: the private
-# signing key never comes to GitHub.
+# the portable zip, the bare exe, and (for non-hotfix stable tags) the SHA-256 updater manifest
+# wisp-update.json to a *draft* GitHub Release. Review the draft on GitHub, add the notes, then
+# publish it.
 on:
   push:
     tags: [ "v*" ]
@@ -63,6 +63,10 @@ jobs:
         Copy-Item assets/fonts/Inter-LICENSE.txt "out/$name/Inter-LICENSE.txt"
         Compress-Archive -Path "out/$name" -DestinationPath "out/$name.zip"
         Copy-Item target/release/wisp.exe out/wisp-windows-x64.exe
+        if ($env:VERSION -notmatch 'hf$') {
+          python scripts/package-update.py --exe target/release/wisp.exe --version $env:VERSION --out out/update
+          Copy-Item out/update/wisp-update.json out/wisp-update.json
+        }
         Get-FileHash "out/$name.zip", out/wisp-windows-x64.exe -Algorithm SHA256 | Format-Table Hash, Path -AutoSize | Out-String -Width 200
 
     - name: Draft the GitHub Release
@@ -71,12 +75,15 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         $tag = "${{ github.ref_name }}"
-        $assets = "out/Wisp-$env:VERSION-windows-x64.zip", "out/wisp-windows-x64.exe"
+        $assets = @("out/Wisp-$env:VERSION-windows-x64.zip", "out/wisp-windows-x64.exe")
+        if (Test-Path out/wisp-update.json) {
+          $assets += "out/wisp-update.json"
+        }
         $draft = gh release view $tag --json isDraft --jq .isDraft 2>$null
         if ($LASTEXITCODE -eq 0) {
           # Re-running only refreshes a draft; a published release is never overwritten.
           if ($draft -ne 'true') { throw "release $tag is already published; not touching it" }
           gh release upload $tag @assets --clobber
         } else {
-          gh release create $tag @assets --draft --verify-tag --title "Wisp $env:VERSION" --notes "Draft built by CI. Sign the updater files with scripts/sign-release.py, add the release notes, then publish."
+          gh release create $tag @assets --draft --verify-tag --title "Wisp $env:VERSION" --notes "Draft built by CI. Review the assets, add the release notes, then publish."
         }

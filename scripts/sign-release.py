@@ -1,12 +1,13 @@
-"""Sign the exe that the Release workflow built and attach the updater files to its draft.
+"""Generate and attach wisp-update.json to a draft GitHub Release.
 
-The private key stays on this PC: this downloads wisp-windows-x64.exe from the draft Release,
-signs it with package-update.py, and uploads wisp-update.json and wisp-update.json.sig next to
-it. It never publishes; check the draft on GitHub, add the notes, then publish it yourself.
+The Release workflow now attaches wisp-update.json automatically for stable tags,
+so this script is kept as a manual fallback: it downloads wisp-windows-x64.exe from
+the draft Release, generates wisp-update.json via package-update.py (HTTPS + SHA-256),
+and uploads it next to the exe. It never publishes; check the draft on GitHub, add
+the notes, then publish it yourself.
 
-Requires: gh (signed in), python -m pip install cryptography,
-WISP_UPDATE_SIGNING_KEY_FILE as for package-update.py, and a checkout whose Cargo.toml has the
-release's version (package-update.py checks it).
+Requires: gh (signed in), Python 3.11+ (stdlib only), and a checkout whose Cargo.toml
+has the release's version (package-update.py checks it).
 Usage: python scripts/sign-release.py v0.2.2
 """
 import subprocess
@@ -28,12 +29,11 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         run('gh', 'release', 'download', tag, '--pattern', 'wisp-windows-x64.exe', '--dir', str(tmp))
-        out = tmp / 'signed'
+        out = tmp / 'update'
         run(sys.executable, str(repo / 'scripts' / 'package-update.py'),
             '--exe', str(tmp / 'wisp-windows-x64.exe'), '--version', version, '--out', str(out))
-        run('gh', 'release', 'upload', tag, '--clobber',
-            str(out / 'wisp-update.json'), str(out / 'wisp-update.json.sig'))
-    print(f'Signed updater files attached to the {tag} draft. Review it on GitHub, then publish.')
+        run('gh', 'release', 'upload', tag, '--clobber', str(out / 'wisp-update.json'))
+    print(f'Updater manifest (wisp-update.json) attached to the {tag} draft. Review it on GitHub, then publish.')
 
 
 if __name__ == '__main__':

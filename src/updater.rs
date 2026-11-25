@@ -291,7 +291,7 @@ impl Updater {
         if self.phase == Phase::Downloading {
             return;
         }
-        crate::diagnostics::info("updater", "Signed update download started");
+        crate::diagnostics::info("updater", "Update download started");
         self.phase = Phase::Downloading;
         self.status = "Downloading...".into();
         self.progress = (0, 0);
