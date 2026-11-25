@@ -161,7 +161,7 @@ Settings > Updates opens a dedicated page in the existing settings surface.
 It shows the installed version, daily-at-startup automatic-check toggle, current
 status, a four-line release-note preview, download progress/cancellation and
 an explicit Restart & update action. Network work stays off the UI thread.
-Checks never install anything. Unsigned/malformed/mismatched packages are rejected.
+Checks never install anything. Malformed/mismatched packages are rejected.
 Only wisp.exe is replaced; user data stays intact. Startup failure triggers an
 attempt to restore the retained executable backup. See [UPDATES.md](UPDATES.md)
 for the release asset contract, signing, limits and user-run verification.
@@ -228,3 +228,13 @@ The database is undocumented, so every step fails quietly: if it is missing or i
 
 
 Windows 10/11, primary display only. No forked app source; Wisp only starts with Windows if "Start with Windows" is turned on in Settings.
+
+## Quick Access and manual update checks
+
+Quick Access cards display a cached Windows Shell icon and app name only; the
+launch command remains stored but is not displayed. Commands without a resolved
+icon use the generic executable icon. Drag a card onto another to move it in the
+saved order (search must be empty). Movement of 6 logical pixels starts a drag;
+a short click still launches. Dropping outside cards cancels reordering.
+Manual update checks have no one-minute cooldown; concurrent requests remain
+blocked while checking or downloading. Daily automatic checks are unchanged.

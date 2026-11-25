@@ -1,108 +1,89 @@
-# In-app updates
+# In-app updates: HTTPS + SHA-256
 
-Open **Settings > Updates**. Checks use the latest stable GitHub Release in
-`kexlyu24/wisp`; drafts and prereleases are ignored. Automatic checks are enabled
-by default and run at startup only when the last attempt was at least one day
-ago. Turn them off in this page to use manual checks instead.
+Settings > Updates checks the latest stable GitHub Release in kexlyu24/wisp.
+Drafts and prereleases are ignored. Automatic startup checks are optional and
+run at most daily. Manual checks have no cooldown; the button is disabled only while a check or
+download is in progress. Download and installation require explicit user actions.
 
-Nothing downloads or installs without an explicit click. Download runs on a
-worker, shows progress, supports cancellation/retry and verifies an Ed25519
-signature, size, SHA-256 and x64 PE header before becoming ready. Cancellation
-can take up to a network timeout while a synchronous request is blocked.
+## Trust model
 
-**Restart & update** closes Wisp normally, waits for the previous process,
-replaces only `wisp.exe`, then starts the new executable. Its startup health
-marker must arrive within 15 seconds or the helper attempts to restore and
-restart the old executable. This is a startup check, not continuous crash
-monitoring. Keep only one Wisp instance running when updating. The executable
-must be named `wisp.exe`, and its directory must be writable; no elevation is
-requested. A failed operation is reported with a native message and, when
-possible, `%APPDATA%\Wisp\update-error.txt`.
+Update metadata and executable downloads use HTTPS and the Windows trust store.
+Asset URLs must match the official repository and release tag. Wisp checks the
+manifest version, bounded file size, SHA-256 and Windows x64 PE header, and
+rechecks the staged payload before installation. No signing key or signature
+asset is required.
 
-The helper and `wisp-backup-<pid>.exe` are retained next to the application.
-After a successful update, the backup can be kept for manual recovery; remove
-old helper/backup files only while Wisp is closed. There is no background cleanup
-service. A power failure during replacement may require restoring the backup
-manually. Application data in `%APPDATA%\Wisp` is not replaced or migrated.
-A downloaded update is currently staged for this running session; restarting
-without installing requires checking/downloading again.
+SHA-256 detects differences from the manifest; it does not authenticate the
+publisher independently. Anyone who compromises the repository/release account
+can replace both the executable and manifest. Local staging checks also cannot
+authenticate a manifest and payload that a local attacker replaces together.
+Protect release access with strong authentication. This is an intentional
+trade-off compared with the previous Ed25519 design.
 
-## Release assets
+HTTP 403 / GitHub API limits are unchanged by this migration. Do not embed a
+personal GitHub token in distributed executables.
 
-Every compatible stable release must include these **exact** asset names:
+## Release assets and packaging
 
-- `wisp-windows-x64.exe`
-- `wisp-update.json`
-- `wisp-update.json.sig`
+Upload these exact names alongside the normal portable ZIP:
 
-The JSON is signed as exact bytes (do not edit or reformat it after signing):
+- wisp-windows-x64.exe
+- wisp-update.json
+
+The manifest contains version, size in bytes, and a 64-character SHA-256:
 
 ```json
 {"version":"0.2.1","size":1234567,"sha256":"<64 lowercase hex characters>"}
 ```
 
-The signature file is a hex-encoded Ed25519 signature of those bytes. The
-application embeds `update-public-key.hex`. An unsigned historical release is
-reported as unsupported, never installed as a fallback. GitHub release notes
-are displayed as a four-line plain-text preview. There are no Up/Down controls.
-Manual checks have a persisted 60-second cooldown, including failed attempts;
-the primary action is disabled while checking/downloading. This reduces repeated
-requests but does not bypass GitHub rate limits or HTTP 403 responses.
-
-v0.2.1 is the first release meant to carry these assets. Releases up to and
-including v0.2.0 have no updater, so their users install 0.2.1 from the zip once;
-later releases then arrive through Settings > Updates. Pushing a branch is not
-publishing an update.
-
-### Maintainer packaging
-
-The signing seed is stored locally outside the repository at
-`C:\Users\eq\Documents\wisp-update-signing-key.hex`. It was created for 0.2.1,
-replacing the original key, which was lost before any signed release shipped.
-Do not upload that file, paste its contents into chat or commit it. **Back it up
-now** (for example to an encrypted USB drive or a password manager): losing it
-means no later release can be signed in a way existing installations accept.
-Public-key rotation requires a deliberate migration in a trusted release.
-
-1. Set the correct stable `[package].version` in Cargo.toml, matching the tag.
-2. Build the release executable using the supported Windows toolchain.
-3. Install Python `cryptography` in your packaging environment.
-4. Set `WISP_UPDATE_SIGNING_KEY_FILE` to the private seed's path.
-5. Run:
+Set Cargo.toml to the intended stable version and build a fresh Windows release.
+Use Python 3.11+ (standard library only):
 
 ```text
 python scripts/package-update.py --exe target/release/wisp.exe --version 0.2.1 --out dist/update-0.2.1
 ```
 
-6. Upload all three generated assets to the matching `v0.2.1` stable Release,
-   alongside the normal portable ZIP and changelog. Test before publishing.
+Use the actual package version in both arguments and the release tag. The script
+rejects mismatched versions, stale executables, invalid PE architecture, and
+existing output files. It creates two assets and never publishes anything.
+There is no cryptography dependency, private-key environment variable, or public
+key file. Extra historical .sig assets are ignored by this client.
 
-The packaging script refuses a mismatched signing key, invalid version, invalid
-PE architecture, and existing output files. It does not publish anything.
-No GitHub Action or remote signing secret is installed automatically.
-Windows Authenticode/SmartScreen reputation is separate from updater signing.
+## Migration from signature-based clients
 
-## User-run verification
+Existing released clients that require Ed25519 signatures do not gain this
+behavior by changing server metadata. Distribute this new client manually once,
+or deliver it through the old signed pipeline using the key trusted by those
+clients. Keep legacy signature assets for older clients if supporting that path.
+The new packaging script does not produce legacy signatures. Never claim a
+hash-only release will automatically upgrade a signature-requiring client.
 
-The `updater::tests` unit tests pass (`cargo test`, 0.2.1). A real
-download, replace and roll-back has not been run yet; do the checks below.
+## Installation and recovery
 
-- Open Updates; check current version, auto-check toggle persistence and Back.
-- Check while offline; confirm a useful error and responsive UI; retry online.
-- A historical release without signed assets must be rejected.
-- For end-to-end testing, use a disposable writable application directory and
-  isolated APPDATA, then publish a deliberately prepared newer signed test
-  release only after approval. Do not test replacement against the only copy.
-- Download, cancel and retry. A modified manifest/signature/executable must fail.
-- Restart/install; verify the new executable, normal app startup and backup.
-- Exercise a failed startup and locked/read-only destination; confirm recovery.
-- Verify settings, tasks, calendar, shortcuts and shelf remain unchanged.
+Download runs in a worker with progress, cancellation and retry. Cancellation
+can take a network timeout while a synchronous request is blocked. Restart &
+update closes Wisp, waits for the old process, replaces only wisp.exe, and starts
+the new executable. A startup health marker must arrive within 15 seconds or the
+helper attempts to restore and restart the previous executable. This is not
+continuous crash monitoring. The executable must be named wisp.exe and its
+folder must be writable; no elevation is requested. Run only one instance.
 
-Targeted unit tests (no live media integration):
+The helper and wisp-backup-<pid>.exe remain beside the executable for recovery.
+A power failure may require restoring that backup manually. Settings and user
+data in APPDATA/Wisp are not replaced. Error reporting uses a native message
+and, where possible, APPDATA/Wisp/update-error.txt. A staged download belongs to
+the current session; restarting without installing requires downloading again.
 
-```text
-cargo test --locked updater::tests -- --test-threads=1
-```
+## Verification checklist
 
-Do not call the updater production-ready before the replacement/rollback paths
-have been exercised on Windows. No CI or full runtime success is claimed.
+- Compile regression tests for valid/invalid manifests, versions, URLs and
+  payload hash/size/PE headers.
+- Package a freshly built executable without any key environment variable.
+- Check offline errors, progress, cancellation and retry.
+- In a disposable application folder and isolated APPDATA, test a deliberately
+  prepared newer release: install, startup health, rollback and locked targets.
+- Confirm tasks, calendar, settings and shelf survive installation.
+
+Agent verification is compile/build and packaging only; interactive testing and
+Rust test execution are left to the user. Do not claim install/rollback is
+verified until exercised on Windows.

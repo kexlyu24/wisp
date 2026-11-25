@@ -863,6 +863,55 @@ struct DismissingNotice {
     velocity: f64,
 }
 
+struct QuickCardMotion {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+}
+const QUICK_CARD_W: f64 = 190.;
+const QUICK_CARD_H: f64 = 44.;
+const QUICK_CARD_GAP_X: f64 = 12.;
+const QUICK_CARD_GAP_Y: f64 = 8.;
+fn quick_card_pos(slot: usize) -> (f64, f64) {
+    let col = slot % 2;
+    let row = slot / 2;
+    (
+        24. + col as f64 * (QUICK_CARD_W + QUICK_CARD_GAP_X),
+        86. + row as f64 * (QUICK_CARD_H + QUICK_CARD_GAP_Y),
+    )
+}
+fn quick_preview_slot(idx: usize, from: usize, to: Option<usize>) -> usize {
+    match to {
+        Some(to) if from < to && idx > from && idx <= to => idx - 1,
+        Some(to) if from > to && idx >= to && idx < from => idx + 1,
+        _ => idx,
+    }
+}
+fn quick_drop_target(x: f64, y: f64, start_idx: usize, count: usize) -> Option<usize> {
+    let visible = count.saturating_sub(start_idx).min(6);
+    if visible == 0 {
+        return None;
+    }
+    let rows = visible.div_ceil(2);
+    let max_y = 86. + rows as f64 * QUICK_CARD_H + (rows - 1) as f64 * QUICK_CARD_GAP_Y + 8.;
+    if !(16. ..QUICK_W - 16.).contains(&x) || !(78. ..max_y).contains(&y) {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for k in 0..visible {
+        let idx = start_idx + k;
+        let (cx, cy) = quick_card_pos(k);
+        let dx = x - (cx + QUICK_CARD_W * 0.5);
+        let dy = y - (cy + QUICK_CARD_H * 0.5);
+        let d2 = dx * dx + dy * dy;
+        if best.is_none_or(|(_, b)| d2 < b) {
+            best = Some((idx, d2));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 struct State {
     expanded: bool,
     progress: f64,
@@ -916,6 +965,13 @@ struct State {
     quick_input: String,
     quick_editing: bool,
     quick_scroll: usize,
+    quick_drag: Option<(usize, f64, f64, bool)>,
+    quick_pointer: (f64, f64),
+    quick_drag_hover: Option<usize>,
+    quick_settling: Option<usize>,
+    quick_drag_lift: f64,
+    quick_drag_lift_v: f64,
+    quick_motion: Vec<QuickCardMotion>,
     quick_add_mode: bool,
     quick_name_input: String,
     quick_cmd_input: String,
@@ -1204,6 +1260,13 @@ impl State {
             quick_input: String::new(),
             quick_editing: false,
             quick_scroll: 0,
+            quick_drag: None,
+            quick_pointer: (0., 0.),
+            quick_drag_hover: None,
+            quick_settling: None,
+            quick_drag_lift: 0.,
+            quick_drag_lift_v: 0.,
+            quick_motion: Vec::new(),
             quick_add_mode: false,
             quick_name_input: String::new(),
             quick_cmd_input: String::new(),
@@ -1926,20 +1989,15 @@ impl State {
             }
             return -1;
         }
-        let card_w = 190.;
-        let card_h = 44.;
         let start_idx = self.quick_scroll * 2;
         for k in 0..6 {
             let item_idx = start_idx + k;
             if item_idx >= filtered.len() {
                 break;
             }
-            let col = k % 2;
-            let row = k / 2;
-            let cx = 24. + col as f64 * (card_w + 12.);
-            let cy = 86. + row as f64 * (card_h + 8.);
-            if (cx..cx + card_w).contains(&x) && (cy..cy + card_h).contains(&y) {
-                if (cx + card_w - 28. ..cx + card_w - 6.).contains(&x)
+            let (cx, cy) = quick_card_pos(k);
+            if (cx..cx + QUICK_CARD_W).contains(&x) && (cy..cy + QUICK_CARD_H).contains(&y) {
+                if (cx + QUICK_CARD_W - 28. ..cx + QUICK_CARD_W - 6.).contains(&x)
                     && (cy + 8. ..cy + 34.).contains(&y)
                 {
                     return 7000 + item_idx as i32;
@@ -2043,6 +2101,13 @@ impl State {
                         .position(|it| it.name == target_name && it.command == target_cmd)
                     {
                         self.quick_items.remove(pos);
+                        let max_scroll = if self.quick_items.len() > 6 {
+                            self.quick_items.len().saturating_sub(1) / 2
+                        } else {
+                            0
+                        };
+                        self.quick_scroll = self.quick_scroll.min(max_scroll);
+                        self.sync_quick_motion(true);
                         if !self.smoke {
                             tasks::save_quick_items(&self.quick_items);
                         }
@@ -2685,6 +2750,7 @@ impl State {
                 dt,
             )
         };
+        let quick_animating = self.advance_quick_motion(dt);
         geom_animating
             || play_animating
             || tab_animating
@@ -2704,6 +2770,96 @@ impl State {
             || dismissing_animating
             || notif_bell_animating
             || notif_badge_animating
+            || quick_animating
+    }
+    fn sync_quick_motion(&mut self, snap: bool) {
+        let len = self.quick_items.len();
+        let start_idx = self.quick_scroll * 2;
+        if snap || self.quick_motion.len() != len {
+            self.quick_motion = (0..len)
+                .map(|i| {
+                    let (x, y) = quick_card_pos(i.saturating_sub(start_idx));
+                    QuickCardMotion {
+                        x,
+                        y,
+                        vx: 0.,
+                        vy: 0.,
+                    }
+                })
+                .collect();
+        }
+    }
+    fn advance_quick_motion(&mut self, dt: f64) -> bool {
+        if self.active_tab != TAB_QUICK || !self.expanded || !self.quick_input.trim().is_empty() {
+            if self.quick_drag.take().is_some() {
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+            self.quick_drag_hover = None;
+            self.quick_settling = None;
+            self.quick_drag_lift = 0.;
+            self.quick_drag_lift_v = 0.;
+            self.sync_quick_motion(true);
+            return false;
+        }
+        self.sync_quick_motion(false);
+        let active_drag = self.quick_drag.filter(|(_, _, _, active)| *active);
+        let lift_target = if active_drag.is_some() { 1. } else { 0. };
+        let lift_moving = if self.reduced_motion {
+            let m = self.quick_drag_lift != lift_target || self.quick_drag_lift_v != 0.;
+            self.quick_drag_lift = lift_target;
+            self.quick_drag_lift_v = 0.;
+            m
+        } else {
+            spring(
+                &mut self.quick_drag_lift,
+                &mut self.quick_drag_lift_v,
+                lift_target,
+                24.,
+                0.85,
+                dt,
+            )
+        };
+        let start_idx = self.quick_scroll * 2;
+        let end_idx = (start_idx + 6).min(self.quick_motion.len());
+        let mut cards_moving = false;
+        for i in start_idx..end_idx {
+            let (tx, ty, omega, zeta) = if let Some((from, sx, sy, _)) = active_drag {
+                if i == from {
+                    let (bx, by) = quick_card_pos(from.saturating_sub(start_idx));
+                    (
+                        bx + (self.quick_pointer.0 - sx),
+                        by + (self.quick_pointer.1 - sy),
+                        30.,
+                        0.90,
+                    )
+                } else {
+                    let slot = quick_preview_slot(i, from, self.quick_drag_hover);
+                    let (bx, by) = quick_card_pos(slot.saturating_sub(start_idx));
+                    (bx, by, 24., 0.85)
+                }
+            } else {
+                let (bx, by) = quick_card_pos(i.saturating_sub(start_idx));
+                (bx, by, 24., 0.85)
+            };
+            let m = &mut self.quick_motion[i];
+            if self.reduced_motion {
+                cards_moving |= m.x != tx || m.y != ty || m.vx != 0. || m.vy != 0.;
+                m.x = tx;
+                m.y = ty;
+                m.vx = 0.;
+                m.vy = 0.;
+            } else {
+                let mx = spring(&mut m.x, &mut m.vx, tx, omega, zeta, dt);
+                let my = spring(&mut m.y, &mut m.vy, ty, omega, zeta, dt);
+                cards_moving |= mx || my;
+            }
+        }
+        if active_drag.is_none() && !cards_moving {
+            self.quick_settling = None;
+        }
+        lift_moving || cards_moving
     }
     /// Pulls new notifications, starts the next one when the notch is free, and retires finished ones.
     unsafe fn update_notices(&mut self, hwnd: Hwnd, now: std::time::Instant) {
@@ -6220,6 +6376,465 @@ unsafe fn todo_page(dc: Handle, s: &State, dx: f64, o: f64) {
         pill_opt(s, TODO_W - 14., y, 3., h, rgb(72, 72, 76), o, dx);
     }
 }
+#[repr(C)]
+struct QuickShellInfo {
+    icon: Handle,
+    index: i32,
+    attributes: u32,
+    display: [u16; 260],
+    kind: [u16; 80],
+}
+#[link(name = "shell32")]
+extern "system" {
+    fn SHDefExtractIconW(
+        path: *const u16,
+        index: i32,
+        flags: u32,
+        large: *mut Handle,
+        small: *mut Handle,
+        size: u32,
+    ) -> i32;
+    fn SHGetFileInfoW(
+        path: *const u16,
+        attrs: u32,
+        info: *mut QuickShellInfo,
+        size: u32,
+        flags: u32,
+    ) -> usize;
+}
+#[link(name = "user32")]
+extern "system" {
+    fn DestroyIcon(icon: Handle) -> i32;
+    fn DrawIconEx(
+        dc: Handle,
+        x: i32,
+        y: i32,
+        icon: Handle,
+        w: i32,
+        h: i32,
+        step: u32,
+        brush: Handle,
+        flags: u32,
+    ) -> i32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn SearchPathW(
+        path: *const u16,
+        file: *const u16,
+        ext: *const u16,
+        size: u32,
+        out: *mut u16,
+        part: *mut *mut u16,
+    ) -> u32;
+}
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegGetValueW(
+        key: Handle,
+        sub: *const u16,
+        val: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+}
+fn quick_icon_target(command: &str) -> String {
+    let c = command.trim();
+    if let Some(quoted) = c.strip_prefix('"') {
+        return quoted.split('"').next().unwrap_or("").into();
+    }
+    if std::path::Path::new(c).exists() {
+        return c.into();
+    }
+    c.split_whitespace().next().unwrap_or("").into()
+}
+fn premul_bgra_resize(raw: &[u32], src_w: u32, src_h: u32, dst_size: usize) -> Vec<u32> {
+    if src_w == 0 || src_h == 0 || dst_size == 0 || raw.len() < (src_w * src_h) as usize {
+        return vec![];
+    }
+    // Convert straight/legacy pixels to premultiplied RGBA before resizing so transparent neighbors
+    // do not cause alpha^2 dark edge halos.
+    let straight = raw.iter().any(|&p| {
+        let a = p >> 24;
+        (p >> 16 & 255) > a || (p >> 8 & 255) > a || (p & 255) > a
+    });
+    let all_clear = raw.iter().all(|&p| p >> 24 == 0);
+    let premul = image::RgbaImage::from_fn(src_w, src_h, |x, y| {
+        let p = raw[(y * src_w + x) as usize];
+        let a = if all_clear { 255 } else { (p >> 24) as u8 };
+        let ch = |c: u32| -> u8 {
+            if all_clear {
+                c as u8
+            } else if straight {
+                ((c * a as u32 + 127) / 255) as u8
+            } else {
+                (c as u8).min(a)
+            }
+        };
+        image::Rgba([ch(p >> 16 & 255), ch(p >> 8 & 255), ch(p & 255), a])
+    });
+    let resized = if src_w == dst_size as u32 && src_h == dst_size as u32 {
+        premul
+    } else {
+        image::imageops::resize(
+            &premul,
+            dst_size as u32,
+            dst_size as u32,
+            image::imageops::FilterType::CatmullRom,
+        )
+    };
+    resized
+        .pixels()
+        .map(|p| {
+            let a = p[3] as u32;
+            let r = (p[0] as u32).min(a);
+            let g = (p[1] as u32).min(a);
+            let b = (p[2] as u32).min(a);
+            (a << 24) | (r << 16) | (g << 8) | b
+        })
+        .collect()
+}
+unsafe fn hbitmap_to_premul_bgra(
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    dst_size: usize,
+) -> Option<Vec<u32>> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC as WinCreateDC, DeleteDC as WinDeleteDC, GetDIBits, BITMAPINFO,
+        BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    let dc = WinCreateDC(None);
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    if GetDIBits(dc, bitmap, 0, 0, None, &mut info, DIB_RGB_COLORS) == 0 {
+        let _ = WinDeleteDC(dc);
+        return None;
+    }
+    let (w, h) = (info.bmiHeader.biWidth, info.bmiHeader.biHeight.abs());
+    if w <= 0 || h <= 0 || w > 1024 || h > 1024 {
+        let _ = WinDeleteDC(dc);
+        return None;
+    }
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = 0;
+    info.bmiHeader.biHeight = -h;
+    let mut raw = vec![0u32; (w * h) as usize];
+    let lines = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        h as u32,
+        Some(raw.as_mut_ptr().cast()),
+        &mut info,
+        DIB_RGB_COLORS,
+    );
+    let _ = WinDeleteDC(dc);
+    if lines == 0 {
+        return None;
+    }
+    Some(premul_bgra_resize(&raw, w as u32, h as u32, dst_size))
+}
+unsafe fn resolve_quick_path(target: &str) -> Option<Vec<u16>> {
+    if target.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(target).exists() {
+        return Some(wide(target));
+    }
+    let path = wide(target);
+    let mut out = [0u16; 32768];
+    let n = SearchPathW(
+        std::ptr::null(),
+        path.as_ptr(),
+        wide(".exe").as_ptr(),
+        out.len() as u32,
+        out.as_mut_ptr(),
+        null_mut(),
+    );
+    if n > 0 && (n as usize) < out.len() {
+        return Some(out[..n as usize + 1].to_vec());
+    }
+    // Resolve desktop apps registered in App Paths (e.g. chrome.exe, msedge.exe) that aren't on PATH.
+    let mut names = vec![target.to_string()];
+    if !target.contains('.') {
+        names.push(format!("{target}.exe"));
+    }
+    for root in [0x80000001usize as Handle, 0x80000002usize as Handle] {
+        for name in &names {
+            let sub = wide(&format!(
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{name}"
+            ));
+            let mut buf = [0u16; 1024];
+            let mut bytes = (buf.len() * 2) as u32;
+            if RegGetValueW(
+                root,
+                sub.as_ptr(),
+                std::ptr::null(),
+                0x2,
+                null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            ) == 0
+                && bytes >= 2
+            {
+                let len = (bytes as usize / 2).saturating_sub(1);
+                let found = String::from_utf16_lossy(&buf[..len])
+                    .trim_matches('"')
+                    .to_string();
+                if std::path::Path::new(&found).exists() {
+                    return Some(wide(&found));
+                }
+            }
+        }
+    }
+    None
+}
+unsafe fn shell_image_factory_icon(path: &[u16], dst_size: usize) -> Option<Vec<u32>> {
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::SIZE,
+            Graphics::Gdi::DeleteObject as WinDeleteObject,
+            UI::Shell::{
+                IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
+                SIIGBF_ICONONLY,
+            },
+        },
+    };
+    let factory: IShellItemImageFactory =
+        SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok()?;
+    let req = (dst_size * 2).clamp(96, 256) as i32;
+    let bitmap = factory
+        .GetImage(
+            SIZE { cx: req, cy: req },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+        )
+        .ok()?;
+    let pixels = hbitmap_to_premul_bgra(bitmap, dst_size);
+    let _ = WinDeleteObject(bitmap);
+    pixels
+}
+unsafe fn apps_folder_icon(aumid: &str, dst_size: usize) -> Option<Vec<u32>> {
+    use windows::{
+        core::{Interface, HSTRING},
+        Win32::{
+            Foundation::SIZE,
+            Graphics::Gdi::DeleteObject as WinDeleteObject,
+            UI::Shell::{
+                FOLDERID_AppsFolder, IShellItem, IShellItemImageFactory, SHCreateItemInKnownFolder,
+                KF_FLAG_DEFAULT, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+            },
+        },
+    };
+    let item: IShellItem =
+        SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, &HSTRING::from(aumid))
+            .ok()?;
+    let factory: IShellItemImageFactory = item.cast().ok()?;
+    let req = (dst_size * 2).clamp(96, 256) as i32;
+    let bitmap = factory
+        .GetImage(
+            SIZE { cx: req, cy: req },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+        )
+        .ok()?;
+    let pixels = hbitmap_to_premul_bgra(bitmap, dst_size);
+    let _ = WinDeleteObject(bitmap);
+    pixels
+}
+unsafe fn hicon_to_premul_bgra(icon: Handle, fallback_px: i32, dst_size: usize) -> Vec<u32> {
+    use windows::Win32::{
+        Graphics::Gdi::{
+            CreateCompatibleDC as WinCreateDC, DeleteDC as WinDeleteDC,
+            DeleteObject as WinDeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER,
+            DIB_RGB_COLORS,
+        },
+        UI::WindowsAndMessaging::{GetIconInfo, HICON, ICONINFO},
+    };
+    let mut px = fallback_px.clamp(16, 256);
+    let mut ii = ICONINFO::default();
+    if GetIconInfo(HICON(icon), &mut ii).is_ok() {
+        let bmp = if !ii.hbmColor.is_invalid() {
+            ii.hbmColor
+        } else {
+            ii.hbmMask
+        };
+        if !bmp.is_invalid() {
+            let probe_dc = WinCreateDC(None);
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            if GetDIBits(probe_dc, bmp, 0, 0, None, &mut bi, DIB_RGB_COLORS) != 0 {
+                let nat = bi.bmiHeader.biWidth.max(bi.bmiHeader.biHeight.abs());
+                if nat >= 16 {
+                    px = nat.min(256);
+                }
+            }
+            let _ = WinDeleteDC(probe_dc);
+        }
+        if !ii.hbmColor.is_invalid() {
+            let _ = WinDeleteObject(ii.hbmColor);
+        }
+        if !ii.hbmMask.is_invalid() {
+            let _ = WinDeleteObject(ii.hbmMask);
+        }
+    }
+    let dc = CreateCompatibleDC(null_mut());
+    let bitmap_info = BitmapInfo {
+        size: 40,
+        width: px,
+        height: -px,
+        planes: 1,
+        bits: 32,
+        compression: 0,
+        bytes: 0,
+        x: 0,
+        y: 0,
+        used: 0,
+        important: 0,
+    };
+    let mut bits = null_mut();
+    let bitmap = CreateDIBSection(dc, &bitmap_info, 0, &mut bits, null_mut(), 0);
+    if bitmap.is_null() || bits.is_null() {
+        DeleteDC(dc);
+        return vec![];
+    }
+    let old = SelectObject(dc, bitmap);
+    let count = (px as usize) * (px as usize);
+    std::ptr::write_bytes(bits, 0, count * 4);
+    DrawIconEx(dc, 0, 0, icon, px, px, 0, null_mut(), 3);
+    GdiFlush();
+    let mut pixels = std::slice::from_raw_parts(bits.cast::<u32>(), count).to_vec();
+    if pixels.iter().all(|&p| p >> 24 == 0) {
+        // Legacy non-alpha HICON: recover transparency from the 1-bit mask so corners stay clear.
+        std::ptr::write_bytes(bits, 0xff, count * 4);
+        DrawIconEx(dc, 0, 0, icon, px, px, 0, null_mut(), 1);
+        GdiFlush();
+        let mask = std::slice::from_raw_parts(bits.cast::<u32>(), count);
+        for (p, &m) in pixels.iter_mut().zip(mask.iter()) {
+            if (m & 0x00ffffff) == 0 {
+                *p |= 0xff000000;
+            } else {
+                *p = 0;
+            }
+        }
+    }
+    SelectObject(dc, old);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    premul_bgra_resize(&pixels, px as u32, px as u32, dst_size)
+}
+unsafe fn load_quick_icon(command: &str, size: usize) -> Vec<u32> {
+    let target = quick_icon_target(command);
+    if target.to_ascii_lowercase().starts_with("ms-settings:") {
+        if let Some(px) = apps_folder_icon(
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+            size,
+        ) {
+            return px;
+        }
+    }
+    if let Some(path) = resolve_quick_path(&target) {
+        if let Some(px) = shell_image_factory_icon(&path, size) {
+            return px;
+        }
+        let req = (size * 2).clamp(64, 256) as u32;
+        let mut large = null_mut();
+        if SHDefExtractIconW(path.as_ptr(), 0, 0, &mut large, null_mut(), req) >= 0
+            && !large.is_null()
+        {
+            let px = hicon_to_premul_bgra(large, req as i32, size);
+            DestroyIcon(large);
+            if !px.is_empty() {
+                return px;
+            }
+        }
+        let mut info: QuickShellInfo = std::mem::zeroed();
+        if SHGetFileInfoW(
+            path.as_ptr(),
+            0,
+            &mut info,
+            size_of::<QuickShellInfo>() as u32,
+            0x100,
+        ) != 0
+            && !info.icon.is_null()
+        {
+            let px = hicon_to_premul_bgra(info.icon, 32, size);
+            DestroyIcon(info.icon);
+            if !px.is_empty() {
+                return px;
+            }
+        }
+    }
+    let mut info: QuickShellInfo = std::mem::zeroed();
+    if SHGetFileInfoW(
+        wide("application.exe").as_ptr(),
+        0x80,
+        &mut info,
+        size_of::<QuickShellInfo>() as u32,
+        0x110,
+    ) != 0
+        && !info.icon.is_null()
+    {
+        let px = hicon_to_premul_bgra(info.icon, 32, size);
+        DestroyIcon(info.icon);
+        return px;
+    }
+    vec![]
+}
+unsafe fn draw_quick_icon(s: &State, command: &str, x: f64, y: f64, opacity: f64, extra_dx: f64) {
+    let opacity = opacity.clamp(0., 1.);
+    if opacity <= 0. {
+        return;
+    }
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<(String, usize), Vec<u32>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let size = (30. * s.scale).round().max(1.) as usize;
+    let (ox, oy) = s.offset();
+    let left = ((x + ox + extra_dx) * s.scale).round() as i32;
+    let top = ((y + oy) * s.scale).round() as i32;
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (command.to_string(), size);
+        if !cache.contains_key(&key) {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), load_quick_icon(command, size));
+        }
+        let pixels = &cache[&key];
+        if pixels.len() != size * size {
+            return;
+        }
+        let max_y = (DIB_H * s.scale).ceil() as i32;
+        for dy in 0..size {
+            let py = top + dy as i32;
+            if py < 0 || py >= max_y {
+                continue;
+            }
+            for dx in 0..size {
+                let px = left + dx as i32;
+                if px < 0 || px as usize >= s.stride {
+                    continue;
+                }
+                let src = pixels[dy * size + dx];
+                let a = src >> 24;
+                if a == 0 {
+                    continue;
+                }
+                let alpha = (a as f64 * opacity) as u32;
+                let dst = s.pixels.add(py as usize * s.stride + px as usize);
+                let d = *dst;
+                let mix = |shift: u32| -> u32 {
+                    let v = ((src >> shift) & 255) as f64 * opacity;
+                    ((v as u32) + (((d >> shift) & 255) * (255 - alpha) + 127) / 255).min(255)
+                };
+                *dst = 0xff000000 | mix(16) << 16 | mix(8) << 8 | mix(0);
+            }
+        }
+    });
+}
 unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
     if o <= 0.001 {
         return;
@@ -6589,65 +7204,75 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
         return;
     }
 
-    let card_w = 190.;
-    let card_h = 44.;
     let start_idx = s.quick_scroll * 2;
-    for k in 0..6 {
+    let unfiltered = s.quick_input.trim().is_empty();
+    let dragged = s
+        .quick_drag
+        .filter(|(_, _, _, active)| *active)
+        .map(|(i, _, _, _)| i);
+    let top_card = dragged.or(s.quick_settling);
+    if unfiltered && dragged.is_some() {
+        if let Some(slot) = s.quick_drag_hover {
+            if slot >= start_idx && slot < start_idx + 6 {
+                let (tx, ty) = quick_card_pos(slot - start_idx);
+                round_opt(
+                    s,
+                    tx,
+                    ty,
+                    QUICK_CARD_W,
+                    QUICK_CARD_H,
+                    10.,
+                    rgb(22, 22, 24),
+                    o * s.quick_drag_lift,
+                    dx,
+                );
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..6).collect();
+    order.sort_by_key(|k| Some(start_idx + *k) == top_card);
+    for k in order {
         let item_idx = start_idx + k;
         if item_idx >= filtered.len() {
-            break;
+            continue;
         }
-        let col = k % 2;
-        let row = k / 2;
-        let cx = 24. + col as f64 * (card_w + 12.);
-        let cy = 86. + row as f64 * (card_h + 8.);
-
+        let (cx, cy) = if unfiltered && item_idx < s.quick_motion.len() {
+            (s.quick_motion[item_idx].x, s.quick_motion[item_idx].y)
+        } else {
+            quick_card_pos(k)
+        };
         let hit_launch = 8000 + item_idx as i32;
         let hit_del = 7000 + item_idx as i32;
-        let card_hover = s.hover == hit_launch;
-        let del_hover = s.hover == hit_del;
-
-        let bg = if card_hover {
+        let card_hover = dragged.is_none() && s.hover == hit_launch;
+        let del_hover = dragged.is_none() && s.hover == hit_del;
+        let lifted = Some(item_idx) == top_card && s.quick_drag_lift > 0.01;
+        if lifted {
+            round_opt(
+                s,
+                cx,
+                cy + 3. * s.quick_drag_lift,
+                QUICK_CARD_W,
+                QUICK_CARD_H,
+                10.,
+                rgb(0, 0, 0),
+                o * 0.42 * s.quick_drag_lift,
+                dx,
+            );
+        }
+        let bg = if lifted {
+            blend_color(rgb(44, 44, 50), BLUE, 0.28 * s.quick_drag_lift)
+        } else if card_hover {
             rgb(40, 40, 44)
         } else {
             rgb(28, 28, 30)
         };
-        round_opt(s, cx, cy, card_w, card_h, 10., bg, o, dx);
+        round_opt(s, cx, cy, QUICK_CARD_W, QUICK_CARD_H, 10., bg, o, dx);
 
-        // App badge (30x30 rounded square with initial letter)
-        let badge_bg = match item_idx % 4 {
-            0 => rgb(10, 132, 255),
-            1 => rgb(255, 159, 10),
-            2 => rgb(48, 209, 88),
-            _ => rgb(175, 82, 222),
-        };
-        round_opt(s, cx + 7., cy + 7., 30., 30., 8., badge_bg, o, dx);
-        let initial = filtered[item_idx]
-            .name
-            .chars()
-            .next()
-            .unwrap_or('A')
-            .to_uppercase()
-            .to_string();
-        text_opt(
-            dc,
-            s,
-            0,
-            &initial,
-            WHITE,
-            cx + 7.,
-            cy + 8.,
-            30.,
-            28.,
-            true,
-            o,
-            dx,
-        );
-
+        draw_quick_icon(s, &filtered[item_idx].command, cx + 7., cy + 7., o, dx);
         let text_w = if card_hover || del_hover {
-            card_w - 74.
+            QUICK_CARD_W - 74.
         } else {
-            card_w - 52.
+            QUICK_CARD_W - 52.
         };
         text_opt(
             dc,
@@ -6656,42 +7281,36 @@ unsafe fn quick_page(dc: Handle, s: &State, dx: f64, o: f64) {
             &filtered[item_idx].name,
             WHITE,
             cx + 44.,
-            cy + 6.,
+            cy + 13.,
             text_w,
             18.,
             false,
             o,
             dx,
         );
-        text_opt(
-            dc,
-            s,
-            2,
-            &filtered[item_idx].command,
-            SECONDARY,
-            cx + 44.,
-            cy + 24.,
-            text_w,
-            16.,
-            false,
-            o,
-            dx,
-        );
-
         if card_hover || del_hover {
             let del_bg = if del_hover {
                 rgb(255, 69, 58)
             } else {
                 rgb(44, 44, 48)
             };
-            pill_opt(s, cx + card_w - 24., cy + 14., 16., 16., del_bg, o, dx);
+            pill_opt(
+                s,
+                cx + QUICK_CARD_W - 24.,
+                cy + 14.,
+                16.,
+                16.,
+                del_bg,
+                o,
+                dx,
+            );
             text_opt(
                 dc,
                 s,
                 3,
                 "x",
                 WHITE,
-                cx + card_w - 24.,
+                cx + QUICK_CARD_W - 24.,
                 cy + 13.,
                 16.,
                 16.,
@@ -6973,29 +7592,48 @@ fn update_note_lines(notes: &str) -> Vec<String> {
 unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
     let u = &s.updater;
     text_opt(
-        dc, s, 1, "Updates", WHITE, 24., 38., 392., 24., false, o, dx,
+        dc, s, 1, "Updates", WHITE, 24., 38., 260., 24., false, o, dx,
     );
-    let auto = if u.auto {
-        "Automatic checks: On (daily at startup)"
-    } else {
-        "Automatic checks: Off"
-    };
-    pill_opt(s, 24., 65., 392., 28., rgb(28, 28, 30), o, dx);
-    text_opt(dc, s, 2, auto, WHITE, 34., 65., 370., 28., false, o, dx);
     text_opt(
         dc,
         s,
         3,
-        &format!(
-            "Installed: {} | Stable releases only",
-            env!("CARGO_PKG_VERSION")
-        ),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
         SECONDARY,
+        340.,
+        38.,
+        76.,
         24.,
-        98.,
-        392.,
-        18.,
+        true,
+        o,
+        dx,
+    );
+    pill_opt(s, 24., 65., 392., 28., rgb(28, 28, 30), o, dx);
+    text_opt(
+        dc,
+        s,
+        2,
+        "Auto-check",
+        WHITE,
+        34.,
+        65.,
+        280.,
+        28.,
         false,
+        o,
+        dx,
+    );
+    text_opt(
+        dc,
+        s,
+        2,
+        if u.auto { "On" } else { "Off" },
+        if u.auto { BLUE } else { SECONDARY },
+        350.,
+        65.,
+        54.,
+        28.,
+        true,
         o,
         dx,
     );
@@ -7035,11 +7673,7 @@ unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
             dx,
         );
     }
-    let notes = u
-        .release
-        .as_ref()
-        .map(|r| r.notes.as_str())
-        .unwrap_or("Release notes appear here when an update is available.");
+    let notes = u.release.as_ref().map(|r| r.notes.as_str()).unwrap_or("");
     let lines = update_note_lines(notes);
     for (i, line) in lines.iter().take(4).enumerate() {
         text_opt(
@@ -7064,16 +7698,6 @@ unsafe fn settings_updates_page(dc: Handle, s: &State, dx: f64, o: f64) {
         updater::Phase::Available => "Download update",
         updater::Phase::Error if u.release.is_some() => "Retry download",
         _ => "Check for updates",
-    };
-    let waiting = format!("Try again in {}s", u.cooldown());
-    let label = if !u.action_enabled()
-        && !matches!(
-            u.phase,
-            updater::Phase::Checking | updater::Phase::Downloading
-        ) {
-        waiting.as_str()
-    } else {
-        label
     };
     let enabled = u.action_enabled();
     pill_opt(
@@ -9021,7 +9645,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     || s.tab_t != prev_tab
                     || s.lyrics_t != prev_lt
                     || s.is_dragging
-                    || s.dragging_out;
+                    || s.dragging_out
+                    || s.quick_drag.is_some_and(|(_, _, _, a)| a)
+                    || s.quick_settling.is_some();
                 let ambient = animating
                     || s.expanded
                     || s.media.playing
@@ -9153,6 +9779,21 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x200 => {
+                if let Some((idx, sx, sy, dragged)) = s.quick_drag {
+                    let x = (l as i16) as f64 / s.scale;
+                    let y = ((l >> 16) as i16) as f64 / s.scale;
+                    let dragging = dragged || (x - sx).abs().max((y - sy).abs()) >= 6.;
+                    s.quick_drag = Some((idx, sx, sy, dragging));
+                    s.quick_pointer = (x, y);
+                    s.quick_drag_hover = if dragging {
+                        quick_drop_target(x, y, s.quick_scroll * 2, s.quick_items.len())
+                    } else {
+                        None
+                    };
+                    s.hover = s.quick_hit(x, y);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 let mut tracking = MouseTracking {
                     size: size_of::<MouseTracking>() as u32,
                     flags: 2,
@@ -9391,6 +10032,23 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 }
                 let x = (l as i16) as f64 / s.scale;
                 let y = ((l >> 16) as i16) as f64 / s.scale;
+                if s.usable()
+                    && s.active_tab == TAB_QUICK
+                    && s.quick_input.trim().is_empty()
+                    && !s.quick_add_mode
+                {
+                    let hit = s.quick_hit(x, y);
+                    if hit >= 8000 && ((hit - 8000) as usize) < s.quick_items.len() {
+                        s.quick_editing = false;
+                        s.sync_quick_motion(false);
+                        s.quick_drag = Some(((hit - 8000) as usize, x, y, false));
+                        s.quick_pointer = (x, y);
+                        s.quick_drag_hover = None;
+                        s.quick_settling = None;
+                        SetCapture(hwnd);
+                        return 0;
+                    }
+                }
                 if s.usable() {
                     let field = match s.active_tab {
                         TAB_TODO if s.todo_hit(x, y) == 1000 => {
@@ -9541,6 +10199,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     && !s.blur_drag
                     && !s.is_dragging
                     && s.drag_source.is_none()
+                    && s.quick_drag.is_none()
                 {
                     s.expanded = false;
                     s.hover = -1;
@@ -9560,6 +10219,41 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                 return 0;
             }
             0x202 => {
+                if let Some((from, _, _, dragged)) = s.quick_drag.take() {
+                    ReleaseCapture();
+                    s.quick_drag_hover = None;
+                    let x = (l as i16) as f64 / s.scale;
+                    let y = ((l >> 16) as i16) as f64 / s.scale;
+                    let hit = s.quick_hit(x, y);
+                    if s.expanded && s.active_tab == TAB_QUICK && s.quick_input.trim().is_empty() {
+                        if dragged {
+                            let to =
+                                quick_drop_target(x, y, s.quick_scroll * 2, s.quick_items.len());
+                            if let Some(to) = to.filter(|&i| i < s.quick_items.len()) {
+                                if from < s.quick_items.len() && from != to {
+                                    let item = s.quick_items.remove(from);
+                                    s.quick_items.insert(to, item);
+                                    if from < s.quick_motion.len() && to < s.quick_motion.len() {
+                                        let m = s.quick_motion.remove(from);
+                                        s.quick_motion.insert(to, m);
+                                    }
+                                    s.quick_settling = Some(to);
+                                    if !s.smoke {
+                                        tasks::save_quick_items(&s.quick_items);
+                                    }
+                                } else {
+                                    s.quick_settling = Some(from);
+                                }
+                            } else {
+                                s.quick_settling = Some(from);
+                            }
+                        } else if hit == 8000 + from as i32 {
+                            s.quick_click(hwnd, hit);
+                        }
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 if let Some(id) = s.dragging_input() {
                     s.input_pointer(id, (l as i16) as f64 / s.scale, true);
                     s.end_input_drag();
@@ -10003,6 +10697,9 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
+                if s.quick_drag.is_some() {
+                    return 0;
+                }
                 if msg == 0x020a && s.usable() && s.active_tab == TAB_QUICK && y >= 80. {
                     let filtered_len =
                         tasks::filter_quick_items(&s.quick_items, &s.quick_input).len();
@@ -10013,6 +10710,7 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                         } else {
                             s.quick_scroll.saturating_sub(1)
                         };
+                        s.sync_quick_motion(true);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         return 0;
                     }
@@ -10149,6 +10847,13 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
             }
             0x215 => {
                 // WM_CAPTURECHANGED
+                if let Some((from, _, _, true)) = s.quick_drag.take() {
+                    s.quick_settling = Some(from);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                } else {
+                    s.quick_drag = None;
+                }
+                s.quick_drag_hover = None;
                 s.end_input_drag();
             }
             0x100 if s.active_input().is_some() && w != 27 => {
@@ -11126,6 +11831,104 @@ mod tests {
         assert!(s.shelf_alert.is_none());
     }
 
+    #[test]
+    fn quick_icon_target_preserves_quoted_paths_and_strips_arguments() {
+        assert_eq!(
+            quick_icon_target("\"C:\\Program Files\\App\\app.exe\" --flag"),
+            "C:\\Program Files\\App\\app.exe"
+        );
+        assert_eq!(quick_icon_target("notepad.exe example.txt"), "notepad.exe");
+        assert_eq!(quick_icon_target("ms-settings:"), "ms-settings:");
+    }
+
+    #[test]
+    fn quick_icon_resize_normalizes_straight_premul_and_legacy_alpha() {
+        let straight = vec![0x80_FF_00_00u32; 4 * 4];
+        let out = premul_bgra_resize(&straight, 4, 4, 2);
+        assert_eq!(out.len(), 4);
+        let p = out[0];
+        assert_eq!(p >> 24, 0x80);
+        assert!(((p >> 16) & 255) >= 0x7F && ((p >> 16) & 255) <= 0x81);
+        assert_eq!((p >> 8) & 255, 0);
+        assert_eq!(p & 255, 0);
+
+        let legacy = vec![0x00_20_40_60u32; 4 * 4];
+        let out_legacy = premul_bgra_resize(&legacy, 4, 4, 2);
+        assert_eq!(out_legacy[0] >> 24, 255);
+        assert_eq!((out_legacy[0] >> 16) & 255, 0x20);
+
+        let premul = vec![0x80_40_20_10u32; 4 * 4];
+        let out_premul = premul_bgra_resize(&premul, 4, 4, 2);
+        let pm = out_premul[0];
+        let a = pm >> 24;
+        assert!((pm >> 16 & 255) <= a && (pm >> 8 & 255) <= a && (pm & 255) <= a);
+    }
+
+    #[test]
+    fn quick_preview_slot_shifts_neighbors_around_drag() {
+        assert_eq!(quick_preview_slot(1, 0, Some(3)), 0);
+        assert_eq!(quick_preview_slot(2, 0, Some(3)), 1);
+        assert_eq!(quick_preview_slot(3, 0, Some(3)), 2);
+        assert_eq!(quick_preview_slot(4, 0, Some(3)), 4);
+        assert_eq!(quick_preview_slot(0, 3, Some(1)), 0);
+        assert_eq!(quick_preview_slot(1, 3, Some(1)), 2);
+        assert_eq!(quick_preview_slot(2, 3, Some(1)), 3);
+        assert_eq!(quick_preview_slot(2, 0, None), 2);
+    }
+
+    #[test]
+    fn quick_drop_target_picks_nearest_slot_inside_grid_and_none_outside() {
+        let (x1, y1) = quick_card_pos(1);
+        assert_eq!(quick_drop_target(x1 + 20., y1 + 20., 0, 6), Some(1));
+        assert!(quick_drop_target(24. + QUICK_CARD_W + 6., 86. + 20., 0, 6).is_some());
+        assert_eq!(quick_drop_target(100., 50., 0, 6), None);
+        assert_eq!(quick_drop_target(100., QUICK_H + 10., 0, 6), None);
+        // With only 2 items on row 0, empty space in lower rows must return None.
+        assert_eq!(quick_drop_target(100., 220., 0, 2), None);
+    }
+
+    #[test]
+    fn quick_icon_resize_avoids_alpha_squared_edge_halo() {
+        // Left half opaque white, right half transparent black -> 4x4 down to 2x2 or 1x1.
+        let mut img = vec![0u32; 4 * 4];
+        for y in 0..4 {
+            img[y * 4] = 0xFF_FF_FF_FF;
+            img[y * 4 + 1] = 0xFF_FF_FF_FF;
+        }
+        let out = premul_bgra_resize(&img, 4, 4, 1);
+        let p = out[0];
+        let a = p >> 24;
+        let r = (p >> 16) & 255;
+        // Premultiplied white at ~50% alpha must have R == A (within 2), not ~A/2 (alpha^2 darkening).
+        assert!(a >= 110 && a <= 145, "unexpected alpha {a}");
+        assert!(r.abs_diff(a) <= 2, "alpha^2 dark edge halo: r={r}, a={a}");
+    }
+
+    #[test]
+    fn quick_drag_spring_animates_and_respects_reduced_motion() {
+        let mut s = create_test_state();
+        s.active_tab = TAB_QUICK;
+        s.tab_to = TAB_QUICK;
+        s.panel_w = QUICK_W;
+        s.panel_h = QUICK_H;
+        s.sync_quick_motion(true);
+        let (x0, y0) = quick_card_pos(0);
+        let (x1, y1) = quick_card_pos(1);
+        s.quick_drag = Some((0, x0 + 20., y0 + 20., true));
+        s.quick_pointer = (x1 + 20., y1 + 20.);
+        s.quick_drag_hover = Some(1);
+
+        assert!(s.advance(0.016));
+        assert!(s.quick_motion[0].x > x0);
+        assert!(s.quick_motion[1].x < x1);
+        assert!(s.quick_drag_lift > 0.);
+
+        s.reduced_motion = true;
+        s.advance(0.016);
+        assert!((s.quick_motion[1].x - x0).abs() < 0.01);
+        assert_eq!(s.quick_drag_lift, 1.);
+    }
+
     fn create_test_state() -> State {
         State {
             expanded: true,
@@ -11180,6 +11983,13 @@ mod tests {
             quick_input: String::new(),
             quick_editing: false,
             quick_scroll: 0,
+            quick_drag: None,
+            quick_pointer: (0., 0.),
+            quick_drag_hover: None,
+            quick_settling: None,
+            quick_drag_lift: 0.,
+            quick_drag_lift_v: 0.,
+            quick_motion: Vec::new(),
             quick_add_mode: false,
             quick_name_input: String::new(),
             quick_cmd_input: String::new(),
