@@ -25,7 +25,7 @@ What's playing, synced lyrics, notifications, a calendar, to-dos, a Pomodoro tim
 - 📥 **File shelf**: drop files on the notch, drag them back out, and group them into folders
 - 🪶 **Minimal mode**: shrinks to a sliver when it would hide something, like browser tabs
 - 🚀 **Quick Access**: search and launch apps, or add your own shortcuts
-- ⬆️ **In-app updates**: signed downloads from GitHub Releases, installed only when you click Restart & update
+- ⬆️ **In-app updates**: HTTPS downloads verified with SHA-256 from GitHub Releases, installed only when you click Restart & update
 - ⚙️ **Settings** right inside the notch, including the background (black by default, frosted glass, or your own image), and every movement runs on springs
 
 <table>
@@ -72,7 +72,7 @@ a request to that image host, without importing browser cookies.
 
 ## In-app updates
 
-Settings → Updates provides stable-release checks, release notes, signed downloads
+Settings → Updates provides stable-release checks, release notes, HTTPS downloads verified with SHA-256
 and explicit Restart & update. No browser or account is required. Update packages
 must be published by the maintainer; 0.2.1 is the first release with them, so
 update from 0.2.0 or older by downloading the zip once. See [docs/UPDATES.md](docs/UPDATES.md) for packaging,
