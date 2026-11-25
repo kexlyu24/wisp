@@ -233,8 +233,11 @@ Windows 10/11, primary display only. No forked app source; Wisp only starts with
 
 Quick Access cards display a cached Windows Shell icon and app name only; the
 launch command remains stored but is not displayed. Commands without a resolved
-icon use the generic executable icon. Drag a card onto another to move it in the
-saved order (search must be empty). Movement of 6 logical pixels starts a drag;
-a short click still launches. Dropping outside cards cancels reordering.
+icon use the generic executable icon. Scrolling through more than 6 shortcuts
+animates smoothly on a spring (`reduced_motion` snaps immediately) with top and
+bottom edge fades and a continuous scrollbar pill on the right edge. Drag a card
+onto another to move it in the saved order (search must be empty). Movement of 6
+logical pixels starts a drag; a short click still launches. Dropping outside
+cards cancels reordering.
 Manual update checks have no one-minute cooldown; concurrent requests remain
 blocked while checking or downloading. Daily automatic checks are unchanged.
