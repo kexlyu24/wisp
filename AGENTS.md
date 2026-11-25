@@ -38,7 +38,7 @@ Tests that need real apps or the network are `#[ignore]`d, for example `cargo te
 - **Volume** only ever changes the player's own level, never the system volume. Spotify deliberately uses its Volume Mixer session; see CONTEXT.md for why.
 - **The calendar** only shows events the user typed. Never invent, sample or import events.
 - **Privacy.** Nothing leaves the PC except lyrics lookups (LRCLIB, then NetEase), update checks, and image downloads the user dropped. Logs never contain user text, clipboard contents, full URLs or credentials.
-- **Updates are signed.** The Ed25519 private key lives only on the owner's PC. Never ask for it, add it to CI, or weaken `src/updater.rs`'s checks. `update-public-key.hex` is the matching public key.
+- **Updates are verified via HTTPS + SHA-256.** Never weaken `src/updater.rs`'s checks (official GitHub release URL pinning, manifest version/size/SHA-256, and x64 PE validation). See `docs/UPDATES.md` for the trust model and asset contract.
 - **Demo and README GIFs** may only show public-domain songs ("Amazing Grace") or placeholders. No copyrighted songs, lyrics, album art or Spotify branding.
 
 ## When you change behaviour
@@ -63,7 +63,7 @@ Never move the user's mouse or keyboard to test. To check something on screen, p
 ## Releasing (owner only)
 
 1. Bump `Cargo.toml` and merge `dev` → `main`.
-2. Tag from `main` (`git tag vX.Y.Z` and `git push origin vX.Y.Z`). `.github/workflows/release.yml` then builds, tests and drafts a Release with the zip and exe.
-3. The owner signs the updater files locally with `python scripts/sign-release.py vX.Y.Z`, adds the notes, and publishes.
+2. Tag from `main` (`git tag vX.Y.Z` and `git push origin vX.Y.Z`). `.github/workflows/release.yml` then builds, tests, packages `wisp-update.json` (for stable tags) via `scripts/package-update.py`, and drafts a Release with the zip, exe, and manifest.
+3. The owner reviews the draft on GitHub, adds the release notes, and publishes (or uses `python scripts/sign-release.py vX.Y.Z` as a manual fallback to re-attach `wisp-update.json`).
 
 Hotfix tags are `vX.Y.Zhf`, with Cargo version `X.Y.Z+hf`.

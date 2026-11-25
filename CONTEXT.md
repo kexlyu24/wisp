@@ -46,7 +46,7 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 | `src/todo_input.rs` | Shared single-line text editing (caret, selection, clipboard) |
 | `src/settings.rs` | `settings.txt` and Start with Windows |
 | `src/tray.rs` | Tray icon and menu |
-| `src/updater.rs` | Signed in-app updates from GitHub Releases |
+| `src/updater.rs` | In-app updates from GitHub Releases (HTTPS + SHA-256 verified) |
 | `src/web_drop.rs` | Downloading and validating images dropped from a browser |
 | `src/diagnostics.rs` | Local, privacy-safe log (`wisp.log`) |
 
@@ -59,7 +59,7 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 - **Spotifast volume uses `spotifast volume` / `mute`.** These commands work even while it is minimized, and its UI doesn't. They run one at a time, and Wisp never touches Spotifast's internal files.
 - **Lyrics fall back to NetEase** only when LRCLIB has no synced lyrics, and only on an exact title, artist and length match. NetEase requests are sent without cookies, because its cookie makes search return unrelated songs.
 - **The default look is pure black (OLED).** Frost, Aura and Slate are real frosted glass: Wisp captures the screen behind the panel (its own layered window is never in the capture), blurs it, and tints it. The closed notch is always black.
-- **Updates are Ed25519-signed.** The private key stays on the owner's PC; CI builds releases but never signs them.
+- **Updates use HTTPS + SHA-256 verification.** Wisp pins downloads to official GitHub Releases URLs and verifies manifest version, size, SHA-256, and x64 PE headers before staging and installing (replacing the earlier Ed25519 signing flow; see `docs/UPDATES.md`).
 - **Only events you typed** appear in the calendar. Wisp never imports or invents agenda items.
 - **The "Music Player" picker** that used to be on the Settings page was removed in an earlier PR. Following a player is automatic, or set by `Settings::player`.
 
@@ -70,7 +70,7 @@ feat/… or fix/…  ──PR──▶  dev  ──PR at release──▶  main 
 ```
 
 - **CI** (`.github/workflows/rust.yml`) runs the tests, the release build and the smoke test on Windows for every push and PR to `main` and `dev`.
-- **Releases** (`.github/workflows/release.yml`) build a draft from a version tag. The owner signs the updater files with `scripts/sign-release.py` and publishes.
+- **Releases** (`.github/workflows/release.yml`) build a draft from a version tag with the zip, bare exe, and (for stable tags) `wisp-update.json`. The owner reviews the draft, adds release notes, and publishes.
 - **`UNRELEASED.md`** is the owner's git-ignored notes on changes since the last release. `CHANGELOG.md` is the public history.
 
 ## Open questions
