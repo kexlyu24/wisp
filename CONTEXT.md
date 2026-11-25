@@ -18,7 +18,8 @@ An original, animated "dynamic notch" for Windows 10 and 11, inspired by Apple's
 | Shelf | Drop files (or browser images) on it, drag them back out, group them into folders |
 | Quick Access | Search and launch apps or your own shortcuts |
 | Notifications | Recent Windows notifications |
-| Settings | Switches, the background theme, updates, Quit |
+
+- **Settings popup:** clicking the notch header gear icon or tray **Settings…** opens a standalone 620×420 Apple dark-mode floating popup (`Notch`, `General`, `Appearance`, `Updates`, plus `Quit Wisp`).
 
 - **Minimal mode:** when the closed notch would cover real content, such as browser tabs, it shrinks to a sliver.
 - **Supported players:** Spotify, Spotifast, Apple Music (detection only for volume), the SoundCloud app, and Chrome or Edge (YouTube and so on).
@@ -45,6 +46,7 @@ A single native Rust executable with no UI framework. Everything is drawn into a
 | `src/tasks.rs` | To-do, Pomodoro, Calendar and Quick Access state (Win32-free, unit tested) |
 | `src/todo_input.rs` | Shared single-line text editing (caret, selection, clipboard) |
 | `src/settings.rs` | `settings.txt` and Start with Windows |
+| `src/settings_win.rs` | Standalone 620×420 Settings popup window (layout, hit-testing, GDI+ paint, Win32 lifecycle) |
 | `src/tray.rs` | Tray icon and menu |
 | `src/updater.rs` | In-app updates from GitHub Releases (HTTPS + SHA-256 verified) |
 | `src/web_drop.rs` | Downloading and validating images dropped from a browser |
