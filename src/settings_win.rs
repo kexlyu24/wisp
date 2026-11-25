@@ -3,7 +3,6 @@
 //! layered-window implementation so every layout boundary is unit-tested without an HWND.
 
 use std::{
-    ffi::c_void,
     mem::size_of,
     ptr::null_mut,
     sync::atomic::{AtomicBool, Ordering},
@@ -133,6 +132,7 @@ impl SettingsWindow {
         self.open
     }
 
+    #[cfg(test)]
     pub fn section(&self) -> SettingsSection {
         self.section
     }
@@ -148,6 +148,10 @@ impl SettingsWindow {
         }
         self.section = section;
         self.pressed = HIT_NONE;
+    }
+
+    pub fn auto_switch_t(&self) -> f64 {
+        self.auto_switch_t
     }
 
     pub fn snap_auto_switch(&mut self, auto_on: bool) {
