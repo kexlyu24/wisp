@@ -1,4 +1,4 @@
-//! Notification-area (tray) icon. Its menu (right-click, or left-click) opens the Settings page or quits.
+//! Notification-area (tray) icon. Its menu (right-click, or left-click) opens the Settings popup or quits.
 use crate::{
     wide, AppendMenuW, BitmapInfo, CreateDIBSection, CreatePopupMenu, DeleteObject, DestroyMenu,
     GetCursorPos, GetSystemMetrics, Point, SetForegroundWindow, TrackPopupMenu,
@@ -6,6 +6,9 @@ use crate::{
 use std::ffi::c_void;
 use std::ptr::null_mut;
 type Handle = *mut c_void;
+
+const TRAY_DARK_PNG: &[u8] = include_bytes!("../assets/icons/wisp-tray-dark.png");
+const TRAY_LIGHT_PNG: &[u8] = include_bytes!("../assets/icons/wisp-tray-light.png");
 
 /// Window message the shell sends for tray-icon mouse events (lParam holds the mouse message).
 pub const CALLBACK: u32 = 0x8010;
@@ -122,7 +125,7 @@ impl Tray {
         DestroyIcon(old);
     }
     /// Handles a tray mouse event by showing the menu; returns the chosen item (see `item`), or 0.
-    /// The settings themselves live on the notch's Settings page; the menu only opens it.
+    /// The settings live in the standalone Settings popup window; the menu only opens it.
     pub unsafe fn handle(&self, lparam: isize) -> usize {
         let event = (lparam & 0xffff) as u32;
         if event != 0x205 && event != 0x7b && event != 0x202 {
@@ -177,10 +180,34 @@ fn light_taskbar() -> bool {
     }
 }
 
-/// Dynamic Island glyph: a wide pill with a small lens cut out at its right end, antialiased with
-/// 4×4 supersampling, white on a dark taskbar and black on a light one.
-unsafe fn make_icon() -> Handle {
-    let size = GetSystemMetrics(49).max(16);
+/// Decodes an embedded PNG into premultiplied BGRA pixels scaled cleanly to `size × size`.
+pub(crate) fn decode_icon_bgra(bytes: &[u8], size: u32) -> Option<Vec<u32>> {
+    let size = size.max(1);
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let resized = if img.width() == size && img.height() == size {
+        img
+    } else {
+        image::imageops::resize(&img, size, size, image::imageops::FilterType::Lanczos3)
+    };
+    let mut out = Vec::with_capacity((size * size) as usize);
+    for px in resized.pixels() {
+        let [r, g, b, a] = px.0;
+        let a32 = a as u32;
+        let pr = (r as u32 * a32 + 127) / 255;
+        let pg = (g as u32 * a32 + 127) / 255;
+        let pb = (b as u32 * a32 + 127) / 255;
+        out.push((a32 << 24) | (pr << 16) | (pg << 8) | pb);
+    }
+    Some(out)
+}
+
+/// Decodes the dark-surface Wisp W mark for in-app dark UI (e.g. Settings popup titlebar).
+pub(crate) fn titlebar_mark_bgra(size: u32) -> Option<Vec<u32>> {
+    decode_icon_bgra(TRAY_DARK_PNG, size)
+}
+
+/// Builds a Win32 `HICON` from premultiplied BGRA pixels of dimensions `size × size`.
+unsafe fn hicon_from_bgra(src: &[u32], size: i32) -> Handle {
     let info = BitmapInfo {
         size: 40,
         width: size,
@@ -196,40 +223,17 @@ unsafe fn make_icon() -> Handle {
     };
     let mut bits = null_mut();
     let color = CreateDIBSection(null_mut(), &info, 0, &mut bits, null_mut(), 0);
-    if color.is_null() {
+    if color.is_null() || bits.is_null() {
+        if !color.is_null() {
+            DeleteObject(color);
+        }
         return null_mut();
     }
-    let rgb: u32 = if light_taskbar() { 0x000000 } else { 0xffffff };
-    let s = size as f64;
-    let (cx, cy) = (s / 2., s / 2.);
-    let (half_w, half_h) = (s * 0.45, s * 0.2);
-    let (lens_x, lens_r) = (cx + half_w - half_h, half_h * 0.45);
-    let inside = |x: f64, y: f64| {
-        let dx = ((x - cx).abs() - (half_w - half_h)).max(0.);
-        let dy = (y - cy).abs();
-        let pill = dx * dx + dy * dy <= half_h * half_h;
-        let lens = (x - lens_x).powi(2) + (y - cy).powi(2) <= lens_r * lens_r;
-        pill && !lens
-    };
     let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
-    for py in 0..size {
-        for px in 0..size {
-            let mut hits = 0;
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    if inside(
-                        px as f64 + (sx as f64 + 0.5) / 4.,
-                        py as f64 + (sy as f64 + 0.5) / 4.,
-                    ) {
-                        hits += 1;
-                    }
-                }
-            }
-            let alpha = (hits * 255 / 16) as u32;
-            pixels[(py * size + px) as usize] = (alpha << 24) | rgb;
-        }
-    }
-    let mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
+    pixels.copy_from_slice(&src[..(size * size) as usize]);
+    let row_bytes = (((size + 31) / 32) * 4) as usize;
+    let mask_bytes = vec![0u8; row_bytes * size as usize];
+    let mask = CreateBitmap(size, size, 1, 1, mask_bytes.as_ptr().cast());
     let icon = CreateIconIndirect(&IconInfo {
         icon: 1,
         x: 0,
@@ -240,4 +244,48 @@ unsafe fn make_icon() -> Handle {
     DeleteObject(mask);
     DeleteObject(color);
     icon
+}
+
+/// Creates a Win32 window `HICON` for Wisp (used by `WispNotch` and `WispSettings` window classes).
+pub(crate) unsafe fn make_window_icon(size: i32) -> Handle {
+    let size = size.max(16);
+    match decode_icon_bgra(TRAY_LIGHT_PNG, size as u32) {
+        Some(bgra) => hicon_from_bgra(&bgra, size),
+        None => null_mut(),
+    }
+}
+
+/// Wisp tray icon: uses the notch+W icon on light taskbars and the vibrant W mark on dark ones.
+unsafe fn make_icon() -> Handle {
+    let size = GetSystemMetrics(49).max(16);
+    let bytes = if light_taskbar() {
+        TRAY_LIGHT_PNG
+    } else {
+        TRAY_DARK_PNG
+    };
+    match decode_icon_bgra(bytes, size as u32) {
+        Some(bgra) => hicon_from_bgra(&bgra, size),
+        None => null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_wisp_icons_decode_to_premultiplied_bgra() {
+        for bytes in [TRAY_DARK_PNG, TRAY_LIGHT_PNG] {
+            let pixels = decode_icon_bgra(bytes, 24).expect("embedded icon should decode");
+            assert_eq!(pixels.len(), 24 * 24);
+            let opaque_count = pixels.iter().filter(|&&p| (p >> 24) > 200).count();
+            assert!(opaque_count > 30, "expected visible opaque icon pixels");
+            for &p in &pixels {
+                let a = p >> 24;
+                assert!(((p >> 16) & 0xff) <= a);
+                assert!(((p >> 8) & 0xff) <= a);
+                assert!((p & 0xff) <= a);
+            }
+        }
+    }
 }
