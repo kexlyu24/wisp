@@ -754,9 +754,13 @@ const TAB_SHELF: usize = 4;
 const TAB_QUICK: usize = 5;
 const TAB_NOTIF: usize = 6;
 const TAB_SETTINGS: usize = 7;
-const TAB_COUNT: usize = 8;
+const TAB_COUNT: usize = 7;
+pub(crate) const HEADER_SETTINGS: i32 = 11;
 fn page_w(tab: usize) -> f64 {
-    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, QUICK_W, NOTIF_W, SET_W][tab.min(TAB_COUNT - 1)]
+    [NP_W, CAL_W, TODO_W, POMO_W, EXP_W, QUICK_W, NOTIF_W][tab.min(TAB_COUNT - 1)]
+}
+fn gear_rect(panel_w: f64) -> (f64, f64) {
+    (panel_w - 24. - 34., 34.)
 }
 /// Notification Center page geometry: 3 cards visible at a time.
 const NOTIF_W: f64 = 440.;
@@ -1764,7 +1768,7 @@ impl State {
             52.
         }
     }
-    /// Header tab positions: the pages and Quick Access from the left, Notification Center and Settings at the right edge.
+    /// Header tab positions: the pages and Quick Access from the left, Notification Center at the right edge next to the Gear action button.
     fn tab_x(&self, tab: usize) -> (f64, f64) {
         if tab < TAB_SHELF {
             (24. + 35. * tab as f64, 34.)
@@ -1772,10 +1776,8 @@ impl State {
             (164., self.shelf_tab_w())
         } else if tab == TAB_QUICK {
             (164. + self.shelf_tab_w() + 3., 34.)
-        } else if tab == TAB_NOTIF {
-            (self.panel_w_now() - 24. - 34. - 38., 34.)
         } else {
-            (self.panel_w_now() - 24. - 34., 34.)
+            (gear_rect(self.panel_w_now()).0 - 38., 34.)
         }
     }
     /// Right edge of the header tabs.
@@ -1794,7 +1796,7 @@ impl State {
             _ => false,
         }
     }
-    /// Header targets: 0..TAB_COUNT page tabs, 10 Clear, 12 folder breadcrumb, -1 none.
+    /// Header targets: 0..TAB_COUNT page tabs, 10 Clear, 11 Settings popup toggle, 12 folder breadcrumb, -1 none.
     fn header_hit(&self, x: f64, y: f64) -> i32 {
         if !(8. ..36.).contains(&y) {
             return -1;
@@ -1810,6 +1812,10 @@ impl State {
             if (tx..tx + tw).contains(&x) {
                 return tab as i32;
             }
+        }
+        let (gx, gw) = gear_rect(self.panel_w_now());
+        if (gx..gx + gw).contains(&x) {
+            return HEADER_SETTINGS;
         }
         if self.has_clear(self.active_tab) {
             let (cx, cw) = clear_rect(self.panel_w_now(), self.active_tab);
@@ -4223,20 +4229,30 @@ struct TextCache {
     masks: std::collections::HashMap<(usize, u32, i32, i32, Vec<u16>), (Vec<u8>, u32)>,
 }
 /// Draws `text` like `DrawTextW(dc, text, rect, flags)` with the DC's current font and text color,
-/// honoring the DC's clip box, but from a cached grayscale mask.
-unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u32) {
+/// honoring the DC's clip box, into an arbitrary premultiplied BGRA surface using a cached grayscale mask.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cached_text_into(
+    dc: Handle,
+    pixels: *mut u32,
+    stride: usize,
+    height: i32,
+    text_cache: &std::cell::RefCell<TextCache>,
+    ticks: u32,
+    text: &[u16],
+    rect: Rect,
+    flags: u32,
+) {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     if text.is_empty() || w <= 0 || h <= 0 || w > 4096 || h > 2048 {
         return;
     }
     let font = GetCurrentObject(dc, 6);
     let color = GetTextColor(dc);
-    let mut cache = s.text_cache.borrow_mut();
-    let now = s.ticks;
+    let mut cache = text_cache.borrow_mut();
     if cache.masks.len() > 192 {
         cache
             .masks
-            .retain(|_, (_, used)| now.wrapping_sub(*used) < 300);
+            .retain(|_, (_, used)| ticks.wrapping_sub(*used) < 300);
         if cache.masks.len() > 384 {
             cache.masks.clear();
         }
@@ -4244,31 +4260,59 @@ unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u3
     let key = (font as usize, flags, w, h, text.to_vec());
     if !cache.masks.contains_key(&key) {
         let mask = render_mask(font, text, w, h, flags);
-        cache.masks.insert(key.clone(), (mask, now));
+        cache.masks.insert(key.clone(), (mask, ticks));
     }
     let Some((mask, used)) = cache.masks.get_mut(&key) else {
         return;
     };
-    *used = now;
+    *used = ticks;
     let mut clip = Rect::default();
     if GetClipBox(dc, &mut clip) == 0 {
         return;
     }
-    blend_mask(s, mask, w, rect, clip, color);
+    blend_mask_into(pixels, stride, height, mask, w, rect, clip, color);
 }
-/// Blends a coverage mask (row length `w`, placed at `rect`) into the frame in `color`, within `clip`.
-unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, color: u32) {
+/// Draws `text` like `DrawTextW(dc, text, rect, flags)` with the DC's current font and text color,
+/// honoring the DC's clip box, but from a cached grayscale mask.
+unsafe fn cached_text(dc: Handle, s: &State, text: &[u16], rect: Rect, flags: u32) {
+    cached_text_into(
+        dc,
+        s.pixels,
+        s.stride,
+        (DIB_H * s.scale).ceil() as i32,
+        &s.text_cache,
+        s.ticks,
+        text,
+        rect,
+        flags,
+    );
+}
+/// Blends a coverage mask (row length `w`, placed at `rect`) into `pixels` in `color`, within `clip`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn blend_mask_into(
+    pixels: *mut u32,
+    stride: usize,
+    height: i32,
+    mask: &[u8],
+    w: i32,
+    rect: Rect,
+    clip: Rect,
+    color: u32,
+) {
     let (x0, x1) = (
         rect.left.max(clip.left).max(0),
-        rect.right.min(clip.right).min(s.stride as i32),
+        rect.right.min(clip.right).min(stride as i32),
     );
-    let (y0, y1) = (rect.top.max(clip.top).max(0), rect.bottom.min(clip.bottom));
+    let (y0, y1) = (
+        rect.top.max(clip.top).max(0),
+        rect.bottom.min(clip.bottom).min(height),
+    );
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let (r, g, b) = (color & 255, (color >> 8) & 255, (color >> 16) & 255);
     for y in y0..y1 {
-        let row = std::slice::from_raw_parts_mut(s.pixels.add(y as usize * s.stride), x1 as usize);
+        let row = std::slice::from_raw_parts_mut(pixels.add(y as usize * stride), x1 as usize);
         let src = &mask[((y - rect.top) * w) as usize..];
         for x in x0..x1 {
             let c = src[(x - rect.left) as usize] as u32;
@@ -4283,6 +4327,19 @@ unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, col
                 | mix(d & 255, b);
         }
     }
+}
+/// Blends a coverage mask (row length `w`, placed at `rect`) into the notch frame in `color`, within `clip`.
+unsafe fn blend_mask(s: &State, mask: &[u8], w: i32, rect: Rect, clip: Rect, color: u32) {
+    blend_mask_into(
+        s.pixels,
+        s.stride,
+        (DIB_H * s.scale).ceil() as i32,
+        mask,
+        w,
+        rect,
+        clip,
+        color,
+    );
 }
 /// White-on-black rendering of one text box; its red channel is the coverage GDI would blend with.
 unsafe fn render_mask(font: Handle, text: &[u16], w: i32, h: i32, flags: u32) -> Vec<u8> {
@@ -8865,12 +8922,17 @@ unsafe fn paint(hwnd: Hwnd, s: &State) {
                 0.,
             );
         }
+        let (gx, gw) = gear_rect(cur_w);
+        let gear_hover = s.tab_hover == HEADER_SETTINGS;
+        if gear_hover {
+            pill_opt(s, gx, 10., gw, 24., rgb(28, 28, 30), rv, 0.);
+        }
         icon_opt(
             s,
             10,
-            s.tab_x(TAB_SETTINGS).0 + 8.,
+            gx + 8.,
             13.,
-            lit(TAB_SETTINGS),
+            if gear_hover { WHITE } else { SECONDARY },
             rv,
             0.,
         );
@@ -10424,6 +10486,10 @@ unsafe extern "system" fn procedure(hwnd: Hwnd, msg: u32, w: usize, l: isize) ->
                                 s.shelf_scroll = 0.;
                                 s.shelf_hover = -1;
                                 s.shelf_remove_hover = -1;
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                                return 0;
+                            }
+                            HEADER_SETTINGS => {
                                 InvalidateRect(hwnd, std::ptr::null(), 0);
                                 return 0;
                             }
@@ -12399,22 +12465,34 @@ mod tests {
         assert_eq!(TAB_SHELF, 4);
         assert_eq!(TAB_QUICK, 5);
         assert_eq!(TAB_NOTIF, 6);
-        assert_eq!(TAB_SETTINGS, 7);
-        assert_eq!(TAB_COUNT, 8);
+        assert_eq!(TAB_COUNT, 7);
 
         assert_eq!(page_w(TAB_NOTIF), NOTIF_W);
-        assert_eq!(page_w(TAB_SETTINGS), SET_W);
 
         let state = create_test_state();
         assert_eq!(state.page_h(TAB_NOTIF), NOTIF_H);
-        assert_eq!(state.page_h(TAB_SETTINGS), SET_H);
 
         let notif_tab = state.tab_x(TAB_NOTIF);
-        let settings_tab = state.tab_x(TAB_SETTINGS);
+        let gear_btn = gear_rect(state.panel_w_now());
         assert_eq!(notif_tab.1, 34.);
-        assert_eq!(settings_tab.1, 34.);
-        // Tab width is 34, plus 4px gap = 38px spacing between Notification Center and Settings
-        assert_eq!(notif_tab.0 + 34. + 4., settings_tab.0);
+        assert_eq!(gear_btn.1, 34.);
+        // Tab width is 34, plus 4px gap = 38px spacing between Notification Center and Gear button
+        assert_eq!(notif_tab.0 + 34. + 4., gear_btn.0);
+    }
+
+    #[test]
+    fn notch_header_gear_is_action_not_tab() {
+        assert_eq!(TAB_COUNT, 7);
+        let mut state = create_test_state();
+        state.active_tab = TAB_NOTIF;
+        state.tab_from = TAB_NOTIF;
+        state.tab_to = TAB_NOTIF;
+        state.panel_w = NOTIF_W;
+        let (gx, gw) = gear_rect(state.panel_w_now());
+        assert_eq!(state.header_hit(gx + gw * 0.5, 20.), HEADER_SETTINGS);
+        let (nx, nw) = state.tab_x(TAB_NOTIF);
+        assert_eq!(nx + nw + 4., gx);
+        assert_eq!(state.header_hit(nx + nw * 0.5, 20.), TAB_NOTIF as i32);
     }
 
     #[test]
