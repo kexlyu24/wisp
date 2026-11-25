@@ -1,4 +1,4 @@
-WISP 0.2.1 FOR WINDOWS
+WISP 0.2.2 FOR WINDOWS
 ======================
 
 Wisp is a Dynamic Island-style notch for Windows 10/11. It sits at the top
@@ -33,7 +33,8 @@ Want the exact original look? SF Pro is a free download from Apple:
   - Hover the notch to open it. Move away to close it.
   - Scroll or swipe on the open notch to switch pages:
     Now Playing, Calendar, To-do, Pomodoro, Shelf, Quick Access,
-    Notifications, Settings.
+    Notifications. Click the gear button at the top right (or "Settings..."
+    in the tray menu) to open the standalone Settings popup window.
   - Calendar: pick a date, click "Add an event", type a title, set the
     time with - / + (or choose "All day") and click Add. Click an event
     to change it, or its x to delete it.
