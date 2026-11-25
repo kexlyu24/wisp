@@ -1076,6 +1076,8 @@ struct State {
     notif_badge_v: f64,
     settings: settings::Settings,
     settings_subpage: usize,
+    pub(crate) main_hwnd: Hwnd,
+    pub(crate) settings_win: settings_win::SettingsWindow,
     updater: updater::Updater,
     web_drop_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     web_drop_status: String,
@@ -1394,6 +1396,8 @@ impl State {
             deep_idle_ticks: 0,
             settings: loaded_settings,
             settings_subpage: 0,
+            main_hwnd: hwnd,
+            settings_win: settings_win::SettingsWindow::new(),
             updater: updater::Updater::new(!smoke),
             web_drop_rx: None,
             web_drop_status: String::new(),
@@ -3136,7 +3140,7 @@ impl State {
             5300..=5304 => {
                 let style = (hit - 5300) as u32;
                 if style == 4 && self.bg_custom_pixels.is_none() {
-                    self.import_custom_bg(hwnd);
+                    self.import_custom_bg(hwnd, hwnd);
                 } else {
                     self.settings.bg_style = style;
                     self.apply_settings();
@@ -3159,7 +3163,7 @@ impl State {
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             5320 => {
-                self.import_custom_bg(hwnd);
+                self.import_custom_bg(hwnd, hwnd);
             }
             5321 => {
                 self.reset_custom_bg(hwnd);
@@ -3187,8 +3191,8 @@ impl State {
             _ => {}
         }
     }
-    unsafe fn import_custom_bg(&mut self, hwnd: Hwnd) {
-        if let Some(file_path) = open_image_dialog(hwnd) {
+    pub(crate) unsafe fn import_custom_bg(&mut self, owner: Hwnd, main_hwnd: Hwnd) {
+        if let Some(file_path) = open_image_dialog(owner) {
             let h = (DIB_H * self.scale).ceil() as usize;
             if let Some(prepared) = prepare_custom_bg(
                 &file_path,
@@ -3207,7 +3211,9 @@ impl State {
                 if !self.smoke {
                     self.settings.save();
                 }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
+                if !main_hwnd.is_null() {
+                    InvalidateRect(main_hwnd, std::ptr::null(), 0);
+                }
             }
         }
     }
@@ -12104,7 +12110,7 @@ mod tests {
         assert_eq!(s.quick_scroll_vel, 0.);
     }
 
-    fn create_test_state() -> State {
+    pub(crate) fn create_test_state() -> State {
         State {
             expanded: true,
             progress: 1.,
@@ -12266,6 +12272,8 @@ mod tests {
             deep_idle_ticks: 0,
             settings: settings::Settings::default(),
             settings_subpage: 0,
+            main_hwnd: null_mut(),
+            settings_win: settings_win::SettingsWindow::new(),
             updater: updater::Updater::default(),
             web_drop_rx: None,
             web_drop_status: String::new(),

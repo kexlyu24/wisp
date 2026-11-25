@@ -2,6 +2,1625 @@
 //! Pure geometry, hit-testing, position clamping, and switch springs live alongside the Win32
 //! layered-window implementation so every layout boundary is unit-tested without an HWND.
 
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use crate::{
+    blend_color, cached_text_into, render, rgb, settings, update_note_lines, updater, wide,
+    BeginPaint, BitmapInfo, Blend, CreateCompatibleDC, CreateDIBSection, CreateWindowExW,
+    DefWindowProcW, DeleteDC, DeleteObject, DestroyWindow, EndPaint, GetModuleHandleW,
+    GetWindowLongPtrW, GetWindowRect, Handle, Hwnd, InvalidateRect, LoadCursorW, MouseTracking,
+    Paint, Point, Rect, RegisterClassExW, ReleaseCapture, SelectObject, SendMessageW, SetBkMode,
+    SetCapture, SetForegroundWindow, SetTextColor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    Size, State, SystemParametersInfoW, TrackMouseEvent, UpdateLayeredWindow, WindowClass, BLUE,
+    GREEN, PACE_MOTION, SECONDARY, SETTING_ROWS, TERTIARY, WHITE,
+};
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn MonitorFromPoint(pt: Point, flags: u32) -> Handle;
+    fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
+}
+
+const WIN_BG: u32 = 0x161414; // rgb(20, 20, 22) (#141416)
+const SIDEBAR_BG: u32 = 0x100e0e; // rgb(14, 14, 16) (#0e0e10)
+const CARD_BG: u32 = 0x1e1c1c; // rgb(28, 28, 30) (#1c1c1e)
+const DIVIDER: u32 = 0x262424; // rgb(36, 36, 38) (#242426)
+const ROW_SEP: u32 = 0x2e2c2c; // rgb(44, 44, 46) (#2c2c2e)
+
+const NOTCH_ROWS: [(&str, &str); 4] = [
+    (
+        "Open on hover",
+        "Expand the panel when the pointer reaches the top edge",
+    ),
+    (
+        "Minimal mode",
+        "Shrink to a thin sliver when covering browser tabs or content",
+    ),
+    (
+        "Lyrics when closed",
+        "Show the live lyric line inside the collapsed notch pill",
+    ),
+    (
+        "Notification popups",
+        "Briefly spring open for incoming Windows notifications",
+    ),
+];
+
+const GENERAL_ROWS: [(&str, &str); 3] = [
+    (
+        "24-hour clock",
+        "Show 14:25 instead of 2:25 PM in the collapsed notch",
+    ),
+    (
+        "Match Windows motion",
+        "Snap animations when Windows animation effects are off",
+    ),
+    (
+        "Start with Windows",
+        "Launch Wisp automatically when you sign in",
+    ),
+];
+
+const NAV_LABELS: [&str; 4] = ["Notch", "General", "Appearance", "Updates"];
+const BG_STYLE_NAMES: [&str; 5] = ["Frost", "Aura", "Slate", "OLED", "Image"];
+const BG_SWATCH_COLORS: [u32; 5] = [
+    0x342d28, // Frost cool steel
+    0x38212a, // Aura subtle plum
+    0x2d2927, // Slate charcoal
+    0x000000, // OLED pure black
+    0x684b26, // Image blue-slate preview
+];
+
+static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+pub struct SettingsWindow {
+    hwnd: Hwnd,
+    open: bool,
+    section: SettingsSection,
+    dc: Handle,
+    bitmap: Handle,
+    original: Handle,
+    pixels: *mut u32,
+    stride: usize,
+    w_px: i32,
+    h_px: i32,
+    renderer: Option<render::Renderer>,
+    hover: i32,
+    pressed: i32,
+    blur_drag: bool,
+    auto_switch_t: f64,
+    auto_switch_v: f64,
+    pos: Option<(i32, i32)>,
+}
+
+impl SettingsWindow {
+    pub fn new() -> Self {
+        Self {
+            hwnd: null_mut(),
+            open: false,
+            section: SettingsSection::Notch,
+            dc: null_mut(),
+            bitmap: null_mut(),
+            original: null_mut(),
+            pixels: null_mut(),
+            stride: 0,
+            w_px: 0,
+            h_px: 0,
+            renderer: None,
+            hover: HIT_NONE,
+            pressed: HIT_NONE,
+            blur_drag: false,
+            auto_switch_t: 0.,
+            auto_switch_v: 0.,
+            pos: None,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn section(&self) -> SettingsSection {
+        self.section
+    }
+
+    pub fn set_section(&mut self, section: SettingsSection) {
+        if self.blur_drag {
+            self.blur_drag = false;
+            if !self.hwnd.is_null() {
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+        }
+        self.section = section;
+        self.pressed = HIT_NONE;
+    }
+
+    pub fn snap_auto_switch(&mut self, auto_on: bool) {
+        self.auto_switch_t = if auto_on { 1. } else { 0. };
+        self.auto_switch_v = 0.;
+    }
+
+    pub fn advance(&mut self, auto_on: bool, reduced_motion: bool, dt: f64) -> bool {
+        advance_switch(
+            &mut self.auto_switch_t,
+            &mut self.auto_switch_v,
+            auto_on,
+            reduced_motion,
+            dt,
+        )
+    }
+
+    unsafe fn work_area_for(pt: Option<(i32, i32)>) -> (i32, i32, i32, i32) {
+        if let Some((x, y)) = pt {
+            let mon = MonitorFromPoint(Point { x, y }, 2);
+            if !mon.is_null() {
+                let mut info = MonitorInfo {
+                    size: size_of::<MonitorInfo>() as u32,
+                    monitor: Rect::default(),
+                    work: Rect::default(),
+                    flags: 0,
+                };
+                if GetMonitorInfoW(mon, &mut info) != 0 {
+                    return (
+                        info.work.left,
+                        info.work.top,
+                        info.work.right,
+                        info.work.bottom,
+                    );
+                }
+            }
+        }
+        let mut work = Rect::default();
+        if SystemParametersInfoW(0x0030, 0, (&mut work as *mut Rect).cast(), 0) != 0 {
+            return (work.left, work.top, work.right, work.bottom);
+        }
+        (0, 0, 1920, 1040)
+    }
+
+    unsafe fn ensure_window(state: &mut State) -> bool {
+        if !state.settings_win.hwnd.is_null() {
+            return true;
+        }
+        let instance = GetModuleHandleW(std::ptr::null());
+        let class = wide("WispSettings");
+        if !CLASS_REGISTERED.swap(true, Ordering::AcqRel) {
+            let wc = WindowClass {
+                size: size_of::<WindowClass>() as u32,
+                style: 3,
+                proc: settings_proc,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: null_mut(),
+                cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
+                background: null_mut(),
+                menu: std::ptr::null(),
+                name: class.as_ptr(),
+                small_icon: null_mut(),
+            };
+            if RegisterClassExW(&wc) == 0 {
+                CLASS_REGISTERED.store(false, Ordering::Release);
+                return false;
+            }
+        }
+        let scale = state.scale;
+        let w_px = (SET_WIN_W * scale).round() as i32;
+        let h_px = (SET_WIN_H * scale).round() as i32;
+        let work = Self::work_area_for(None);
+        let init_x = work.0 + ((work.2 - work.0) - w_px) / 2;
+        let init_y = work.1 + ((work.3 - work.1) - h_px) / 2;
+        let (x, y) = clamp_window_pos(init_x, init_y, w_px, h_px, work);
+        let hwnd = CreateWindowExW(
+            0x80000 | 0x80,
+            class.as_ptr(),
+            wide("Wisp Settings").as_ptr(),
+            0x80000000,
+            x,
+            y,
+            w_px,
+            h_px,
+            null_mut(),
+            null_mut(),
+            instance,
+            null_mut(),
+        );
+        if hwnd.is_null() {
+            return false;
+        }
+        let dc = CreateCompatibleDC(null_mut());
+        let stride = w_px as usize;
+        let info = BitmapInfo {
+            size: 40,
+            width: w_px,
+            height: -h_px,
+            planes: 1,
+            bits: 32,
+            compression: 0,
+            bytes: 0,
+            x: 0,
+            y: 0,
+            used: 0,
+            important: 0,
+        };
+        let mut pixels = null_mut();
+        let bitmap = CreateDIBSection(dc, &info, 0, &mut pixels, null_mut(), 0);
+        if bitmap.is_null() || pixels.is_null() {
+            DeleteDC(dc);
+            DestroyWindow(hwnd);
+            return false;
+        }
+        let original = SelectObject(dc, bitmap);
+        let renderer = Some(render::Renderer::new(pixels.cast(), stride, h_px, scale));
+        SetWindowLongPtrW(hwnd, -21, (state as *mut State) as isize);
+        let sw = &mut state.settings_win;
+        sw.hwnd = hwnd;
+        sw.dc = dc;
+        sw.bitmap = bitmap;
+        sw.original = original;
+        sw.pixels = pixels.cast();
+        sw.stride = stride;
+        sw.w_px = w_px;
+        sw.h_px = h_px;
+        sw.renderer = renderer;
+        sw.pos = Some((x, y));
+        true
+    }
+
+    pub unsafe fn open(state: &mut State) {
+        if state.smoke {
+            state.settings_win.open = true;
+            state.settings_win.snap_auto_switch(state.updater.auto);
+            return;
+        }
+        state.autostart = settings::starts_with_windows();
+        state.snap_switches();
+        state.settings_win.snap_auto_switch(state.updater.auto);
+        if !Self::ensure_window(state) {
+            return;
+        }
+        let sw = &mut state.settings_win;
+        let work = Self::work_area_for(sw.pos);
+        let (x, y) = match sw.pos {
+            Some((px, py)) => clamp_window_pos(px, py, sw.w_px, sw.h_px, work),
+            None => clamp_window_pos(
+                work.0 + ((work.2 - work.0) - sw.w_px) / 2,
+                work.1 + ((work.3 - work.1) - sw.h_px) / 2,
+                sw.w_px,
+                sw.h_px,
+                work,
+            ),
+        };
+        sw.pos = Some((x, y));
+        sw.open = true;
+        sw.hover = HIT_NONE;
+        sw.pressed = HIT_NONE;
+        let win_hwnd = sw.hwnd;
+        SetWindowPos(win_hwnd, null_mut(), x, y, sw.w_px, sw.h_px, 0x0004);
+        Self::paint(state);
+        ShowWindow(win_hwnd, 5);
+        SetForegroundWindow(win_hwnd);
+        if !state.main_hwnd.is_null() {
+            InvalidateRect(state.main_hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    pub unsafe fn toggle(state: &mut State) {
+        if state.settings_win.open {
+            state.settings_win.hide();
+            if !state.main_hwnd.is_null() {
+                InvalidateRect(state.main_hwnd, std::ptr::null(), 0);
+            }
+        } else {
+            Self::open(state);
+        }
+    }
+
+    pub unsafe fn hide(&mut self) {
+        if self.blur_drag {
+            self.blur_drag = false;
+            if !self.hwnd.is_null() {
+                ReleaseCapture();
+            }
+        }
+        if !self.hwnd.is_null() {
+            let mut r = Rect::default();
+            if GetWindowRect(self.hwnd, &mut r) != 0 {
+                self.pos = Some((r.left, r.top));
+            }
+            ShowWindow(self.hwnd, 0);
+        }
+        self.open = false;
+        self.hover = HIT_NONE;
+        self.pressed = HIT_NONE;
+    }
+
+    pub unsafe fn destroy(&mut self) {
+        self.open = false;
+        self.blur_drag = false;
+        self.renderer = None;
+        if !self.hwnd.is_null() {
+            SetWindowLongPtrW(self.hwnd, -21, 0);
+            DestroyWindow(self.hwnd);
+            self.hwnd = null_mut();
+        }
+        if !self.dc.is_null() {
+            if !self.original.is_null() {
+                SelectObject(self.dc, self.original);
+                self.original = null_mut();
+            }
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap);
+                self.bitmap = null_mut();
+            }
+            DeleteDC(self.dc);
+            self.dc = null_mut();
+        }
+        self.pixels = null_mut();
+    }
+
+    fn hit_context(state: &State) -> HitContext {
+        HitContext {
+            section: state.settings_win.section,
+            has_custom_image: state.bg_custom_pixels.is_some(),
+            bg_style: state.settings.bg_style,
+            update_action_enabled: state.updater.action_enabled(),
+            update_downloading: state.updater.phase == updater::Phase::Downloading,
+        }
+    }
+
+    pub unsafe fn handle_click(state: &mut State, hit: i32) {
+        let main_hwnd = state.main_hwnd;
+        let win_hwnd = state.settings_win.hwnd;
+        match hit {
+            HIT_CLOSE => {
+                state.settings_win.hide();
+                if !main_hwnd.is_null() {
+                    InvalidateRect(main_hwnd, std::ptr::null(), 0);
+                }
+                return;
+            }
+            HIT_QUIT => {
+                state.settings_win.hide();
+                if !main_hwnd.is_null() {
+                    DestroyWindow(main_hwnd);
+                }
+                return;
+            }
+            h if (HIT_NAV_BASE..HIT_NAV_BASE + 4).contains(&h) => {
+                state
+                    .settings_win
+                    .set_section(SettingsSection::from_index((h - HIT_NAV_BASE) as usize));
+            }
+            h if (HIT_SWITCH_BASE..HIT_SWITCH_BASE + 7).contains(&h) => {
+                let item = SETTING_ROWS[(h - HIT_SWITCH_BASE) as usize].1;
+                state.change_setting(main_hwnd, item);
+            }
+            h if (HIT_BG_STYLE_BASE..HIT_BG_STYLE_BASE + 5).contains(&h) => {
+                let style = (h - HIT_BG_STYLE_BASE) as u32;
+                if style == 4 && state.bg_custom_pixels.is_none() {
+                    if !state.smoke {
+                        state.import_custom_bg(win_hwnd, main_hwnd);
+                    }
+                } else {
+                    state.settings.bg_style = style;
+                    state.apply_settings();
+                    if !state.smoke {
+                        state.settings.save();
+                    }
+                    if !main_hwnd.is_null() {
+                        InvalidateRect(main_hwnd, std::ptr::null(), 0);
+                    }
+                }
+            }
+            h if (HIT_BG_OPACITY_BASE..HIT_BG_OPACITY_BASE + 4).contains(&h) => {
+                let opacities = [70, 80, 90, 100];
+                state.settings.bg_opacity = opacities[(h - HIT_BG_OPACITY_BASE) as usize];
+                if state.bg_custom_pixels.is_some() {
+                    state.reload_custom_bg();
+                }
+                state.apply_settings();
+                if !state.smoke {
+                    state.settings.save();
+                }
+                if !main_hwnd.is_null() {
+                    InvalidateRect(main_hwnd, std::ptr::null(), 0);
+                }
+            }
+            HIT_BG_CHOOSE => {
+                if !state.smoke {
+                    state.import_custom_bg(win_hwnd, main_hwnd);
+                }
+            }
+            HIT_BG_RESET => {
+                if !state.smoke {
+                    state.reset_custom_bg(main_hwnd);
+                }
+            }
+            h if (HIT_BG_POS_BASE..HIT_BG_POS_BASE + 3).contains(&h) => {
+                state.settings.bg_pos = match h - HIT_BG_POS_BASE {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                };
+                if state.bg_custom_pixels.is_some() {
+                    state.reload_custom_bg();
+                }
+                state.apply_settings();
+                if !state.smoke {
+                    state.settings.save();
+                }
+                if !main_hwnd.is_null() {
+                    InvalidateRect(main_hwnd, std::ptr::null(), 0);
+                }
+            }
+            HIT_UPD_AUTO => {
+                if !state.smoke {
+                    state.updater.toggle_auto();
+                }
+            }
+            HIT_UPD_CANCEL => {
+                state.updater.cancel();
+            }
+            HIT_UPD_ACTION if !state.smoke && state.updater.action_enabled() => {
+                match state.updater.phase {
+                    updater::Phase::Ready => match state.updater.install() {
+                        Ok(()) => {
+                            if !main_hwnd.is_null() {
+                                DestroyWindow(main_hwnd);
+                            }
+                            return;
+                        }
+                        Err(e) => state.updater.status = e,
+                    },
+                    updater::Phase::Available => state.updater.download(),
+                    updater::Phase::Error if state.updater.release.is_some() => {
+                        state.updater.download()
+                    }
+                    _ => state.updater.check(),
+                }
+            }
+            _ => {}
+        }
+        state.pace.store(PACE_MOTION, Ordering::Relaxed);
+        if state.settings_win.is_open() && !state.settings_win.hwnd.is_null() {
+            Self::paint(state);
+        }
+    }
+
+    pub unsafe fn paint(state: &State) {
+        let sw = &state.settings_win;
+        if sw.hwnd.is_null() || sw.pixels.is_null() {
+            return;
+        }
+        let Some(r) = sw.renderer.as_ref() else {
+            return;
+        };
+        let scale = state.scale;
+        let px = |v: f64| (v * scale).round() as i32;
+        let total = sw.stride * sw.h_px as usize;
+        std::ptr::write_bytes(sw.pixels, 0, total);
+        SetBkMode(sw.dc, 1);
+
+        let draw_text = |font_idx: usize,
+                         text: &str,
+                         color: u32,
+                         x: f64,
+                         y: f64,
+                         w: f64,
+                         h: f64,
+                         center: bool| {
+            let mut buf = state.text_buffer.borrow_mut();
+            buf.clear();
+            buf.extend(text.encode_utf16());
+            SelectObject(sw.dc, state.fonts[font_idx]);
+            SetTextColor(sw.dc, color);
+            let rect = Rect {
+                left: px(x),
+                top: px(y),
+                right: px(x + w),
+                bottom: px(y + h),
+            };
+            let flags = 0x20 | 0x4 | 0x8000 | if center { 1 } else { 0 };
+            cached_text_into(
+                sw.dc,
+                sw.pixels,
+                sw.stride,
+                sw.h_px,
+                &state.text_cache,
+                state.ticks,
+                &buf,
+                rect,
+                flags,
+            );
+        };
+
+        let draw_switch = |tx: f64, ty: f64, t_raw: f64| {
+            let t = t_raw.clamp(0., 1.);
+            r.round(
+                tx,
+                ty,
+                36.,
+                20.,
+                10.,
+                blend_color(rgb(57, 57, 61), GREEN, t),
+            );
+            r.round(tx + 2. + 16. * t, ty + 2., 16., 16., 8., WHITE);
+        };
+
+        // 1. Rounded window base (#141416) + top titlebar & left sidebar (#0e0e10)
+        r.round(0., 0., SET_WIN_W, SET_WIN_H, 14., WIN_BG);
+        // Sidebar rounded bottom-left + titlebar rounded top corners via layered fills
+        r.round(0., 0., SET_WIN_W, TITLE_H + 14., 14., SIDEBAR_BG);
+        r.round(0., TITLE_H, SET_WIN_W, 14., 0., WIN_BG);
+        r.round(0., TITLE_H, SIDEBAR_W, SET_WIN_H - TITLE_H, 14., SIDEBAR_BG);
+        r.round(
+            SIDEBAR_W - 14.,
+            TITLE_H,
+            14.,
+            SET_WIN_H - TITLE_H,
+            0.,
+            SIDEBAR_BG,
+        );
+        r.round(0., TITLE_H, 14., 14., 0., SIDEBAR_BG);
+        // Subtle structural hairlines
+        r.round(0., TITLE_H - 1., SET_WIN_W, 1., 0., DIVIDER);
+        r.round(
+            SIDEBAR_W - 1.,
+            TITLE_H,
+            1.,
+            SET_WIN_H - TITLE_H,
+            0.,
+            DIVIDER,
+        );
+
+        // 2. Titlebar: Wisp pill emblem, "Wisp Settings", circular Close button
+        r.round(16., 15., 20., 10., 5., WHITE);
+        r.ellipse(31.5, 20., 2., 2., SIDEBAR_BG);
+        draw_text(7, "Wisp Settings", WHITE, 44., 10., 180., 20., false);
+
+        let close_hot = sw.hover == HIT_CLOSE || sw.pressed == HIT_CLOSE;
+        if close_hot {
+            r.round(
+                CLOSE_X,
+                CLOSE_Y,
+                CLOSE_SIZE,
+                CLOSE_SIZE,
+                CLOSE_SIZE / 2.,
+                if sw.pressed == HIT_CLOSE {
+                    rgb(54, 54, 58)
+                } else {
+                    rgb(44, 44, 46)
+                },
+            );
+        }
+        let cx = CLOSE_X + CLOSE_SIZE / 2.;
+        let cy = CLOSE_Y + CLOSE_SIZE / 2.;
+        let ccol = if close_hot { WHITE } else { SECONDARY };
+        r.stroke(&[(cx - 4., cy - 4.), (cx + 4., cy + 4.)], false, 1.6, ccol);
+        r.stroke(&[(cx + 4., cy - 4.), (cx - 4., cy + 4.)], false, 1.6, ccol);
+
+        // 3. Left sidebar: 4 categories + version + neutral Quit Wisp
+        for (i, label) in NAV_LABELS.iter().enumerate() {
+            let ny = NAV_Y0 + i as f64 * NAV_STEP;
+            let hit = HIT_NAV_BASE + i as i32;
+            let active = sw.section as usize == i;
+            let hot = sw.hover == hit;
+            let bg = if active {
+                Some(BLUE)
+            } else if sw.pressed == hit {
+                Some(rgb(36, 36, 40))
+            } else if hot {
+                Some(CARD_BG)
+            } else {
+                None
+            };
+            if let Some(col) = bg {
+                r.round(NAV_X, ny, NAV_W, NAV_H, 8., col);
+            }
+            let fg = if active || hot { WHITE } else { SECONDARY };
+            draw_sidebar_icon(r, i, NAV_X + 10., ny + 9., fg);
+            draw_text(
+                if active { 7 } else { 2 },
+                label,
+                if active { WHITE } else { fg },
+                NAV_X + 34.,
+                ny + 7.,
+                NAV_W - 42.,
+                20.,
+                false,
+            );
+        }
+
+        // Sidebar footer
+        r.round(12., 344., SIDEBAR_W - 24., 1., 0., DIVIDER);
+        draw_text(
+            3,
+            concat!("Wisp ", env!("CARGO_PKG_VERSION")),
+            TERTIARY,
+            14.,
+            352.,
+            SIDEBAR_W - 28.,
+            18.,
+            false,
+        );
+        let quit_bg = if sw.pressed == HIT_QUIT {
+            rgb(54, 54, 58)
+        } else if sw.hover == HIT_QUIT {
+            rgb(44, 44, 46)
+        } else {
+            CARD_BG
+        };
+        r.round(QUIT_X, QUIT_Y, QUIT_W, QUIT_H, 8., quit_bg);
+        draw_text(2, "Quit Wisp", WHITE, QUIT_X, QUIT_Y, QUIT_W, QUIT_H, true);
+
+        // 4. Right content pane
+        match sw.section {
+            SettingsSection::Notch => {
+                draw_text(0, "Notch", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_text(
+                    3,
+                    "How the dynamic notch expands, hides, and shows live info.",
+                    SECONDARY,
+                    CONTENT_X,
+                    79.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "BEHAVIOR",
+                    SECONDARY,
+                    CONTENT_X + 4.,
+                    102.,
+                    160.,
+                    14.,
+                    false,
+                );
+                r.round(
+                    CONTENT_X,
+                    SWITCH_CARD_Y,
+                    CONTENT_W,
+                    4. * SWITCH_ROW_H,
+                    12.,
+                    CARD_BG,
+                );
+                for (k, &(title, sub)) in NOTCH_ROWS.iter().enumerate() {
+                    let ry = SWITCH_CARD_Y + k as f64 * SWITCH_ROW_H;
+                    let hit = HIT_SWITCH_BASE + k as i32;
+                    if sw.hover == hit || sw.pressed == hit {
+                        r.round(
+                            CONTENT_X + 4.,
+                            ry + 4.,
+                            CONTENT_W - 8.,
+                            SWITCH_ROW_H - 8.,
+                            8.,
+                            if sw.pressed == hit {
+                                rgb(50, 50, 54)
+                            } else {
+                                rgb(38, 38, 42)
+                            },
+                        );
+                    }
+                    draw_text(
+                        7,
+                        title,
+                        WHITE,
+                        CONTENT_X + 14.,
+                        ry + 9.,
+                        CONTENT_W - 74.,
+                        18.,
+                        false,
+                    );
+                    draw_text(
+                        3,
+                        sub,
+                        SECONDARY,
+                        CONTENT_X + 14.,
+                        ry + 29.,
+                        CONTENT_W - 74.,
+                        16.,
+                        false,
+                    );
+                    draw_switch(
+                        CONTENT_X + CONTENT_W - 50.,
+                        ry + (SWITCH_ROW_H - 20.) / 2.,
+                        state.switch_t[k],
+                    );
+                    if k < 3 {
+                        r.round(
+                            CONTENT_X + 14.,
+                            ry + SWITCH_ROW_H - 1.,
+                            CONTENT_W - 14.,
+                            1.,
+                            0.,
+                            ROW_SEP,
+                        );
+                    }
+                }
+                draw_text(
+                    3,
+                    "Changes save automatically.",
+                    TERTIARY,
+                    CONTENT_X + 4.,
+                    SWITCH_CARD_Y + 4. * SWITCH_ROW_H + 10.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+            }
+            SettingsSection::General => {
+                draw_text(0, "General", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_text(
+                    3,
+                    "Clock format, motion preference, and Windows startup.",
+                    SECONDARY,
+                    CONTENT_X,
+                    79.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "SYSTEM & DISPLAY",
+                    SECONDARY,
+                    CONTENT_X + 4.,
+                    102.,
+                    180.,
+                    14.,
+                    false,
+                );
+                r.round(
+                    CONTENT_X,
+                    SWITCH_CARD_Y,
+                    CONTENT_W,
+                    3. * SWITCH_ROW_H,
+                    12.,
+                    CARD_BG,
+                );
+                for (k, &(title, sub)) in GENERAL_ROWS.iter().enumerate() {
+                    let idx = 4 + k;
+                    let ry = SWITCH_CARD_Y + k as f64 * SWITCH_ROW_H;
+                    let hit = HIT_SWITCH_BASE + idx as i32;
+                    if sw.hover == hit || sw.pressed == hit {
+                        r.round(
+                            CONTENT_X + 4.,
+                            ry + 4.,
+                            CONTENT_W - 8.,
+                            SWITCH_ROW_H - 8.,
+                            8.,
+                            if sw.pressed == hit {
+                                rgb(50, 50, 54)
+                            } else {
+                                rgb(38, 38, 42)
+                            },
+                        );
+                    }
+                    draw_text(
+                        7,
+                        title,
+                        WHITE,
+                        CONTENT_X + 14.,
+                        ry + 9.,
+                        CONTENT_W - 74.,
+                        18.,
+                        false,
+                    );
+                    draw_text(
+                        3,
+                        sub,
+                        SECONDARY,
+                        CONTENT_X + 14.,
+                        ry + 29.,
+                        CONTENT_W - 74.,
+                        16.,
+                        false,
+                    );
+                    draw_switch(
+                        CONTENT_X + CONTENT_W - 50.,
+                        ry + (SWITCH_ROW_H - 20.) / 2.,
+                        state.switch_t[idx],
+                    );
+                    if k < 2 {
+                        r.round(
+                            CONTENT_X + 14.,
+                            ry + SWITCH_ROW_H - 1.,
+                            CONTENT_W - 14.,
+                            1.,
+                            0.,
+                            ROW_SEP,
+                        );
+                    }
+                }
+                draw_text(
+                    3,
+                    "Data is stored locally in %APPDATA%\\Wisp.",
+                    TERTIARY,
+                    CONTENT_X + 4.,
+                    SWITCH_CARD_Y + 3. * SWITCH_ROW_H + 10.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+            }
+            SettingsSection::Appearance => {
+                draw_text(
+                    0,
+                    "Appearance",
+                    WHITE,
+                    CONTENT_X,
+                    56.,
+                    CONTENT_W,
+                    22.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "Panel backdrop theme, frost blur, and opacity. Closed notch stays pure black.",
+                    SECONDARY,
+                    CONTENT_X,
+                    79.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "BACKGROUND STYLE",
+                    SECONDARY,
+                    CONTENT_X + 4.,
+                    98.,
+                    180.,
+                    14.,
+                    false,
+                );
+                r.round(
+                    CONTENT_X,
+                    STYLE_CARD_Y,
+                    CONTENT_W,
+                    STYLE_CARD_H,
+                    12.,
+                    CARD_BG,
+                );
+                for (i, &name) in BG_STYLE_NAMES.iter().enumerate() {
+                    let tr = style_tile_rect(i);
+                    let hit = HIT_BG_STYLE_BASE + i as i32;
+                    let active = state.settings.bg_style == i as u32;
+                    let hot = sw.hover == hit;
+                    if active || hot || sw.pressed == hit {
+                        r.round(
+                            tr.0,
+                            tr.1,
+                            tr.2,
+                            tr.3,
+                            8.,
+                            if active {
+                                rgb(44, 44, 48)
+                            } else {
+                                rgb(36, 36, 40)
+                            },
+                        );
+                    }
+                    if active {
+                        r.stroke_round(tr.0 + 0.5, tr.1 + 0.5, tr.2 - 1., tr.3 - 1., 8., 1.4, BLUE);
+                    }
+                    r.round(
+                        tr.0 + 6.,
+                        tr.1 + 5.,
+                        tr.2 - 12.,
+                        24.,
+                        5.,
+                        BG_SWATCH_COLORS[i],
+                    );
+                    draw_text(
+                        3,
+                        name,
+                        if active || hot { WHITE } else { SECONDARY },
+                        tr.0,
+                        tr.1 + 32.,
+                        tr.2,
+                        16.,
+                        true,
+                    );
+                }
+
+                let has_img = state.bg_custom_pixels.is_some();
+                let layout = appearance_layout(has_img, state.settings.bg_style);
+                r.round(
+                    CONTENT_X,
+                    OPT_CARD_Y,
+                    CONTENT_W,
+                    layout.total_h,
+                    12.,
+                    CARD_BG,
+                );
+
+                if let Some(ry) = layout.image_row_y {
+                    draw_text(
+                        2,
+                        "Custom image",
+                        WHITE,
+                        CONTENT_X + 14.,
+                        ry + 12.,
+                        160.,
+                        20.,
+                        false,
+                    );
+                    let (choose_r, reset_r) = image_button_rects(ry, has_img);
+                    let c_bg = if sw.pressed == HIT_BG_CHOOSE {
+                        rgb(58, 58, 62)
+                    } else if sw.hover == HIT_BG_CHOOSE {
+                        rgb(50, 50, 54)
+                    } else {
+                        rgb(42, 42, 46)
+                    };
+                    r.round(choose_r.0, choose_r.1, choose_r.2, choose_r.3, 12., c_bg);
+                    draw_text(
+                        3,
+                        if has_img { "Change..." } else { "Choose..." },
+                        WHITE,
+                        choose_r.0,
+                        choose_r.1,
+                        choose_r.2,
+                        choose_r.3,
+                        true,
+                    );
+                    if let Some(rr) = reset_r {
+                        let r_bg = if sw.pressed == HIT_BG_RESET {
+                            rgb(58, 58, 62)
+                        } else if sw.hover == HIT_BG_RESET {
+                            rgb(50, 50, 54)
+                        } else {
+                            rgb(42, 42, 46)
+                        };
+                        r.round(rr.0, rr.1, rr.2, rr.3, 12., r_bg);
+                        draw_text(3, "Reset", SECONDARY, rr.0, rr.1, rr.2, rr.3, true);
+                    }
+                    r.round(
+                        CONTENT_X + 14.,
+                        ry + OPT_ROW_H - 1.,
+                        CONTENT_W - 14.,
+                        1.,
+                        0.,
+                        ROW_SEP,
+                    );
+                }
+
+                if let Some(ry) = layout.framing_row_y {
+                    draw_text(
+                        2,
+                        "Framing",
+                        WHITE,
+                        CONTENT_X + 14.,
+                        ry + 12.,
+                        120.,
+                        20.,
+                        false,
+                    );
+                    const POS: [(&str, u32); 3] = [("Top", 1), ("Center", 0), ("Bottom", 2)];
+                    for (i, &(lbl, val)) in POS.iter().enumerate() {
+                        let pr = framing_pill_rect(ry, i);
+                        let hit = HIT_BG_POS_BASE + i as i32;
+                        let active = state.settings.bg_pos == val;
+                        let bg = if active {
+                            rgb(62, 62, 68)
+                        } else if sw.hover == hit || sw.pressed == hit {
+                            rgb(44, 44, 48)
+                        } else {
+                            WIN_BG
+                        };
+                        r.round(pr.0, pr.1, pr.2, pr.3, 12., bg);
+                        draw_text(
+                            3,
+                            lbl,
+                            if active || sw.hover == hit {
+                                WHITE
+                            } else {
+                                SECONDARY
+                            },
+                            pr.0,
+                            pr.1,
+                            pr.2,
+                            pr.3,
+                            true,
+                        );
+                    }
+                    r.round(
+                        CONTENT_X + 14.,
+                        ry + OPT_ROW_H - 1.,
+                        CONTENT_W - 14.,
+                        1.,
+                        0.,
+                        ROW_SEP,
+                    );
+                }
+
+                if let Some(ry) = layout.blur_row_y {
+                    draw_text(
+                        2,
+                        "Blur radius",
+                        WHITE,
+                        CONTENT_X + 14.,
+                        ry + 8.,
+                        140.,
+                        18.,
+                        false,
+                    );
+                    let readout = if state.settings.bg_blur == 0 {
+                        "None".to_string()
+                    } else {
+                        format!("{} px", state.settings.bg_blur)
+                    };
+                    draw_text(
+                        3,
+                        &readout,
+                        SECONDARY,
+                        CONTENT_X + CONTENT_W - 74.,
+                        ry + 8.,
+                        60.,
+                        18.,
+                        true,
+                    );
+                    let active = sw.hover == HIT_BG_BLUR || sw.blur_drag;
+                    let th = if active { 6. } else { 4. };
+                    let track_y = ry + 36.;
+                    let frac = (state.settings.bg_blur as f64 / 30.).clamp(0., 1.);
+                    let thumb_x = BLUR_TRACK_X0 + frac * (BLUR_TRACK_X1 - BLUR_TRACK_X0);
+                    r.round(
+                        BLUR_TRACK_X0,
+                        track_y - th / 2.,
+                        BLUR_TRACK_X1 - BLUR_TRACK_X0,
+                        th,
+                        th / 2.,
+                        rgb(52, 52, 55),
+                    );
+                    if frac > 0.005 {
+                        r.round(
+                            BLUR_TRACK_X0,
+                            track_y - th / 2.,
+                            (thumb_x - BLUR_TRACK_X0).max(th),
+                            th,
+                            th / 2.,
+                            BLUE,
+                        );
+                    }
+                    let knob = if active { 16. } else { 14. };
+                    r.round(
+                        thumb_x - knob / 2.,
+                        track_y - knob / 2.,
+                        knob,
+                        knob,
+                        knob / 2.,
+                        WHITE,
+                    );
+                    r.round(
+                        CONTENT_X + 14.,
+                        ry + BLUR_ROW_H - 1.,
+                        CONTENT_W - 14.,
+                        1.,
+                        0.,
+                        ROW_SEP,
+                    );
+                }
+
+                // Opacity row (always present)
+                let oy = layout.opacity_row_y;
+                draw_text(
+                    2,
+                    "Opacity",
+                    WHITE,
+                    CONTENT_X + 14.,
+                    oy + 12.,
+                    110.,
+                    20.,
+                    false,
+                );
+                const OPS: [(u32, &str); 4] =
+                    [(70, "70%"), (80, "80%"), (90, "90%"), (100, "100%")];
+                for (i, &(val, lbl)) in OPS.iter().enumerate() {
+                    let pr = opacity_pill_rect(oy, i);
+                    let hit = HIT_BG_OPACITY_BASE + i as i32;
+                    let active = state.settings.bg_opacity == val;
+                    let bg = if active {
+                        rgb(62, 62, 68)
+                    } else if sw.hover == hit || sw.pressed == hit {
+                        rgb(44, 44, 48)
+                    } else {
+                        WIN_BG
+                    };
+                    r.round(pr.0, pr.1, pr.2, pr.3, 12., bg);
+                    draw_text(
+                        3,
+                        lbl,
+                        if active || sw.hover == hit {
+                            WHITE
+                        } else {
+                            SECONDARY
+                        },
+                        pr.0,
+                        pr.1,
+                        pr.2,
+                        pr.3,
+                        true,
+                    );
+                }
+            }
+            SettingsSection::Updates => {
+                let u = &state.updater;
+                draw_text(0, "Updates", WHITE, CONTENT_X, 56., CONTENT_W, 22., false);
+                draw_text(
+                    3,
+                    "HTTPS + SHA-256 verified stable releases from GitHub.",
+                    SECONDARY,
+                    CONTENT_X,
+                    79.,
+                    CONTENT_W,
+                    16.,
+                    false,
+                );
+                r.round(
+                    CONTENT_X,
+                    UPD_CARD_Y,
+                    CONTENT_W,
+                    UPD_AUTO_H + UPD_BODY_H,
+                    12.,
+                    CARD_BG,
+                );
+                if sw.hover == HIT_UPD_AUTO || sw.pressed == HIT_UPD_AUTO {
+                    r.round(
+                        CONTENT_X + 4.,
+                        UPD_CARD_Y + 4.,
+                        CONTENT_W - 8.,
+                        UPD_AUTO_H - 8.,
+                        8.,
+                        if sw.pressed == HIT_UPD_AUTO {
+                            rgb(50, 50, 54)
+                        } else {
+                            rgb(38, 38, 42)
+                        },
+                    );
+                }
+                draw_text(
+                    7,
+                    "Check automatically",
+                    WHITE,
+                    CONTENT_X + 14.,
+                    UPD_CARD_Y + 8.,
+                    CONTENT_W - 74.,
+                    18.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "Check once daily on startup (nothing installs automatically)",
+                    SECONDARY,
+                    CONTENT_X + 14.,
+                    UPD_CARD_Y + 28.,
+                    CONTENT_W - 74.,
+                    16.,
+                    false,
+                );
+                draw_switch(
+                    CONTENT_X + CONTENT_W - 50.,
+                    UPD_CARD_Y + (UPD_AUTO_H - 20.) / 2.,
+                    sw.auto_switch_t,
+                );
+                r.round(
+                    CONTENT_X + 14.,
+                    UPD_CARD_Y + UPD_AUTO_H - 1.,
+                    CONTENT_W - 14.,
+                    1.,
+                    0.,
+                    ROW_SEP,
+                );
+
+                // Status + version + progress + release notes + buttons
+                let body_y = UPD_CARD_Y + UPD_AUTO_H;
+                let status_lines = update_note_lines(&u.status);
+                for (i, line) in status_lines.iter().take(2).enumerate() {
+                    draw_text(
+                        7,
+                        line,
+                        WHITE,
+                        CONTENT_X + 14.,
+                        body_y + 10. + i as f64 * 18.,
+                        CONTENT_W - 28.,
+                        18.,
+                        false,
+                    );
+                }
+                draw_text(
+                    3,
+                    concat!("Current version: Wisp ", env!("CARGO_PKG_VERSION")),
+                    SECONDARY,
+                    CONTENT_X + 14.,
+                    body_y + 46.,
+                    CONTENT_W - 28.,
+                    16.,
+                    false,
+                );
+                if u.phase == updater::Phase::Downloading && u.progress.1 > 0 {
+                    let frac = (u.progress.0 as f64 / u.progress.1 as f64).clamp(0., 1.);
+                    r.round(
+                        CONTENT_X + 14.,
+                        body_y + 68.,
+                        CONTENT_W - 74.,
+                        4.,
+                        2.,
+                        rgb(44, 44, 48),
+                    );
+                    r.round(
+                        CONTENT_X + 14.,
+                        body_y + 68.,
+                        (CONTENT_W - 74.) * frac,
+                        4.,
+                        2.,
+                        BLUE,
+                    );
+                    draw_text(
+                        3,
+                        &format!("{:.0}%", frac * 100.),
+                        SECONDARY,
+                        CONTENT_X + CONTENT_W - 56.,
+                        body_y + 62.,
+                        42.,
+                        16.,
+                        true,
+                    );
+                } else if let Some(rel) = &u.release {
+                    for (i, line) in update_note_lines(&rel.notes).iter().take(2).enumerate() {
+                        draw_text(
+                            3,
+                            line,
+                            SECONDARY,
+                            CONTENT_X + 14.,
+                            body_y + 66. + i as f64 * 16.,
+                            CONTENT_W - 28.,
+                            16.,
+                            false,
+                        );
+                    }
+                }
+                let action_lbl = match u.phase {
+                    updater::Phase::Checking => "Checking...",
+                    updater::Phase::Downloading => "Downloading...",
+                    updater::Phase::Ready => "Restart & update",
+                    updater::Phase::Available => "Download update",
+                    updater::Phase::Error if u.release.is_some() => "Retry download",
+                    _ => "Check for updates",
+                };
+                let enabled = u.action_enabled();
+                let act_bg = if !enabled {
+                    rgb(45, 45, 48)
+                } else if sw.pressed == HIT_UPD_ACTION {
+                    blend_color(BLUE, rgb(0, 0, 0), 0.18)
+                } else {
+                    BLUE
+                };
+                r.round(
+                    UPD_ACTION_X,
+                    UPD_ACTION_Y,
+                    UPD_ACTION_W,
+                    UPD_ACTION_H,
+                    15.,
+                    act_bg,
+                );
+                draw_text(
+                    2,
+                    action_lbl,
+                    if enabled { WHITE } else { SECONDARY },
+                    UPD_ACTION_X,
+                    UPD_ACTION_Y,
+                    UPD_ACTION_W,
+                    UPD_ACTION_H,
+                    true,
+                );
+                if u.phase == updater::Phase::Downloading {
+                    let cancel_bg = if sw.pressed == HIT_UPD_CANCEL {
+                        rgb(54, 54, 58)
+                    } else if sw.hover == HIT_UPD_CANCEL {
+                        rgb(44, 44, 48)
+                    } else {
+                        rgb(36, 36, 40)
+                    };
+                    r.round(
+                        UPD_CANCEL_X,
+                        UPD_ACTION_Y,
+                        UPD_CANCEL_W,
+                        UPD_ACTION_H,
+                        15.,
+                        cancel_bg,
+                    );
+                    draw_text(
+                        2,
+                        "Cancel",
+                        WHITE,
+                        UPD_CANCEL_X,
+                        UPD_ACTION_Y,
+                        UPD_CANCEL_W,
+                        UPD_ACTION_H,
+                        true,
+                    );
+                }
+
+                // Card 2: Troubleshooting log info (non-interactive)
+                r.round(CONTENT_X, 328., CONTENT_W, 54., 12., CARD_BG);
+                draw_text(
+                    7,
+                    "Troubleshooting log",
+                    WHITE,
+                    CONTENT_X + 14.,
+                    337.,
+                    260.,
+                    18.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "%APPDATA%\\Wisp\\wisp.log (stays local)",
+                    SECONDARY,
+                    CONTENT_X + 14.,
+                    357.,
+                    300.,
+                    16.,
+                    false,
+                );
+                draw_text(
+                    3,
+                    "Local only",
+                    TERTIARY,
+                    CONTENT_X + CONTENT_W - 80.,
+                    346.,
+                    66.,
+                    18.,
+                    true,
+                );
+            }
+        }
+
+        // Subtle outer border hairline so dark window reads cleanly on dark wallpapers
+        r.stroke_round(
+            0.5,
+            0.5,
+            SET_WIN_W - 1.,
+            SET_WIN_H - 1.,
+            14.,
+            1.,
+            rgb(42, 42, 46),
+        );
+
+        let mut wr = Rect::default();
+        GetWindowRect(sw.hwnd, &mut wr);
+        let dst = Point {
+            x: wr.left,
+            y: wr.top,
+        };
+        let size = Size {
+            x: sw.w_px,
+            y: sw.h_px,
+        };
+        let src = Point { x: 0, y: 0 };
+        let blend = Blend {
+            op: 0,
+            flags: 0,
+            alpha: 255,
+            format: 1,
+        };
+        UpdateLayeredWindow(sw.hwnd, null_mut(), &dst, &size, sw.dc, &src, 0, &blend, 2);
+    }
+}
+
+impl Drop for SettingsWindow {
+    fn drop(&mut self) {
+        unsafe {
+            self.destroy();
+        }
+    }
+}
+
+unsafe fn draw_sidebar_icon(r: &render::Renderer, idx: usize, x: f64, y: f64, color: u32) {
+    match idx {
+        // 0: Notch pill icon
+        0 => {
+            r.stroke_round(x + 1., y + 4., 14., 8., 4., 1.5, color);
+            r.ellipse(x + 11.5, y + 8., 1.4, 1.4, color);
+        }
+        // 1: General sliders icon
+        1 => {
+            r.stroke(&[(x + 2., y + 5.), (x + 14., y + 5.)], false, 1.4, color);
+            r.ellipse(x + 6., y + 5., 2., 2., color);
+            r.stroke(&[(x + 2., y + 11.), (x + 14., y + 11.)], false, 1.4, color);
+            r.ellipse(x + 10., y + 11., 2., 2., color);
+        }
+        // 2: Appearance half-circle contrast icon
+        2 => {
+            r.stroke_ellipse(x + 8., y + 8., 6., 6., 1.5, color);
+            r.ring(x + 8., y + 8., 5.2, 5.2, -90., 180., color);
+        }
+        // 3: Updates upward arrow in circle
+        _ => {
+            r.stroke_ellipse(x + 8., y + 8., 6., 6., 1.4, color);
+            r.stroke(&[(x + 8., y + 11.), (x + 8., y + 5.)], false, 1.4, color);
+            r.stroke(
+                &[(x + 5.5, y + 7.5), (x + 8., y + 5.), (x + 10.5, y + 7.5)],
+                false,
+                1.4,
+                color,
+            );
+        }
+    }
+}
+
+unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize {
+    let ptr = GetWindowLongPtrW(hwnd, -21) as *mut State;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, w, l);
+    }
+    let s = &mut *ptr;
+    match msg {
+        0x0010 => {
+            // WM_CLOSE -> hide instead of quitting Wisp
+            s.settings_win.hide();
+            if !s.main_hwnd.is_null() {
+                InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        0x000F => {
+            let mut ps: Paint = std::mem::zeroed();
+            BeginPaint(hwnd, &mut ps);
+            SettingsWindow::paint(s);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        0x0232 => {
+            // WM_EXITSIZEMOVE -> remember dragged position
+            let mut r = Rect::default();
+            if GetWindowRect(hwnd, &mut r) != 0 {
+                s.settings_win.pos = Some((r.left, r.top));
+            }
+            0
+        }
+        0x0100 => {
+            // WM_KEYDOWN: Escape hides Settings popup
+            if w == 0x1B {
+                s.settings_win.hide();
+                if !s.main_hwnd.is_null() {
+                    InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        0x0200 => {
+            let mut tracking = MouseTracking {
+                size: size_of::<MouseTracking>() as u32,
+                flags: 2,
+                hwnd,
+                hover_time: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+            let x = (l as i16) as f64 / s.scale;
+            let y = ((l >> 16) as i16) as f64 / s.scale;
+            if s.settings_win.blur_drag {
+                let next = blur_from_x(x);
+                if s.settings.bg_blur != next {
+                    s.settings.bg_blur = next;
+                    s.apply_settings();
+                    if !s.main_hwnd.is_null() {
+                        InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+                    }
+                    SettingsWindow::paint(s);
+                }
+                return 0;
+            }
+            let hit = hit_test(SettingsWindow::hit_context(s), x, y);
+            if s.settings_win.hover != hit {
+                s.settings_win.hover = hit;
+                SettingsWindow::paint(s);
+            }
+            0
+        }
+        0x02A3 => {
+            if s.settings_win.hover != HIT_NONE {
+                s.settings_win.hover = HIT_NONE;
+                SettingsWindow::paint(s);
+            }
+            0
+        }
+        0x0201 => {
+            let x = (l as i16) as f64 / s.scale;
+            let y = ((l >> 16) as i16) as f64 / s.scale;
+            let hit = hit_test(SettingsWindow::hit_context(s), x, y);
+            if hit == HIT_TITLEBAR {
+                ReleaseCapture();
+                SendMessageW(hwnd, 0x00A1, 2, 0);
+                return 0;
+            }
+            if hit == HIT_BG_BLUR {
+                s.settings_win.blur_drag = true;
+                s.settings_win.pressed = HIT_BG_BLUR;
+                SetCapture(hwnd);
+                s.settings.bg_blur = blur_from_x(x);
+                s.apply_settings();
+                if !s.main_hwnd.is_null() {
+                    InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+                }
+                SettingsWindow::paint(s);
+                return 0;
+            }
+            s.settings_win.pressed = hit;
+            SettingsWindow::paint(s);
+            0
+        }
+        0x0202 => {
+            if s.settings_win.blur_drag {
+                s.settings_win.blur_drag = false;
+                s.settings_win.pressed = HIT_NONE;
+                ReleaseCapture();
+                if s.bg_custom_pixels.is_some() {
+                    s.reload_custom_bg();
+                }
+                s.apply_settings();
+                if !s.smoke {
+                    s.settings.save();
+                }
+                if !s.main_hwnd.is_null() {
+                    InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+                }
+                SettingsWindow::paint(s);
+                return 0;
+            }
+            let x = (l as i16) as f64 / s.scale;
+            let y = ((l >> 16) as i16) as f64 / s.scale;
+            let hit = hit_test(SettingsWindow::hit_context(s), x, y);
+            let pressed = std::mem::replace(&mut s.settings_win.pressed, HIT_NONE);
+            if hit != HIT_NONE && hit == pressed {
+                SettingsWindow::handle_click(s, hit);
+            } else if s.settings_win.is_open() {
+                SettingsWindow::paint(s);
+            }
+            0
+        }
+        0x0215 => {
+            // WM_CAPTURECHANGED: clean up blur drag if capture was stolen
+            if s.settings_win.blur_drag {
+                s.settings_win.blur_drag = false;
+                s.settings_win.pressed = HIT_NONE;
+                if s.bg_custom_pixels.is_some() {
+                    s.reload_custom_bg();
+                }
+                s.apply_settings();
+                if !s.smoke {
+                    s.settings.save();
+                }
+                if !s.main_hwnd.is_null() {
+                    InvalidateRect(s.main_hwnd, std::ptr::null(), 0);
+                }
+                SettingsWindow::paint(s);
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
 pub const SET_WIN_W: f64 = 620.;
 pub const SET_WIN_H: f64 = 420.;
 pub const TITLE_H: f64 = 40.;
@@ -545,5 +2164,51 @@ mod tests {
         assert_eq!(pos, 1.);
         assert_eq!(vel, 0.);
         assert!(!advance_switch(&mut pos, &mut vel, true, true, 0.016));
+    }
+
+    #[test]
+    fn settings_window_section_switch_and_blur_drag_cleanup() {
+        let mut w = SettingsWindow::new();
+        assert!(!w.is_open());
+        assert_eq!(w.section(), SettingsSection::Notch);
+        w.open = true;
+        w.blur_drag = true;
+        w.pressed = HIT_BG_BLUR;
+        w.set_section(SettingsSection::Appearance);
+        assert_eq!(w.section(), SettingsSection::Appearance);
+        assert!(!w.blur_drag);
+        assert_eq!(w.pressed, HIT_NONE);
+
+        unsafe { w.hide() };
+        assert!(!w.is_open());
+        assert_eq!(w.hover, HIT_NONE);
+        assert_eq!(w.pressed, HIT_NONE);
+        assert!(!w.blur_drag);
+    }
+
+    #[test]
+    fn settings_window_appearance_style_and_opacity_clicks_update_settings() {
+        let mut s = crate::tests::create_test_state();
+        s.smoke = true;
+        s.expanded = false;
+        s.active_tab = 0;
+        s.settings_win.open = true;
+
+        unsafe {
+            SettingsWindow::handle_click(&mut s, HIT_NAV_BASE + 2);
+            assert_eq!(s.settings_win.section(), SettingsSection::Appearance);
+            assert!(!s.expanded);
+
+            SettingsWindow::handle_click(&mut s, HIT_BG_STYLE_BASE);
+            assert_eq!(s.settings.bg_style, 0);
+
+            SettingsWindow::handle_click(&mut s, HIT_BG_OPACITY_BASE + 1);
+            assert_eq!(s.settings.bg_opacity, 80);
+
+            SettingsWindow::handle_click(&mut s, HIT_CLOSE);
+            assert!(!s.settings_win.is_open());
+            assert_eq!(s.active_tab, 0);
+            assert!(!s.expanded);
+        }
     }
 }
